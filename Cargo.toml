@@ -1,11 +1,11 @@
 [package]
 name = "tower-http-cache"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.75.0"
 description = "Tower-compatible caching layer with pluggable backends (in-memory, Redis, and more)"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/danielrcurtis/tower-http-cache"
+repository = "https://github.com/sadco-io/tower-http-cache"
 documentation = "https://docs.rs/tower-http-cache"
 readme = "README.md"
 keywords = ["tower", "cache", "middleware", "http"]
