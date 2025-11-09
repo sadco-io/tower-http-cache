@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/tower-http-cache)](https://crates.io/crates/tower-http-cache)
 [![Documentation](https://docs.rs/tower-http-cache/badge.svg)](https://docs.rs/tower-http-cache)
-[![License](https://img.shields.io/crates/l/tower-http-cache)](LICENSE-MIT)
+[![License](https://img.shields.io/github/license/sadco-io/tower-http-cache)](https://github.com/sadco-io/tower-http-cache/blob/master/LICENSE-MIT)
 
 Tower middleware for HTTP response caching with pluggable storage backends (in-memory, Redis, and more). `tower-http-cache` brings a production-grade caching layer to Tower/Axum/Hyper stacks, with stampede protection, stale-while-revalidate, header allowlisting, compression, and policy controls out of the box.
 
