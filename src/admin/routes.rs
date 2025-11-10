@@ -213,7 +213,7 @@ pub fn validate_auth(config: &AdminConfig, auth_header: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::admin::stats::GlobalStats;
+
     use crate::backend::memory::InMemoryBackend;
 
     fn test_state() -> AdminState<InMemoryBackend> {

@@ -82,7 +82,7 @@ impl GlobalStats {
     fn record_key_hit(&self, key: &str) {
         self.key_hits
             .entry(key.to_string())
-            .or_insert_with(|| KeyHitStats::new())
+            .or_insert_with(KeyHitStats::new)
             .increment();
     }
 
@@ -210,8 +210,8 @@ where
 {
     let duration = time.duration_since(UNIX_EPOCH).unwrap_or_default();
     let secs = duration.as_secs();
-    let timestamp = chrono::DateTime::from_timestamp(secs as i64, 0)
-        .unwrap_or_else(|| chrono::DateTime::UNIX_EPOCH);
+    let timestamp =
+        chrono::DateTime::from_timestamp(secs as i64, 0).unwrap_or(chrono::DateTime::UNIX_EPOCH);
     serializer.serialize_str(&timestamp.to_rfc3339())
 }
 

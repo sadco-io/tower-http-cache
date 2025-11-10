@@ -77,11 +77,10 @@ impl MLLoggingConfig {
             return true;
         }
         use std::collections::hash_map::RandomState;
-        use std::hash::{BuildHasher, Hash, Hasher};
+        use std::hash::BuildHasher;
         let hasher = RandomState::new();
-        let mut h = hasher.build_hasher();
-        std::time::SystemTime::now().hash(&mut h);
-        let random = (h.finish() as f64) / (u64::MAX as f64);
+
+        let random = (hasher.hash_one(std::time::SystemTime::now()) as f64) / (u64::MAX as f64);
         random < self.sample_rate
     }
 }

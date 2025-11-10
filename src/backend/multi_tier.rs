@@ -159,6 +159,7 @@ where
     }
 
     /// Promotes an entry from L2 to L1.
+    #[allow(dead_code)]
     async fn promote(
         &self,
         key: &str,

@@ -7,6 +7,7 @@
 use http::{HeaderValue, Request};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::str::FromStr;
 use uuid::Uuid;
 
 /// Unique identifier for tracking a request through the system.
@@ -26,9 +27,9 @@ impl RequestId {
     /// Creates a request ID from a string value.
     ///
     /// This is useful when extracting request IDs from headers or
-    /// other sources.
-    pub fn from_str(s: &str) -> Self {
-        Self(s.to_owned())
+    /// other sources. For a fallible variant, use `RequestId::from_str()` from the `FromStr` trait.
+    pub fn from_string(s: impl Into<String>) -> Self {
+        Self(s.into())
     }
 
     /// Attempts to extract a request ID from an HTTP header.
@@ -46,7 +47,7 @@ impl RequestId {
         req.headers()
             .get("x-request-id")
             .and_then(Self::from_header)
-            .unwrap_or_else(Self::new)
+            .unwrap_or_default()
     }
 
     /// Returns the request ID as a string slice.
@@ -84,6 +85,14 @@ impl From<RequestId> for String {
     }
 }
 
+impl FromStr for RequestId {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.to_owned()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,7 +108,7 @@ mod tests {
 
     #[test]
     fn from_str_creates_request_id() {
-        let id = RequestId::from_str("custom-id-123");
+        let id = "custom-id-123".parse::<RequestId>().unwrap();
         assert_eq!(id.as_str(), "custom-id-123");
     }
 
@@ -129,7 +138,7 @@ mod tests {
 
     #[test]
     fn display_implementation() {
-        let id = RequestId::from_str("test-id");
+        let id = "test-id".parse::<RequestId>().unwrap();
         assert_eq!(format!("{}", id), "test-id");
     }
 

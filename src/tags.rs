@@ -43,15 +43,12 @@ impl TagIndex {
         for tag in &tags {
             self.forward
                 .entry(tag.clone())
-                .or_insert_with(HashSet::new)
+                .or_default()
                 .insert(key.clone());
         }
 
         // Update reverse index (key → tags)
-        self.reverse
-            .entry(key)
-            .or_insert_with(HashSet::new)
-            .extend(tags);
+        self.reverse.entry(key).or_default().extend(tags);
     }
 
     /// Retrieves all cache keys associated with a tag.
