@@ -618,7 +618,11 @@ mod tests {
         assert_eq!(stats.total_hits(), 3);
         // With a 100ms window and 3 hits, we should get at least 1800 hits/min
         let rate = stats.hits_per_minute(window_ms);
-        assert!(rate >= 0.0, "Hit rate should be non-negative, got: {}", rate);
+        assert!(
+            rate >= 0.0,
+            "Hit rate should be non-negative, got: {}",
+            rate
+        );
     }
 
     #[test]
