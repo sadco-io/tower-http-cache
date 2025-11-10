@@ -1,6 +1,6 @@
 [package]
 name = "tower-http-cache"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.75.0"
 description = "Tower-compatible caching layer with pluggable backends (in-memory, Redis, and more)"
