@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2025-11-10
+
+### Added
+
+- **Auto-refresh functionality**: Proactively refreshes frequently-accessed cache entries before they expire
+  - Lock-free frequency tracking using `AtomicU64` and `DashMap` for minimal performance overhead (< 1%)
+  - Configurable hit rate thresholds with sliding time windows
+  - Background task management with graceful shutdown via `Drop`
+  - Concurrency control using semaphore-based limits
+  - Request reconstruction from stored metadata
+  - Full observability support with metrics and tracing
+  - Comprehensive test coverage with 22 new tests
+  - `AutoRefreshConfig` for fine-grained configuration
+  - `init_auto_refresh()` method to enable proactive cache warming
+- Added tokio features: `rt`, `time`, `macros` for background task support
+
+### Changed
+
+- Enhanced `CacheLayer` with auto-refresh capabilities
+- Enhanced `CacheService` to track cache hits for frequency analysis
+- Non-breaking change: auto-refresh is disabled by default and requires explicit configuration
+
 ## [0.1.2] - 2025-11-09
 
 ### Fixed
@@ -45,7 +67,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Benchmark suite with Criterion
 - Examples for Axum and Redis integration
 
-[Unreleased]: https://github.com/sadco-io/tower-http-cache/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/sadco-io/tower-http-cache/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/sadco-io/tower-http-cache/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/sadco-io/tower-http-cache/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/sadco-io/tower-http-cache/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/sadco-io/tower-http-cache/releases/tag/v0.1.0

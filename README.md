@@ -13,6 +13,7 @@ Tower middleware for HTTP response caching with pluggable storage backends (in-m
 - ✅ **Drop-in `CacheLayer`**: wrap any Tower service; caches GET/HEAD by default.
 - 🔒 **Stampede protection**: deduplicates concurrent misses and serves stale data while recomputing.
 - ⏱ **Flexible TTLs**: positive/negative TTL, refresh-before-expiry window, stale-while-revalidate.
+- 🔄 **Auto-refresh**: proactively refreshes frequently-accessed cache entries before expiration.
 - 📦 **Pluggable storage**: in-memory backend (Moka) and optional Redis backend (async pooled).
 - 📏 **Policy guards**: min/max body size, cache-control respect/override, custom method/status filters.
 - 🧰 **Custom keys**: built-in extractors (path, path+query) plus custom closures.
@@ -24,10 +25,10 @@ Tower middleware for HTTP response caching with pluggable storage backends (in-m
 
 ```toml
 [dependencies]
-tower-http-cache = "0.1"
+tower-http-cache = "0.2"
 
 # Enable Redis support if required
-tower-http-cache = { version = "0.1", features = ["redis-backend"] }
+tower-http-cache = { version = "0.2", features = ["redis-backend"] }
 ```
 
 ---
@@ -73,6 +74,31 @@ async fn build_redis_layer(redis_url: &str) -> CacheLayer<RedisBackend> {
 }
 ```
 
+### Enabling Auto-Refresh
+
+Auto-refresh proactively refreshes frequently-accessed cache entries before they expire, reducing cache misses and latency for hot endpoints:
+
+```rust
+use std::time::Duration;
+use tower_http_cache::prelude::*;
+use tower_http_cache::refresh::AutoRefreshConfig;
+
+let cache_layer = CacheLayer::builder(InMemoryBackend::new(10_000))
+    .ttl(Duration::from_secs(120))
+    .refresh_before(Duration::from_secs(30))
+    .auto_refresh(AutoRefreshConfig {
+        enabled: true,
+        min_hits_per_minute: 10.0,
+        check_interval: Duration::from_secs(10),
+        max_concurrent_refreshes: 5,
+        ..Default::default()
+    })
+    .build();
+
+// Initialize auto-refresh with the service instance
+cache_layer.init_auto_refresh(my_service.clone()).await?;
+```
+
 ---
 
 ## Configuration Highlights
@@ -82,6 +108,7 @@ async fn build_redis_layer(redis_url: &str) -> CacheLayer<RedisBackend> {
 | `ttl` / `negative_ttl` | cache lifetime for successful and error responses |
 | `stale_while_revalidate` | serve stale data while a refresh is in progress |
 | `refresh_before` | proactively refresh the cache shortly before expiry |
+| `auto_refresh` | automatically refresh frequently-accessed entries before expiration |
 | `allow_streaming_bodies` | opt into caching streaming responses |
 | `min_body_size` / `max_body_size` | enforce size bounds for cached bodies |
 | `header_allowlist` | restrict which headers are stored alongside cached bodies |
