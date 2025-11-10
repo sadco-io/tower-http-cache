@@ -4,8 +4,14 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::logging::MLLoggingConfig;
+use crate::tags::TagPolicy;
+
 /// Type alias for the method predicate function
 type MethodPredicateFn = Arc<dyn Fn(&Method) -> bool + Send + Sync>;
+
+/// Type alias for tag extractor function
+type TagExtractorFn = Arc<dyn Fn(&Method, &http::Uri) -> Vec<String> + Send + Sync>;
 
 /// Runtime cache policy shared by the layer and backend.
 ///
@@ -27,6 +33,9 @@ pub struct CachePolicy {
     header_allowlist: Option<HashSet<String>>,
     allow_streaming_bodies: bool,
     compression: CompressionConfig,
+    ml_logging: MLLoggingConfig,
+    tag_policy: TagPolicy,
+    tag_extractor: Option<TagExtractorFn>,
 }
 
 /// Strategy for compressing cached payloads.
@@ -96,6 +105,9 @@ impl CachePolicy {
             header_allowlist: None,
             allow_streaming_bodies: false,
             compression: CompressionConfig::default(),
+            ml_logging: MLLoggingConfig::default(),
+            tag_policy: TagPolicy::default(),
+            tag_extractor: None,
         }
     }
 
@@ -154,6 +166,28 @@ impl CachePolicy {
 
     pub fn stale_while_revalidate(&self) -> Duration {
         self.stale_while_revalidate
+    }
+
+    pub fn ml_logging(&self) -> &MLLoggingConfig {
+        &self.ml_logging
+    }
+
+    pub fn tag_policy(&self) -> &TagPolicy {
+        &self.tag_policy
+    }
+
+    /// Extracts tags for a request using the configured tag extractor.
+    pub fn extract_tags(&self, method: &Method, uri: &http::Uri) -> Vec<String> {
+        if !self.tag_policy.enabled {
+            return Vec::new();
+        }
+
+        if let Some(ref extractor) = self.tag_extractor {
+            let tags = extractor(method, uri);
+            self.tag_policy.validate_tags(tags)
+        } else {
+            Vec::new()
+        }
     }
 
     /// Returns the headers that should be cached based on the allowlist.
@@ -242,6 +276,24 @@ impl CachePolicy {
         );
         self
     }
+
+    pub fn with_ml_logging(mut self, config: MLLoggingConfig) -> Self {
+        self.ml_logging = config;
+        self
+    }
+
+    pub fn with_tag_policy(mut self, policy: TagPolicy) -> Self {
+        self.tag_policy = policy;
+        self
+    }
+
+    pub fn with_tag_extractor<F>(mut self, extractor: F) -> Self
+    where
+        F: Fn(&Method, &http::Uri) -> Vec<String> + Send + Sync + 'static,
+    {
+        self.tag_extractor = Some(Arc::new(extractor));
+        self
+    }
 }
 
 impl Default for CachePolicy {
@@ -259,6 +311,9 @@ impl Default for CachePolicy {
             header_allowlist: None,
             allow_streaming_bodies: false,
             compression: CompressionConfig::default(),
+            ml_logging: MLLoggingConfig::default(),
+            tag_policy: TagPolicy::default(),
+            tag_extractor: None,
         }
     }
 }

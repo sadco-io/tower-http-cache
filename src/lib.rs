@@ -38,12 +38,22 @@
 //! ## Status
 //! The project is under active development. The public API is not yet stabilized.
 
+pub mod admin;
 pub mod backend;
 pub mod codec;
 pub mod error;
 pub mod layer;
+pub mod logging;
 pub mod policy;
 pub mod prelude;
 pub mod refresh;
+pub mod request_id;
+pub mod tags;
 
 pub use layer::{CacheLayer, CacheLayerBuilder, KeyExtractor};
+pub use logging::{CacheEvent, CacheEventType, MLLoggingConfig};
+pub use request_id::RequestId;
+pub use tags::{TagIndex, TagPolicy};
+
+#[cfg(feature = "admin-api")]
+pub use admin::{AdminConfig, AdminState};

@@ -1,9 +1,11 @@
 use async_trait::async_trait;
 use moka::future::Cache;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use super::{CacheBackend, CacheEntry, CacheRead};
 use crate::error::CacheError;
+use crate::tags::TagIndex;
 
 /// An in-memory [`CacheBackend`] implementation backed by [`moka`].
 ///
@@ -11,6 +13,7 @@ use crate::error::CacheError;
 #[derive(Clone)]
 pub struct InMemoryBackend {
     cache: Cache<String, StoredEntry>,
+    tag_index: Arc<TagIndex>,
 }
 
 #[derive(Clone)]
@@ -26,7 +29,10 @@ impl InMemoryBackend {
     /// The capacity is expressed in number of cached entries, not bytes.
     pub fn new(max_capacity: u64) -> Self {
         let cache = Cache::builder().max_capacity(max_capacity).build();
-        Self { cache }
+        Self {
+            cache,
+            tag_index: Arc::new(TagIndex::new()),
+        }
     }
 }
 
@@ -65,6 +71,13 @@ impl CacheBackend for InMemoryBackend {
         let expires_at = now + ttl;
         let stale_until = expires_at + stale_for;
 
+        // Index tags if present
+        if let Some(ref tags) = entry.tags {
+            if !tags.is_empty() {
+                self.tag_index.index(key.clone(), tags.clone());
+            }
+        }
+
         let stored = StoredEntry {
             entry,
             expires_at,
@@ -76,7 +89,16 @@ impl CacheBackend for InMemoryBackend {
 
     async fn invalidate(&self, key: &str) -> Result<(), CacheError> {
         self.cache.invalidate(key).await;
+        self.tag_index.remove(key);
         Ok(())
+    }
+
+    async fn get_keys_by_tag(&self, tag: &str) -> Result<Vec<String>, CacheError> {
+        Ok(self.tag_index.get_keys_by_tag(tag))
+    }
+
+    async fn list_tags(&self) -> Result<Vec<String>, CacheError> {
+        Ok(self.tag_index.list_tags())
     }
 }
 

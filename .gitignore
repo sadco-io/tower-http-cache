@@ -9,5 +9,8 @@ Cargo.lock
 *~
 .DS_Store
 
+# Internal planning docs
+ROADMAP.md
+
 # Snyk Security Extension - AI Rules (auto-generated)
 .cursor/rules/snyk_rules.mdc
