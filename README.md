@@ -150,6 +150,38 @@ let cache_layer = CacheLayer::builder(backend)
     .build();
 ```
 
+### Smart Streaming & Large File Handling
+
+Automatically prevent large files from overwhelming your cache:
+
+```rust
+use tower_http_cache::streaming::StreamingPolicy;
+
+let cache_layer = CacheLayer::builder(backend)
+    .policy(
+        CachePolicy::default()
+            .with_streaming_policy(StreamingPolicy {
+                enabled: true,
+                max_cacheable_size: Some(1024 * 1024), // 1MB limit
+                excluded_content_types: HashSet::from([
+                    "application/pdf".to_string(),
+                    "video/*".to_string(),
+                    "audio/*".to_string(),
+                    "application/zip".to_string(),
+                ]),
+                ..Default::default()
+            })
+    )
+    .build();
+```
+
+**Features:**
+- Automatic early detection via `Content-Length` and `size_hint()`
+- Content-Type based filtering (skip PDFs, videos, archives by default)
+- Protects multi-tier caches (large files excluded from L1)
+- Prevents memory exhaustion from large response bodies
+- Fully configurable per content-type and size
+
 ### Admin API
 
 Enable cache introspection and management endpoints:

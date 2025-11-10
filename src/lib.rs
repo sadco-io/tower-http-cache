@@ -48,11 +48,13 @@ pub mod policy;
 pub mod prelude;
 pub mod refresh;
 pub mod request_id;
+pub mod streaming;
 pub mod tags;
 
 pub use layer::{CacheLayer, CacheLayerBuilder, KeyExtractor};
 pub use logging::{CacheEvent, CacheEventType, MLLoggingConfig};
 pub use request_id::RequestId;
+pub use streaming::{StreamingDecision, StreamingPolicy};
 pub use tags::{TagIndex, TagPolicy};
 
 #[cfg(feature = "admin-api")]

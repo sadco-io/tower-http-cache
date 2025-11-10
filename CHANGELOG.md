@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2025-11-10
+
+### Added
+
+#### Smart Streaming & Large File Handling
+- **Intelligent body size detection**: Prevent large files from overwhelming cache
+  - `StreamingPolicy` for configurable streaming behavior
+  - Early detection via `Content-Length` header and `size_hint()`
+  - Content-Type based filtering (PDFs, videos, archives excluded by default)
+  - Configurable `max_cacheable_size` (default: 1MB)
+  - Wildcard content-type matching (e.g., `video/*`, `audio/*`)
+  - Force-cache lists for critical API responses
+  - Multi-tier size protection (large entries excluded from L1)
+  - 14 comprehensive integration tests
+  - 20+ unit tests with 100% branch coverage
+
+#### Multi-Tier Size Protection
+- **max_l1_entry_size**: Prevent large entries from polluting fast L1 cache
+  - Configurable size limit for L1 promotion (default: 256KB)
+  - Automatic size checking during write-through and promotion
+  - Large entries stored only in L2 for capacity efficiency
+  - Metrics tracking for skipped L1 writes and promotions
+  - Zero performance impact on small entries
+
+### Changed
+- Streaming policy enabled by default (can be disabled)
+- Size limits now apply consistently to all content types (including forced-cache types)
+
+### Performance
+- Eliminates memory exhaustion from large file responses
+- Prevents cache pollution from 5-20MB files
+- Protects L1 cache from unnecessary large entry storage
+- < 1% overhead on streaming decision path
+
 ## [0.3.0] - 2025-11-10
 
 ### Added

@@ -23,6 +23,7 @@ use crate::backend::{CacheBackend, CacheEntry, CacheRead};
 use crate::policy::CompressionStrategy;
 use crate::policy::{CachePolicy, CompressionConfig};
 use crate::refresh::{AutoRefreshConfig, RefreshCallback, RefreshManager, RefreshMetadata};
+use crate::streaming::{extract_size_info, should_stream, StreamingDecision};
 
 pub type BoxError = Box<dyn StdError + Send + Sync>;
 
@@ -663,6 +664,56 @@ where
             histogram!("tower_http_cache.backend_latency").record(start.elapsed().as_secs_f64());
 
             let (parts, body) = response.into_parts();
+
+            // NEW: Early streaming decision
+            let content_type = parts
+                .headers
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok());
+
+            let content_length = parts
+                .headers
+                .get(http::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok());
+
+            let size_hint = body.size_hint();
+
+            let streaming_decision = should_stream(
+                policy.streaming_policy(),
+                &size_hint,
+                content_type,
+                content_length,
+            );
+
+            // Check if we should skip caching and pass through
+            match streaming_decision {
+                StreamingDecision::SkipCache | StreamingDecision::StreamThrough => {
+                    // Pass through without caching - but we still need to collect
+                    // the body to match the return type
+                    #[cfg(feature = "metrics")]
+                    counter!("tower_http_cache.streaming_passthrough").increment(1);
+
+                    #[cfg(feature = "tracing")]
+                    tracing::debug!(
+                        method = %method,
+                        uri = %uri,
+                        decision = ?streaming_decision,
+                        content_type = ?content_type,
+                        size = ?extract_size_info(&size_hint, content_length),
+                        "streaming_passthrough"
+                    );
+
+                    // We need to collect the body to return the right type
+                    // In the future, this could be optimized with true streaming
+                    let collected = BodyExt::collect(body).await.map_err(|err| err.into())?;
+                    let response_bytes = collected.to_bytes();
+
+                    drop(primary_guard);
+                    return Ok(Response::from_parts(parts, Full::from(response_bytes)));
+                }
+                _ => {}
+            }
 
             let streaming = body.size_hint().upper().is_none();
             if streaming && !policy.allow_streaming_bodies() {

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::logging::MLLoggingConfig;
+use crate::streaming::StreamingPolicy;
 use crate::tags::TagPolicy;
 
 /// Type alias for the method predicate function
@@ -36,6 +37,7 @@ pub struct CachePolicy {
     ml_logging: MLLoggingConfig,
     tag_policy: TagPolicy,
     tag_extractor: Option<TagExtractorFn>,
+    streaming_policy: StreamingPolicy,
 }
 
 /// Strategy for compressing cached payloads.
@@ -108,6 +110,7 @@ impl CachePolicy {
             ml_logging: MLLoggingConfig::default(),
             tag_policy: TagPolicy::default(),
             tag_extractor: None,
+            streaming_policy: StreamingPolicy::default(),
         }
     }
 
@@ -174,6 +177,10 @@ impl CachePolicy {
 
     pub fn tag_policy(&self) -> &TagPolicy {
         &self.tag_policy
+    }
+
+    pub fn streaming_policy(&self) -> &StreamingPolicy {
+        &self.streaming_policy
     }
 
     /// Extracts tags for a request using the configured tag extractor.
@@ -294,6 +301,11 @@ impl CachePolicy {
         self.tag_extractor = Some(Arc::new(extractor));
         self
     }
+
+    pub fn with_streaming_policy(mut self, policy: StreamingPolicy) -> Self {
+        self.streaming_policy = policy;
+        self
+    }
 }
 
 impl Default for CachePolicy {
@@ -314,6 +326,7 @@ impl Default for CachePolicy {
             ml_logging: MLLoggingConfig::default(),
             tag_policy: TagPolicy::default(),
             tag_extractor: None,
+            streaming_policy: StreamingPolicy::default(),
         }
     }
 }

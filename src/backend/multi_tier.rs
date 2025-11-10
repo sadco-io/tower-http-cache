@@ -46,6 +46,10 @@ pub struct MultiTierConfig {
 
     /// Whether to write to both tiers on set (true) or L2 only (false)
     pub write_through: bool,
+
+    /// Don't store entries larger than this in L1 (default: 256KB)
+    /// Large entries are only stored in L2 to prevent L1 pollution
+    pub max_l1_entry_size: Option<usize>,
 }
 
 impl Default for MultiTierConfig {
@@ -53,6 +57,7 @@ impl Default for MultiTierConfig {
         Self {
             promotion_strategy: PromotionStrategy::default(),
             write_through: true,
+            max_l1_entry_size: Some(256 * 1024), // 256KB
         }
     }
 }
@@ -202,38 +207,60 @@ where
             self.record_hit(key);
 
             if self.should_promote(key) {
-                #[cfg(feature = "metrics")]
-                metrics::counter!("tower_http_cache.tier.promoted").increment(1);
+                let entry_size = read.entry.body.len();
 
-                // Calculate remaining TTL for promotion
-                let ttl = if let Some(expires_at) = read.expires_at {
-                    expires_at
-                        .duration_since(std::time::SystemTime::now())
-                        .unwrap_or(Duration::from_secs(60))
+                // Check if entry is small enough for L1
+                let should_promote_l1 = if let Some(max_size) = self.config.max_l1_entry_size {
+                    entry_size <= max_size
                 } else {
-                    Duration::from_secs(60)
+                    true
                 };
 
-                let stale_for = if let (Some(stale_until), Some(expires_at)) =
-                    (read.stale_until, read.expires_at)
-                {
-                    stale_until.duration_since(expires_at).unwrap_or_default()
+                if should_promote_l1 {
+                    #[cfg(feature = "metrics")]
+                    metrics::counter!("tower_http_cache.tier.promoted").increment(1);
+
+                    // Calculate remaining TTL for promotion
+                    let ttl = if let Some(expires_at) = read.expires_at {
+                        expires_at
+                            .duration_since(std::time::SystemTime::now())
+                            .unwrap_or(Duration::from_secs(60))
+                    } else {
+                        Duration::from_secs(60)
+                    };
+
+                    let stale_for = if let (Some(stale_until), Some(expires_at)) =
+                        (read.stale_until, read.expires_at)
+                    {
+                        stale_until.duration_since(expires_at).unwrap_or_default()
+                    } else {
+                        Duration::ZERO
+                    };
+
+                    // Promote asynchronously (best effort)
+                    let entry = read.entry.clone();
+                    let key = key.to_string();
+                    let l1 = self.l1.clone();
+                    let key_stats = self.key_stats.clone();
+
+                    tokio::spawn(async move {
+                        let _ = l1.set(key.clone(), entry, ttl, stale_for).await;
+                        if let Some(stats) = key_stats.get(&key) {
+                            stats.reset();
+                        }
+                    });
                 } else {
-                    Duration::ZERO
-                };
+                    #[cfg(feature = "metrics")]
+                    metrics::counter!("tower_http_cache.tier.promotion_skipped_large").increment(1);
 
-                // Promote asynchronously (best effort)
-                let entry = read.entry.clone();
-                let key = key.to_string();
-                let l1 = self.l1.clone();
-                let key_stats = self.key_stats.clone();
-
-                tokio::spawn(async move {
-                    let _ = l1.set(key.clone(), entry, ttl, stale_for).await;
-                    if let Some(stats) = key_stats.get(&key) {
-                        stats.reset();
-                    }
-                });
+                    #[cfg(feature = "tracing")]
+                    tracing::debug!(
+                        key = %key,
+                        size = entry_size,
+                        max_l1_size = ?self.config.max_l1_entry_size,
+                        "skipping promotion for large entry"
+                    );
+                }
             }
 
             return Ok(Some(read));
@@ -249,14 +276,39 @@ where
         ttl: Duration,
         stale_for: Duration,
     ) -> Result<(), CacheError> {
+        let entry_size = entry.body.len();
+
         // Always write to L2
         self.l2
             .set(key.clone(), entry.clone(), ttl, stale_for)
             .await?;
 
-        // Optionally write to L1 if write-through is enabled
+        // Optionally write to L1 if write-through is enabled and size is acceptable
         if self.config.write_through {
-            let _ = self.l1.set(key.clone(), entry, ttl, stale_for).await;
+            let should_write_l1 = if let Some(max_size) = self.config.max_l1_entry_size {
+                if entry_size <= max_size {
+                    true
+                } else {
+                    #[cfg(feature = "metrics")]
+                    metrics::counter!("tower_http_cache.tier.l1_skipped_large").increment(1);
+
+                    #[cfg(feature = "tracing")]
+                    tracing::debug!(
+                        key = %key,
+                        size = entry_size,
+                        max_l1_size = max_size,
+                        "skipping L1 write for large entry"
+                    );
+
+                    false
+                }
+            } else {
+                true
+            };
+
+            if should_write_l1 {
+                let _ = self.l1.set(key.clone(), entry, ttl, stale_for).await;
+            }
         }
 
         Ok(())
@@ -352,6 +404,13 @@ impl<L1, L2> MultiTierBuilder<L1, L2> {
     /// Enables or disables write-through to L1.
     pub fn write_through(mut self, enabled: bool) -> Self {
         self.config.write_through = enabled;
+        self
+    }
+
+    /// Sets the maximum entry size for L1 cache.
+    /// Entries larger than this will only be stored in L2.
+    pub fn max_l1_entry_size(mut self, size: Option<usize>) -> Self {
+        self.config.max_l1_entry_size = size;
         self
     }
 
