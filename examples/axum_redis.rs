@@ -11,18 +11,18 @@ fn main() {
 #[cfg(feature = "redis-backend")]
 use std::net::SocketAddr;
 #[cfg(feature = "redis-backend")]
-use std::sync::Arc;
-#[cfg(feature = "redis-backend")]
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "redis-backend")]
+use std::sync::Arc;
 #[cfg(feature = "redis-backend")]
 use std::time::Duration;
 
 #[cfg(feature = "redis-backend")]
-use axum::{Router, routing::get};
-#[cfg(feature = "redis-backend")]
-use redis::Client;
+use axum::{routing::get, Router};
 #[cfg(feature = "redis-backend")]
 use redis::aio::ConnectionManager;
+#[cfg(feature = "redis-backend")]
+use redis::Client;
 #[cfg(feature = "redis-backend")]
 use tower::ServiceBuilder;
 #[cfg(feature = "redis-backend")]

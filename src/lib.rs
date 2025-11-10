@@ -44,5 +44,6 @@ pub mod error;
 pub mod layer;
 pub mod policy;
 pub mod prelude;
+pub mod refresh;
 
 pub use layer::{CacheLayer, CacheLayerBuilder, KeyExtractor};

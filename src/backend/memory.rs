@@ -86,7 +86,7 @@ mod tests {
     use crate::backend::CacheEntry;
     use bytes::Bytes;
     use http::{StatusCode, Version};
-    use tokio::time::{Duration, sleep};
+    use tokio::time::{sleep, Duration};
 
     fn entry_with_body(body: &'static [u8]) -> CacheEntry {
         CacheEntry::new(
