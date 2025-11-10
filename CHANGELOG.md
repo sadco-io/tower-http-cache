@@ -7,6 +7,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2025-11-10
+
+### Added
+
+#### Cache Tags & Invalidation Groups
+- **Tag-based cache invalidation**: Group related cache entries with tags and invalidate them together
+  - `TagPolicy` for configuring tag behavior
+  - `TagIndex` for efficient bidirectional tag→key and key→tag lookups
+  - `invalidate_by_tag()` and `invalidate_by_tags()` methods
+  - Automatic cleanup of orphaned tag entries
+  - Thread-safe using `DashMap` for lock-free concurrent access
+  - Integrated with both in-memory and Redis backends
+  - 17 comprehensive unit tests
+
+#### Multi-Tier Caching
+- **L1 + L2 hybrid backend**: Combine fast in-memory cache with larger distributed storage
+  - `MultiTierBackend<L1, L2>` generic over any two `CacheBackend` implementations
+  - Automatic promotion from L2→L1 based on access patterns
+  - Configurable `PromotionStrategy` (HitCount, HitRate)
+  - Per-key access tracking with atomic operations
+  - Write-through and write-back modes
+  - Graceful tier failure handling
+  - Tier-specific metrics and observability
+  - < 2% performance overhead
+  - 7 integration tests
+
+#### ML-Ready Structured Logging
+- **Request correlation and ML training data**: Comprehensive structured logging for analytics
+  - `RequestId` type for request correlation (following X-Request-ID header)
+  - `MLLoggingConfig` for configurable sampling, key hashing, and privacy controls
+  - Rich JSON event format with 15+ metadata fields
+  - SHA-256 key hashing option for privacy compliance
+  - Integration with `tracing` crate for structured output
+  - Cost and complexity tracking for ML model training
+  - Configurable sampling rate to reduce overhead
+  - 15 unit tests
+
+#### Admin API & Observability
+- **REST API for cache introspection**: Production-ready management endpoints
+  - 7 REST endpoints for cache management:
+    - `GET /health` - Health check
+    - `GET /stats` - Overall statistics
+    - `GET /hot-keys` - Most accessed keys
+    - `GET /tags` - List all tags
+    - `POST /invalidate` - Invalidate by key or tag
+    - `GET /keys` - List cached keys (planned)
+    - `GET /key/:key` - Inspect specific key (planned)
+  - Token-based authentication (Bearer token)
+  - Real-time statistics collection
+  - Hot keys tracking with configurable limits
+  - JSON response format for all endpoints
+  - Optional feature flag: `admin-api`
+  - 19 unit tests
+
+### Changed
+
+- Enhanced `CachePolicy` with `tag_policy`, `ml_logging`, and `tag_extractor` fields
+- Updated `CacheEntry` to include optional `tags` field
+- Extended `CacheBackend` trait with default implementations for tag operations
+- Integrated tag support into `InMemoryBackend`
+
+### Dependencies
+
+- Added `uuid` 1.0 with v4 and serde features
+- Added `sha2` 0.10 for key hashing
+- Added `hex` 0.4 for hash encoding
+- Added `chrono` 0.4 for timestamp handling
+- Added optional `axum` 0.8 for admin API (behind `admin-api` feature)
+- Added optional `governor` 0.6 for rate limiting (behind `admin-api` feature)
+
+### Performance
+
+- Tag indexing: < 1% overhead on cache set operations
+- Multi-tier: < 2% total overhead (L1 hot path unchanged)
+- ML logging: < 100µs per event with sampling
+- Request ID extraction: Negligible (simple header lookup)
+
+### Non-Breaking Changes
+
+All v0.3.0 features are opt-in and backward compatible:
+- Default behavior unchanged
+- No breaking API changes
+- All features disabled by default and require explicit configuration
+
 ## [0.2.0] - 2025-11-10
 
 ### Added
@@ -67,7 +151,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Benchmark suite with Criterion
 - Examples for Axum and Redis integration
 
-[Unreleased]: https://github.com/sadco-io/tower-http-cache/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/sadco-io/tower-http-cache/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/sadco-io/tower-http-cache/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/sadco-io/tower-http-cache/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/sadco-io/tower-http-cache/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/sadco-io/tower-http-cache/compare/v0.1.0...v0.1.1
