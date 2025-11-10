@@ -4,8 +4,8 @@ use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
-use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
+use dashmap::DashMap;
 use futures_util::future::BoxFuture;
 use http::header::{CACHE_CONTROL, PRAGMA};
 use http::{HeaderMap, Method, Request, Response, Uri};
@@ -22,6 +22,7 @@ use crate::backend::{CacheBackend, CacheEntry, CacheRead};
 #[cfg(feature = "compression")]
 use crate::policy::CompressionStrategy;
 use crate::policy::{CachePolicy, CompressionConfig};
+use crate::refresh::{AutoRefreshConfig, RefreshCallback, RefreshManager, RefreshMetadata};
 
 pub type BoxError = Box<dyn StdError + Send + Sync>;
 
@@ -42,6 +43,7 @@ pub struct CacheLayer<B> {
     policy: CachePolicy,
     key_extractor: KeyExtractor,
     locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
+    refresh_manager: Option<Arc<RefreshManager>>,
 }
 
 /// Strategy used to turn requests into cache keys.
@@ -113,6 +115,7 @@ pub struct CacheLayerBuilder<B> {
     backend: B,
     policy: CachePolicy,
     key_extractor: KeyExtractor,
+    auto_refresh_config: Option<AutoRefreshConfig>,
 }
 
 impl<B> CacheLayerBuilder<B>
@@ -124,6 +127,7 @@ where
             backend,
             policy: CachePolicy::default(),
             key_extractor: KeyExtractor::default(),
+            auto_refresh_config: None,
         }
     }
 
@@ -207,12 +211,27 @@ where
         self
     }
 
+    /// Enables auto-refresh functionality with the provided configuration.
+    ///
+    /// When enabled, frequently accessed cache entries will be proactively
+    /// refreshed before they expire, reducing cache misses and latency.
+    pub fn auto_refresh(mut self, config: AutoRefreshConfig) -> Self {
+        self.auto_refresh_config = Some(config);
+        self
+    }
+
     pub fn build(self) -> CacheLayer<B> {
+        let refresh_manager = self
+            .auto_refresh_config
+            .filter(|cfg| cfg.enabled)
+            .map(|cfg| Arc::new(RefreshManager::new(cfg)));
+
         CacheLayer {
             backend: self.backend,
             policy: self.policy,
             key_extractor: self.key_extractor,
             locks: Arc::new(DashMap::new()),
+            refresh_manager,
         }
     }
 }
@@ -244,52 +263,52 @@ where
     }
 
     pub fn with_ttl(mut self, ttl: Duration) -> Self {
-        self.policy = self.policy.with_ttl(ttl);
+        self.policy = self.policy.clone().with_ttl(ttl);
         self
     }
 
     pub fn with_negative_ttl(mut self, ttl: Duration) -> Self {
-        self.policy = self.policy.with_negative_ttl(ttl);
+        self.policy = self.policy.clone().with_negative_ttl(ttl);
         self
     }
 
     pub fn with_stale_while_revalidate(mut self, duration: Duration) -> Self {
-        self.policy = self.policy.with_stale_while_revalidate(duration);
+        self.policy = self.policy.clone().with_stale_while_revalidate(duration);
         self
     }
 
     pub fn with_refresh_before(mut self, duration: Duration) -> Self {
-        self.policy = self.policy.with_refresh_before(duration);
+        self.policy = self.policy.clone().with_refresh_before(duration);
         self
     }
 
     pub fn with_max_body_size(mut self, size: Option<usize>) -> Self {
-        self.policy = self.policy.with_max_body_size(size);
+        self.policy = self.policy.clone().with_max_body_size(size);
         self
     }
 
     pub fn with_min_body_size(mut self, size: Option<usize>) -> Self {
-        self.policy = self.policy.with_min_body_size(size);
+        self.policy = self.policy.clone().with_min_body_size(size);
         self
     }
 
     pub fn with_allow_streaming_bodies(mut self, allow: bool) -> Self {
-        self.policy = self.policy.with_allow_streaming_bodies(allow);
+        self.policy = self.policy.clone().with_allow_streaming_bodies(allow);
         self
     }
 
     pub fn with_compression(mut self, config: CompressionConfig) -> Self {
-        self.policy = self.policy.with_compression(config);
+        self.policy = self.policy.clone().with_compression(config);
         self
     }
 
     pub fn with_respect_cache_control(mut self, enabled: bool) -> Self {
-        self.policy = self.policy.with_respect_cache_control(enabled);
+        self.policy = self.policy.clone().with_respect_cache_control(enabled);
         self
     }
 
     pub fn with_cache_statuses(mut self, statuses: impl IntoIterator<Item = u16>) -> Self {
-        self.policy = self.policy.with_statuses(statuses);
+        self.policy = self.policy.clone().with_statuses(statuses);
         self
     }
 
@@ -297,7 +316,7 @@ where
     where
         F: Fn(&Method) -> bool + Send + Sync + 'static,
     {
-        self.policy = self.policy.with_method_predicate(predicate);
+        self.policy = self.policy.clone().with_method_predicate(predicate);
         self
     }
 
@@ -306,13 +325,49 @@ where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.policy = self.policy.with_header_allowlist(headers);
+        self.policy = self.policy.clone().with_header_allowlist(headers);
         self
     }
 
     pub fn with_key_extractor(mut self, extractor: KeyExtractor) -> Self {
         self.key_extractor = extractor;
         self
+    }
+
+    /// Manually initialize the auto-refresh manager with a service instance.
+    ///
+    /// This should be called after constructing the service to start the background
+    /// refresh task. This is only necessary if auto-refresh is enabled.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let layer = CacheLayer::builder(backend)
+    ///     .auto_refresh(config)
+    ///     .build();
+    ///
+    /// layer.init_auto_refresh(my_service.clone()).await?;
+    /// ```
+    pub async fn init_auto_refresh<S, ResBody>(&self, service: S) -> Result<(), String>
+    where
+        S: Service<Request<()>, Response = Response<ResBody>> + Clone + Send + Sync + 'static,
+        S::Future: Send + 'static,
+        S::Error: Into<BoxError> + Send,
+        ResBody: Body<Data = Bytes> + Send + 'static,
+        ResBody::Error: Into<BoxError> + Send,
+        B: Clone,
+    {
+        if let Some(ref manager) = self.refresh_manager {
+            let callback = Arc::new(CacheRefreshCallback::new(
+                service,
+                self.backend.clone(),
+                self.policy.clone(),
+                self.key_extractor.clone(),
+            ));
+            manager.start(callback).await
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -329,6 +384,24 @@ where
             policy: self.policy.clone(),
             key_extractor: self.key_extractor.clone(),
             locks: self.locks.clone(),
+            refresh_manager: self.refresh_manager.clone(),
+        }
+    }
+}
+
+impl<B> Drop for CacheLayer<B> {
+    fn drop(&mut self) {
+        // Trigger graceful shutdown of refresh manager
+        // We use tokio::spawn to avoid blocking in Drop
+        if let Some(manager) = &self.refresh_manager {
+            let manager = manager.clone();
+            // Best-effort shutdown - spawn detached task
+            // Note: We cannot guarantee execution in Drop, but we try our best
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    manager.shutdown().await;
+                });
+            }
         }
     }
 }
@@ -340,7 +413,123 @@ pub struct CacheService<S, B> {
     policy: CachePolicy,
     key_extractor: KeyExtractor,
     locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
+    refresh_manager: Option<Arc<RefreshManager>>,
 }
+
+/// Implementation of RefreshCallback for CacheService.
+struct CacheRefreshCallback<S, B> {
+    inner: S,
+    backend: B,
+    policy: CachePolicy,
+}
+
+impl<S, B> CacheRefreshCallback<S, B> {
+    fn new(inner: S, backend: B, policy: CachePolicy, _key_extractor: KeyExtractor) -> Self {
+        Self {
+            inner,
+            backend,
+            policy,
+        }
+    }
+}
+
+impl<S, B, ResBody> RefreshCallback for CacheRefreshCallback<S, B>
+where
+    S: Service<Request<()>, Response = Response<ResBody>> + Clone + Send + Sync + 'static,
+    S::Future: Send + 'static,
+    S::Error: Into<BoxError> + Send,
+    ResBody: Body<Data = Bytes> + Send + 'static,
+    ResBody::Error: Into<BoxError> + Send,
+    B: CacheBackend,
+{
+    fn refresh(&self, key: String, metadata: RefreshMetadata) -> crate::refresh::RefreshFuture {
+        let backend = self.backend.clone();
+        let policy = self.policy.clone();
+        let inner = self.inner.clone();
+
+        Box::pin(async move {
+            #[cfg(feature = "tracing")]
+            tracing::debug!(key = %key, uri = %metadata.uri, "Auto-refresh triggered");
+
+            // Reconstruct the request
+            let request = match metadata.try_into_request() {
+                Some(req) => req,
+                None => {
+                    #[cfg(feature = "tracing")]
+                    tracing::warn!(key = %key, "Failed to reconstruct request for auto-refresh");
+                    return Err("Failed to reconstruct request".into());
+                }
+            };
+
+            // Call the inner service
+            let service = inner;
+            let response = match service.oneshot(request).await {
+                Ok(resp) => resp,
+                Err(_err) => {
+                    #[cfg(feature = "tracing")]
+                    tracing::error!(key = %key, "Service error during auto-refresh");
+                    return Err("Service error during refresh".into());
+                }
+            };
+
+            let (parts, body) = response.into_parts();
+
+            // Collect the body
+            let collected = match BodyExt::collect(body).await {
+                Ok(c) => c,
+                Err(_err) => {
+                    #[cfg(feature = "tracing")]
+                    tracing::error!(key = %key, "Body collection error during auto-refresh");
+                    return Err("Body collection error".into());
+                }
+            };
+
+            let cache_bytes = collected.to_bytes();
+
+            // Check if we should cache this response
+            let body_too_large = policy
+                .max_body_size()
+                .is_some_and(|max| cache_bytes.len() > max);
+            let body_too_small = policy
+                .min_body_size()
+                .is_some_and(|min| cache_bytes.len() < min);
+
+            if body_too_large || body_too_small {
+                return Ok(()); // Successfully refreshed but not stored
+            }
+
+            // Store the refreshed entry
+            if let Some(ttl) = policy.ttl_for(parts.status) {
+                if !ttl.is_zero() {
+                    let stale_for = policy.stale_while_revalidate();
+                    let headers_to_cache = policy.headers_to_cache(&parts.headers);
+                    let (compressed_bytes, _compressed) =
+                        maybe_compress(cache_bytes, policy.compression());
+
+                    let entry = CacheEntry::new(
+                        parts.status,
+                        parts.version,
+                        headers_to_cache,
+                        compressed_bytes,
+                    );
+
+                    if let Err(_err) = backend.set(key.clone(), entry, ttl, stale_for).await {
+                        #[cfg(feature = "tracing")]
+                        tracing::error!(key = %key, "Failed to store refreshed entry");
+                        return Err("Failed to store entry".into());
+                    }
+                }
+            }
+
+            Ok(())
+        })
+    }
+}
+
+// Note: We cannot easily initialize the refresh manager from within the service
+// because the service may have different type parameters than required by the callback.
+// Instead, users who want to use auto-refresh should ensure the service is called at least once,
+// or manually initialize the refresh functionality if needed.
 
 impl<S, B, ReqBody, ResBody> Service<Request<ReqBody>> for CacheService<S, B>
 where
@@ -378,6 +567,14 @@ where
         let inner = self.inner.clone();
         let stale_window = policy.stale_while_revalidate();
         let refresh_before = policy.refresh_before();
+        let refresh_manager = self.refresh_manager.clone();
+
+        // Prepare refresh metadata if auto-refresh is enabled
+        let refresh_metadata = if refresh_manager.is_some() && key.is_some() {
+            Some(RefreshMetadata::from_request(&req))
+        } else {
+            None
+        };
 
         Box::pin(async move {
             #[cfg(feature = "tracing")]
@@ -390,11 +587,23 @@ where
                         HitState::Fresh(entry) => {
                             #[cfg(feature = "metrics")]
                             counter!("tower_http_cache.hit").increment(1);
+
+                            // Record hit for auto-refresh tracking
+                            if let Some(ref manager) = refresh_manager {
+                                manager.tracker().record_hit(key_ref);
+                            }
+
                             return Ok(entry.into_response());
                         }
                         HitState::Stale(entry) => {
                             #[cfg(feature = "metrics")]
                             counter!("tower_http_cache.stale_hit").increment(1);
+
+                            // Record hit for auto-refresh tracking
+                            if let Some(ref manager) = refresh_manager {
+                                manager.tracker().record_hit(key_ref);
+                            }
+
                             stale_entry = Some(entry);
                         }
                         HitState::Expired => {}
@@ -516,6 +725,13 @@ where
                             } else {
                                 #[cfg(feature = "metrics")]
                                 counter!("tower_http_cache.store").increment(1);
+
+                                // Store refresh metadata if auto-refresh is enabled
+                                if let (Some(ref manager), Some(metadata)) =
+                                    (&refresh_manager, refresh_metadata)
+                                {
+                                    manager.store_metadata(key_ref.clone(), metadata);
+                                }
                             }
                         }
                     }
@@ -638,7 +854,7 @@ fn cache_control_disallows(headers: &HeaderMap) -> bool {
 
 #[cfg(feature = "compression")]
 fn maybe_compress(bytes: Bytes, config: CompressionConfig) -> (Bytes, bool) {
-    use flate2::{Compression, write::GzEncoder};
+    use flate2::{write::GzEncoder, Compression};
     use std::io::Write;
 
     match config.strategy {

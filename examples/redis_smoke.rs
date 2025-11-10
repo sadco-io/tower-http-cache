@@ -15,9 +15,9 @@ fn main() {
 #[cfg(feature = "redis-backend")]
 use std::net::SocketAddr;
 #[cfg(feature = "redis-backend")]
-use std::sync::Arc;
-#[cfg(feature = "redis-backend")]
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "redis-backend")]
+use std::sync::Arc;
 #[cfg(feature = "redis-backend")]
 use std::time::Duration;
 
@@ -25,23 +25,23 @@ use std::time::Duration;
 use axum::http::StatusCode;
 #[cfg(feature = "redis-backend")]
 use axum::{
-    Router,
     extract::State,
     response::{Html, IntoResponse, Response},
     routing::get,
+    Router,
 };
 #[cfg(feature = "redis-backend")]
 use http_body_util::{BodyExt, Full};
 #[cfg(feature = "redis-backend")]
+use redis::aio::ConnectionManager;
+#[cfg(feature = "redis-backend")]
 use redis::Client;
 #[cfg(feature = "redis-backend")]
-use redis::aio::ConnectionManager;
+use tower::service_fn;
 #[cfg(feature = "redis-backend")]
 use tower::Layer;
 #[cfg(feature = "redis-backend")]
 use tower::ServiceExt;
-#[cfg(feature = "redis-backend")]
-use tower::service_fn;
 #[cfg(feature = "redis-backend")]
 use tower_http_cache::prelude::*;
 

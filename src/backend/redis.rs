@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
+use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 

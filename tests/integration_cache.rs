@@ -6,8 +6,8 @@ use bytes::Bytes;
 use http::header::CACHE_CONTROL;
 use http::{HeaderValue, Request, StatusCode};
 use http_body::Frame;
-use http_body_util::{BodyExt, Full};
 use http_body_util::StreamBody;
+use http_body_util::{BodyExt, Full};
 use std::convert::Infallible;
 use tokio::time::sleep;
 use tower::service_fn;
@@ -30,7 +30,9 @@ async fn caches_successful_gets() {
             let counter = counter.clone();
             async move {
                 let value = counter.fetch_add(1, Ordering::SeqCst) + 1;
-                Ok::<_, std::convert::Infallible>(http::Response::new(Full::from(value.to_string())))
+                Ok::<_, std::convert::Infallible>(http::Response::new(Full::from(
+                    value.to_string(),
+                )))
             }
         }
     });
@@ -40,8 +42,10 @@ async fn caches_successful_gets() {
     let first = service
         .call(Request::new(()))
         .await
-        .expect("fir
-        st call succeeds")
+        .expect(
+            "fir
+        st call succeeds",
+        )
         .into_body()
         .collect()
         .await
@@ -86,7 +90,9 @@ async fn respects_cache_control_bypass() {
                     "request should propagate cache-control header"
                 );
                 let value = counter.fetch_add(1, Ordering::SeqCst) + 1;
-                Ok::<_, std::convert::Infallible>(http::Response::new(Full::from(value.to_string())))
+                Ok::<_, std::convert::Infallible>(http::Response::new(Full::from(
+                    value.to_string(),
+                )))
             }
         }
     }));
@@ -141,8 +147,7 @@ async fn caches_negative_responses_for_negative_ttl() {
             let counter = counter.clone();
             async move {
                 let value = counter.fetch_add(1, Ordering::SeqCst) + 1;
-                let mut response =
-                    http::Response::new(Full::from(format!("not-found-{value}")));
+                let mut response = http::Response::new(Full::from(format!("not-found-{value}")));
                 *response.status_mut() = StatusCode::NOT_FOUND;
                 Ok::<_, std::convert::Infallible>(response)
             }
@@ -209,7 +214,9 @@ async fn concurrent_requests_share_refresh_work() {
             let counter = counter.clone();
             async move {
                 let value = counter.fetch_add(1, Ordering::SeqCst) + 1;
-                Ok::<_, std::convert::Infallible>(http::Response::new(Full::from(value.to_string())))
+                Ok::<_, std::convert::Infallible>(http::Response::new(Full::from(
+                    value.to_string(),
+                )))
             }
         }
     });
@@ -294,16 +301,13 @@ async fn header_allowlist_filters_cached_headers() {
             let counter = counter.clone();
             async move {
                 let value = counter.fetch_add(1, Ordering::SeqCst) + 1;
-                let mut response =
-                    http::Response::new(Full::from(value.to_string()));
-                response.headers_mut().insert(
-                    "x-allowed",
-                    HeaderValue::from_static("yes"),
-                );
-                response.headers_mut().insert(
-                    "x-blocked",
-                    HeaderValue::from_static("no"),
-                );
+                let mut response = http::Response::new(Full::from(value.to_string()));
+                response
+                    .headers_mut()
+                    .insert("x-allowed", HeaderValue::from_static("yes"));
+                response
+                    .headers_mut()
+                    .insert("x-blocked", HeaderValue::from_static("no"));
                 Ok::<_, Infallible>(response)
             }
         }
@@ -330,8 +334,7 @@ async fn header_allowlist_filters_cached_headers() {
         .await
         .expect("first body collected")
         .to_bytes();
-    let first_text =
-        String::from_utf8(first_bytes.to_vec()).expect("first body utf-8");
+    let first_text = String::from_utf8(first_bytes.to_vec()).expect("first body utf-8");
     assert_eq!(first_text, "1");
 
     service.ready().await.expect("service ready");
@@ -353,8 +356,7 @@ async fn header_allowlist_filters_cached_headers() {
         .await
         .expect("cached body collected")
         .to_bytes();
-    let cached_text =
-        String::from_utf8(cached_bytes.to_vec()).expect("cached body utf-8");
+    let cached_text = String::from_utf8(cached_bytes.to_vec()).expect("cached body utf-8");
     assert_eq!(cached_text, "1");
     assert_eq!(counter.load(Ordering::SeqCst), 1);
 }
@@ -391,8 +393,7 @@ async fn max_body_size_prevents_caching() {
         .await
         .expect("first body collected")
         .to_bytes();
-    let first_text =
-        String::from_utf8(first.to_vec()).expect("first body utf-8");
+    let first_text = String::from_utf8(first.to_vec()).expect("first body utf-8");
 
     service.ready().await.expect("service ready");
     let second = service
@@ -404,8 +405,7 @@ async fn max_body_size_prevents_caching() {
         .await
         .expect("second body collected")
         .to_bytes();
-    let second_text =
-        String::from_utf8(second.to_vec()).expect("second body utf-8");
+    let second_text = String::from_utf8(second.to_vec()).expect("second body utf-8");
 
     assert_eq!(first_text, "large-body-1");
     assert_eq!(second_text, "large-body-2");
@@ -444,8 +444,7 @@ async fn min_body_size_prevents_caching() {
         .await
         .expect("first body collected")
         .to_bytes();
-    let first_text =
-        String::from_utf8(first.to_vec()).expect("first body utf-8");
+    let first_text = String::from_utf8(first.to_vec()).expect("first body utf-8");
 
     service.ready().await.expect("service ready");
     let second = service
@@ -457,8 +456,7 @@ async fn min_body_size_prevents_caching() {
         .await
         .expect("second body collected")
         .to_bytes();
-    let second_text =
-        String::from_utf8(second.to_vec()).expect("second body utf-8");
+    let second_text = String::from_utf8(second.to_vec()).expect("second body utf-8");
 
     assert_eq!(first_text, "tiny-1");
     assert_eq!(second_text, "tiny-2");
@@ -487,9 +485,7 @@ async fn streaming_bodies_not_cached_when_disabled() {
                     |state| async move {
                         state.map(|bytes| {
                             (
-                                Ok::<Frame<Bytes>, Infallible>(
-                                    Frame::data(bytes.clone()),
-                                ),
+                                Ok::<Frame<Bytes>, Infallible>(Frame::data(bytes.clone())),
                                 None,
                             )
                         })
@@ -511,8 +507,7 @@ async fn streaming_bodies_not_cached_when_disabled() {
         .await
         .expect("first body collected")
         .to_bytes();
-    let first_text =
-        String::from_utf8(first.to_vec()).expect("first body utf-8");
+    let first_text = String::from_utf8(first.to_vec()).expect("first body utf-8");
 
     service.ready().await.expect("service ready");
     let second = service
@@ -524,8 +519,7 @@ async fn streaming_bodies_not_cached_when_disabled() {
         .await
         .expect("second body collected")
         .to_bytes();
-    let second_text =
-        String::from_utf8(second.to_vec()).expect("second body utf-8");
+    let second_text = String::from_utf8(second.to_vec()).expect("second body utf-8");
 
     assert_eq!(first_text, "stream-1");
     assert_eq!(second_text, "stream-2");
@@ -696,8 +690,7 @@ async fn compression_caches_gzip_payloads() {
         .await
         .expect("first body collected")
         .to_bytes();
-    let first_text =
-        String::from_utf8(first.to_vec()).expect("first body utf-8");
+    let first_text = String::from_utf8(first.to_vec()).expect("first body utf-8");
     assert_eq!(first_text, payload);
 
     service.ready().await.expect("service ready");
@@ -724,4 +717,3 @@ async fn compression_caches_gzip_payloads() {
     assert_eq!(decompressed, payload);
     assert_eq!(counter.load(Ordering::SeqCst), 1);
 }
-
