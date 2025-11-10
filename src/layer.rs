@@ -333,6 +333,7 @@ where
     }
 }
 
+#[derive(Clone)]
 pub struct CacheService<S, B> {
     inner: S,
     backend: B,
@@ -769,5 +770,23 @@ mod tests {
             }
             StampedeHandle::Secondary(_) => panic!("expected primary guard"),
         }
+    }
+
+    #[test]
+    fn cache_service_implements_clone() {
+        use crate::backend::memory::InMemoryBackend;
+        use tower::service_fn;
+
+        // Compile-time check that CacheService implements Clone
+        fn assert_clone<T: Clone>(_: &T) {}
+
+        let backend = InMemoryBackend::new(100);
+        let layer = CacheLayer::new(backend);
+        let service = layer.layer(service_fn(|_req: http::Request<()>| async {
+            Ok::<_, std::convert::Infallible>(http::Response::new(()))
+        }));
+
+        // This will fail to compile if CacheService doesn't implement Clone
+        assert_clone(&service);
     }
 }

@@ -7,13 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.1] - 2025-01-09
+## [0.1.2] - 2025-11-09
+
+### Fixed
+
+- Added `Clone` implementation to `CacheService` to resolve compatibility issues with Axum's `Router::layer` API
+
+## [0.1.1] - 2025-11-09
 
 ### Fixed
 
 - Corrected repository URL in Cargo.toml to point to `sadco-io/tower-http-cache`
 
-## [0.1.0] - 2025-01-09
+## [0.1.0] - 2025-11-09
 
 ### Added
 
@@ -39,6 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Benchmark suite with Criterion
 - Examples for Axum and Redis integration
 
-[Unreleased]: https://github.com/sadco-io/tower-http-cache/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/sadco-io/tower-http-cache/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/sadco-io/tower-http-cache/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/sadco-io/tower-http-cache/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/sadco-io/tower-http-cache/releases/tag/v0.1.0
