@@ -14,6 +14,10 @@ Tower middleware for HTTP response caching with pluggable storage backends (in-m
 - 🔒 **Stampede protection**: deduplicates concurrent misses and serves stale data while recomputing.
 - ⏱ **Flexible TTLs**: positive/negative TTL, refresh-before-expiry window, stale-while-revalidate.
 - 🔄 **Auto-refresh**: proactively refreshes frequently-accessed cache entries before expiration.
+- 🏷️ **Cache Tags**: group and invalidate related cache entries together.
+- 🎯 **Multi-Tier**: hybrid L1/L2 caching for optimal performance and capacity.
+- 📊 **Admin API**: REST endpoints for cache introspection and management.
+- 🤖 **ML-Ready Logging**: structured logs with request correlation for ML training.
 - 📦 **Pluggable storage**: in-memory backend (Moka) and optional Redis backend (async pooled).
 - 📏 **Policy guards**: min/max body size, cache-control respect/override, custom method/status filters.
 - 🧰 **Custom keys**: built-in extractors (path, path+query) plus custom closures.
@@ -25,10 +29,13 @@ Tower middleware for HTTP response caching with pluggable storage backends (in-m
 
 ```toml
 [dependencies]
-tower-http-cache = "0.2"
+tower-http-cache = "0.3"
 
 # Enable Redis support if required
-tower-http-cache = { version = "0.2", features = ["redis-backend"] }
+tower-http-cache = { version = "0.3", features = ["redis-backend"] }
+
+# With admin API support
+tower-http-cache = { version = "0.3", features = ["admin-api"] }
 ```
 
 ---
@@ -99,6 +106,106 @@ let cache_layer = CacheLayer::builder(InMemoryBackend::new(10_000))
 cache_layer.init_auto_refresh(my_service.clone()).await?;
 ```
 
+### Using Cache Tags
+
+Group related cache entries and invalidate them together:
+
+```rust
+use tower_http_cache::prelude::*;
+use tower_http_cache::tags::TagPolicy;
+
+let cache_layer = CacheLayer::builder(backend)
+    .policy(
+        CachePolicy::default()
+            .with_tag_policy(TagPolicy::new().with_enabled(true))
+            .with_tag_extractor(|method, uri| {
+                // Extract tags from request
+                vec!["user:123".to_string(), "posts".to_string()]
+            })
+    )
+    .build();
+
+// Later: invalidate all entries with a tag
+backend.invalidate_by_tag("user:123").await?;
+backend.invalidate_by_tags(&["user:123", "posts"]).await?;
+```
+
+### Multi-Tier Caching
+
+Combine fast in-memory cache with larger distributed storage:
+
+```rust
+use tower_http_cache::backend::MultiTierBackend;
+
+let backend = MultiTierBackend::builder()
+    .l1(InMemoryBackend::new(1_000))        // Hot data (fast)
+    .l2(RedisBackend::new(manager))          // Cold storage (large)
+    .promotion_threshold(3)                   // Promote after 3 L2 hits
+    .promotion_strategy(PromotionStrategy::HitCount)
+    .write_through(true)
+    .build();
+
+let cache_layer = CacheLayer::builder(backend)
+    .ttl(Duration::from_secs(300))
+    .build();
+```
+
+### Admin API
+
+Enable cache introspection and management endpoints:
+
+```rust
+use tower_http_cache::admin::{AdminConfig, admin_router};
+
+let admin_config = AdminConfig::builder()
+    .require_auth(true)
+    .auth_token("your-secret-token")
+    .build();
+
+// Mount admin routes (Axum example)
+let admin_routes = admin_router(backend.clone(), admin_config);
+let app = Router::new()
+    .nest("/admin/cache", admin_routes)
+    .layer(cache_layer);
+
+// Available endpoints:
+// GET  /admin/cache/health
+// GET  /admin/cache/stats
+// GET  /admin/cache/hot-keys
+// GET  /admin/cache/tags
+// POST /admin/cache/invalidate
+```
+
+### ML-Ready Structured Logging
+
+Enable structured logging for ML model training:
+
+```rust
+use tower_http_cache::logging::MLLoggingConfig;
+
+let cache_layer = CacheLayer::builder(backend)
+    .policy(
+        CachePolicy::default()
+            .with_ml_logging(MLLoggingConfig {
+                enabled: true,
+                sample_rate: 1.0,        // Log 100% of operations
+                hash_keys: true,          // Hash keys for privacy
+                include_request_id: true, // Correlate with X-Request-ID
+            })
+    )
+    .build();
+
+// Logs will be emitted in JSON format:
+// {
+//   "timestamp": "2025-11-10T12:00:00Z",
+//   "request_id": "550e8400-...",
+//   "operation": "cache_hit",
+//   "latency_us": 150,
+//   "tags": ["user:123"],
+//   "tier": "l1"
+// }
+```
+
 ---
 
 ## Configuration Highlights
@@ -109,6 +216,9 @@ cache_layer.init_auto_refresh(my_service.clone()).await?;
 | `stale_while_revalidate` | serve stale data while a refresh is in progress |
 | `refresh_before` | proactively refresh the cache shortly before expiry |
 | `auto_refresh` | automatically refresh frequently-accessed entries before expiration |
+| `tag_policy` | configure cache tags and invalidation groups |
+| `multi_tier` | enable multi-tier caching with L1/L2 backends |
+| `ml_logging` | enable ML-ready structured logging |
 | `allow_streaming_bodies` | opt into caching streaming responses |
 | `min_body_size` / `max_body_size` | enforce size bounds for cached bodies |
 | `header_allowlist` | restrict which headers are stored alongside cached bodies |
@@ -185,6 +295,7 @@ cargo run --example redis_smoke --features redis-backend
 | ------- | ----------- | :-----: |
 | `in-memory` | Enables the Moka-powered in-memory backend | ✓ |
 | `redis-backend` | Enables the Redis backend, codec, and async utilities | ✗ |
+| `admin-api` | Enables admin REST API endpoints (requires axum) | ✗ |
 | `serde` | Derives `serde` traits for cached entries/codecs | ✓ |
 | `compression` | Adds optional gzip compression for cached payloads | ✗ |
 | `metrics` | Emits `metrics` counters (hit/miss/store/etc.) | ✗ |
