@@ -8,34 +8,13 @@ use http::{Method, Request, Response, StatusCode, Uri};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tower::{Service, ServiceBuilder, ServiceExt};
+use tower::{Layer, Service, ServiceExt};
 use tower_http_cache::backend::memory::InMemoryBackend;
 use tower_http_cache::layer::CacheLayer;
 use tower_http_cache::refresh::AutoRefreshConfig;
 
-/// Helper function to create a simple test service.
-fn test_service(
-    call_count: Arc<AtomicUsize>,
-) -> impl Service<
-    Request<()>,
-    Response = Response<http_body_util::Full<bytes::Bytes>>,
-    Error = std::convert::Infallible,
-> + Clone {
-    tower::service_fn(move |_req: Request<()>| {
-        let count = call_count.clone();
-        async move {
-            count.fetch_add(1, Ordering::Relaxed);
-            Ok::<_, std::convert::Infallible>(
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .body(http_body_util::Full::from(bytes::Bytes::from(
-                        "test response",
-                    )))
-                    .unwrap(),
-            )
-        }
-    })
-}
+// Removed test_service helper - using tower::service_fn directly instead
+// to avoid type inference issues with impl Service return types
 
 #[tokio::test]
 async fn auto_refresh_disabled_by_default() {
@@ -45,9 +24,24 @@ async fn auto_refresh_disabled_by_default() {
         .build();
 
     let call_count = Arc::new(AtomicUsize::new(0));
-    let mut service = ServiceBuilder::new()
-        .layer(layer)
-        .service(test_service(call_count.clone()));
+    let handler = tower::service_fn({
+        let count = call_count.clone();
+        move |_req: Request<()>| {
+            let count = count.clone();
+            async move {
+                count.fetch_add(1, Ordering::Relaxed);
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(http_body_util::Full::from(bytes::Bytes::from(
+                            "test response",
+                        )))
+                        .unwrap(),
+                )
+            }
+        }
+    });
+    let mut service = layer.layer(handler);
 
     let req = Request::builder()
         .method(Method::GET)
@@ -91,9 +85,24 @@ async fn auto_refresh_tracks_hits() {
         .build();
 
     let call_count = Arc::new(AtomicUsize::new(0));
-    let mut service = ServiceBuilder::new()
-        .layer(layer)
-        .service(test_service(call_count.clone()));
+    let handler = tower::service_fn({
+        let count = call_count.clone();
+        move |_req: Request<()>| {
+            let count = count.clone();
+            async move {
+                count.fetch_add(1, Ordering::Relaxed);
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(http_body_util::Full::from(bytes::Bytes::from(
+                            "test response",
+                        )))
+                        .unwrap(),
+                )
+            }
+        }
+    });
+    let mut service = layer.layer(handler);
 
     // Make initial request to populate cache
     let req = Request::builder()
@@ -166,7 +175,7 @@ async fn auto_refresh_respects_concurrency_limit() {
         }
     });
 
-    let mut service = ServiceBuilder::new().layer(layer).service(slow_service);
+    let mut service = layer.layer(slow_service);
 
     // Make initial requests to populate cache with different keys
     for i in 0..5 {
@@ -245,7 +254,7 @@ async fn auto_refresh_handles_service_errors_gracefully() {
         }
     });
 
-    let mut service = ServiceBuilder::new().layer(layer).service(error_service);
+    let mut service = layer.layer(error_service);
 
     // Make initial request
     let req = Request::builder()
@@ -365,14 +374,15 @@ async fn auto_refresh_hit_rate_calculation() {
 
     let config = AutoRefreshConfig {
         min_hits_per_minute: 10.0,
-        hit_rate_window: Duration::from_millis(100),
+        hit_rate_window: Duration::from_secs(1), // Use 1 second for more stable timing
         ..Default::default()
     };
     let tracker = AccessTracker::new(config);
 
-    // Record several hits quickly
+    // Record several hits spread over a bit of time
     for _ in 0..5 {
         tracker.record_hit("hot_key");
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
     // Should have a high hit rate
@@ -395,9 +405,24 @@ async fn auto_refresh_with_different_methods() {
         .build();
 
     let call_count = Arc::new(AtomicUsize::new(0));
-    let mut service = ServiceBuilder::new()
-        .layer(layer)
-        .service(test_service(call_count.clone()));
+    let handler = tower::service_fn({
+        let count = call_count.clone();
+        move |_req: Request<()>| {
+            let count = count.clone();
+            async move {
+                count.fetch_add(1, Ordering::Relaxed);
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(http_body_util::Full::from(bytes::Bytes::from(
+                            "test response",
+                        )))
+                        .unwrap(),
+                )
+            }
+        }
+    });
+    let mut service = layer.layer(handler);
 
     // GET should be cached and tracked
     let get_req = Request::builder()
@@ -504,9 +529,24 @@ async fn auto_refresh_only_refreshes_in_window() {
         .build();
 
     let call_count = Arc::new(AtomicUsize::new(0));
-    let mut service = ServiceBuilder::new()
-        .layer(layer)
-        .service(test_service(call_count.clone()));
+    let handler = tower::service_fn({
+        let count = call_count.clone();
+        move |_req: Request<()>| {
+            let count = count.clone();
+            async move {
+                count.fetch_add(1, Ordering::Relaxed);
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(http_body_util::Full::from(bytes::Bytes::from(
+                            "test response",
+                        )))
+                        .unwrap(),
+                )
+            }
+        }
+    });
+    let mut service = layer.layer(handler);
 
     // Make initial request
     let req = Request::builder()
