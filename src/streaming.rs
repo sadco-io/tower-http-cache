@@ -72,6 +72,25 @@ pub struct StreamingPolicy {
 
     /// How to handle HTTP Range requests (default: PassThrough)
     pub range_handling: RangeHandling,
+
+    /// Enable chunk caching for large files (default: false, opt-in)
+    ///
+    /// When enabled, large files are split into chunks and cached separately,
+    /// allowing efficient range request handling without caching the entire file.
+    pub enable_chunk_cache: bool,
+
+    /// Chunk size for large files (default: 1MB)
+    ///
+    /// Files are split into chunks of this size when chunk caching is enabled.
+    /// Larger chunks use less memory overhead but may waste bandwidth for small
+    /// range requests. Smaller chunks are more granular but have more overhead.
+    pub chunk_size: usize,
+
+    /// Minimum file size for chunking (default: 10MB)
+    ///
+    /// Files smaller than this will not be chunked even if chunk caching is enabled.
+    /// This prevents overhead for files that don't benefit from chunking.
+    pub min_chunk_file_size: u64,
 }
 
 impl Default for StreamingPolicy {
@@ -97,6 +116,9 @@ impl Default for StreamingPolicy {
             ]),
             stream_threshold: 512 * 1024, // 512KB
             range_handling: RangeHandling::default(),
+            enable_chunk_cache: false,             // Opt-in feature
+            chunk_size: 1024 * 1024,               // 1MB chunks
+            min_chunk_file_size: 10 * 1024 * 1024, // 10MB minimum
         }
     }
 }
@@ -112,6 +134,9 @@ impl StreamingPolicy {
             force_cache_content_types: HashSet::new(),
             stream_threshold: usize::MAX,
             range_handling: RangeHandling::PassThrough,
+            enable_chunk_cache: false,
+            chunk_size: 1024 * 1024,
+            min_chunk_file_size: 0,
         }
     }
 
@@ -124,6 +149,9 @@ impl StreamingPolicy {
             force_cache_content_types: HashSet::new(),
             stream_threshold: max_size,
             range_handling: RangeHandling::PassThrough,
+            enable_chunk_cache: false,
+            chunk_size: 1024 * 1024,
+            min_chunk_file_size: 0,
         }
     }
 
@@ -136,6 +164,9 @@ impl StreamingPolicy {
             force_cache_content_types: HashSet::new(),
             stream_threshold: usize::MAX,
             range_handling: RangeHandling::PassThrough,
+            enable_chunk_cache: false,
+            chunk_size: 1024 * 1024,
+            min_chunk_file_size: 0,
         }
     }
 }
