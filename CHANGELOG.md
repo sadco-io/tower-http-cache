@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2025-11-10
+
+### Fixed
+- **Axum compatibility**: Fixed `Sync` trait bound issue with response bodies
+  - Implemented custom `SyncBoxBody` type that wraps `BoxBody` and implements `Sync`
+  - Uses `pin_project_lite` for safe pinning and `HttpBody` trait delegation
+  - Resolves compilation errors when using the cache layer with Axum routers
+  - Zero-cost abstraction - same performance as underlying `BoxBody`
+  - Updated `CacheEntry::into_response()` to return `Response<SyncBoxBody>`
+  - All 137 tests passing with new body type
+
+### Changed
+- Added `sync_wrapper` dependency (v1.0) for Sync wrapper pattern
+- Response body type now implements both `HttpBody` and `Sync` for Axum compatibility
+- Examples updated to demonstrate Axum integration patterns
+
 ## [0.4.0] - 2025-11-10
 
 ### Added

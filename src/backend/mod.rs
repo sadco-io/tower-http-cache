@@ -24,6 +24,7 @@ use http::{HeaderName, HeaderValue, Response, StatusCode, Version};
 use std::time::{Duration, SystemTime};
 
 use crate::error::CacheError;
+use crate::layer::SyncBoxBody;
 
 /// Cached response payload captured by the cache layer.
 #[derive(Debug, Clone)]
@@ -145,11 +146,7 @@ impl CacheEntry {
     }
 
     /// Converts the entry back into an `http::Response`.
-    pub fn into_response(
-        self,
-    ) -> Response<
-        http_body_util::combinators::BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>,
-    > {
+    pub fn into_response(self) -> Response<SyncBoxBody> {
         use http_body_util::BodyExt;
 
         let full_body = http_body_util::Full::from(self.body);
@@ -157,7 +154,7 @@ impl CacheEntry {
             .map_err(|never| -> Box<dyn std::error::Error + Send + Sync> { match never {} })
             .boxed();
 
-        let mut response = Response::new(boxed_body);
+        let mut response = Response::new(SyncBoxBody::new(boxed_body));
         *response.status_mut() = self.status;
         *response.version_mut() = self.version;
 

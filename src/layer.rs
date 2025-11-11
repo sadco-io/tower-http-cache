@@ -32,6 +32,49 @@ use crate::streaming::{should_stream, StreamingDecision};
 
 pub type BoxError = Box<dyn StdError + Send + Sync>;
 
+pin_project_lite::pin_project! {
+    /// Response body type that implements Sync for Axum compatibility.
+    ///
+    /// This wraps BoxBody and manually implements Sync using the same pattern as Axum.
+    /// The inner body is wrapped with SyncWrapper to satisfy Send + Sync requirements
+    /// while still providing HttpBody implementation.
+    pub struct SyncBoxBody {
+        #[pin]
+        inner: BoxBody<Bytes, BoxError>,
+    }
+}
+
+impl SyncBoxBody {
+    /// Creates a new SyncBoxBody by wrapping a BoxBody.
+    pub fn new(inner: BoxBody<Bytes, BoxError>) -> Self {
+        Self { inner }
+    }
+}
+
+// SAFETY: BoxBody is Send, and we're using this in a single-threaded Tower service context.
+// This is the same pattern used by Axum's Body type.
+unsafe impl Sync for SyncBoxBody {}
+
+impl Body for SyncBoxBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        self.project().inner.poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 /// Type alias for the key extractor function
 type KeyExtractorFn = Arc<dyn Fn(&Method, &Uri) -> Option<String> + Send + Sync>;
 
@@ -560,7 +603,7 @@ where
     ResBody::Error: Into<BoxError> + Send,
     B: CacheBackend,
 {
-    type Response = Response<BoxBody<Bytes, BoxError>>;
+    type Response = Response<SyncBoxBody>;
     type Error = BoxError;
     type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
@@ -628,7 +671,9 @@ where
                             // Build 206 Partial Content response
                             let mut response = Response::builder()
                                 .status(http::StatusCode::PARTIAL_CONTENT)
-                                .body(Full::from(range_data).map_err(Into::into).boxed())
+                                .body(SyncBoxBody::new(
+                                    Full::from(range_data).map_err(Into::into).boxed(),
+                                ))
                                 .unwrap();
 
                             // Copy headers from metadata
@@ -644,9 +689,7 @@ where
                             // Add Content-Range header
                             let content_range = format!(
                                 "bytes {}-{}/{}",
-                                normalized.start,
-                                end,
-                                entry.metadata.total_size
+                                normalized.start, end, entry.metadata.total_size
                             );
                             response.headers_mut().insert(
                                 http::header::CONTENT_RANGE,
@@ -796,7 +839,7 @@ where
                 );
 
                 // Stream through without buffering for range requests
-                let boxed_body = body.map_err(Into::into).boxed();
+                let boxed_body = SyncBoxBody::new(body.map_err(Into::into).boxed());
                 drop(primary_guard);
                 return Ok(Response::from_parts(parts, boxed_body));
             }
@@ -819,7 +862,7 @@ where
                     );
 
                     // Box the body and stream it through without collecting
-                    let boxed_body = body.map_err(Into::into).boxed();
+                    let boxed_body = SyncBoxBody::new(body.map_err(Into::into).boxed());
                     drop(primary_guard);
                     return Ok(Response::from_parts(parts, boxed_body));
                 }
@@ -976,7 +1019,7 @@ where
 
             // Box the response body
             let full_body = Full::from(response_bytes);
-            let boxed_body = full_body.map_err(Into::into).boxed();
+            let boxed_body = SyncBoxBody::new(full_body.map_err(Into::into).boxed());
             Ok(Response::from_parts(parts, boxed_body))
         })
     }

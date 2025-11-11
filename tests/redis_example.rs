@@ -27,9 +27,7 @@ async fn redis_backend_round_trip() -> Result<(), Box<dyn std::error::Error>> {
 
     // Clean slate for the test DB
     let mut conn = manager.clone();
-    redis::cmd("FLUSHDB")
-        .query_async::<()>(&mut conn)
-        .await?;
+    redis::cmd("FLUSHDB").query_async::<()>(&mut conn).await?;
 
     let backend = RedisBackend::new(manager).with_namespace("tower_http_cache_test");
 

@@ -5,6 +5,7 @@
 //!
 //! Run: cargo run --example chunk_cache_demo
 
+use bytes::Bytes;
 use http::{Method, Request, Response, StatusCode, Uri};
 use http_body_util::Full;
 use std::collections::HashSet;
@@ -12,7 +13,6 @@ use std::time::Duration;
 use tower::{Service, ServiceBuilder, ServiceExt};
 use tower_http_cache::prelude::*;
 use tower_http_cache::streaming::StreamingPolicy;
-use bytes::Bytes;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -31,9 +31,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .with_streaming_policy(StreamingPolicy {
                     enabled: true,
                     max_cacheable_size: Some(100 * 1024 * 1024), // 100MB
-                    enable_chunk_cache: true,                     // Enable chunk caching!
-                    chunk_size: 1024 * 1024,                      // 1MB chunks
-                    min_chunk_file_size: 5 * 1024 * 1024,         // 5MB minimum
+                    enable_chunk_cache: true,                    // Enable chunk caching!
+                    chunk_size: 1024 * 1024,                     // 1MB chunks
+                    min_chunk_file_size: 5 * 1024 * 1024,        // 5MB minimum
                     excluded_content_types: HashSet::new(),
                     force_cache_content_types: HashSet::from([
                         "video/*".to_string(),
@@ -81,11 +81,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .body(())
         .unwrap();
 
-    let resp1 = service.clone().oneshot(req1).await.map_err(|e| format!("{}", e))?;
+    let resp1 = service
+        .clone()
+        .oneshot(req1)
+        .await
+        .map_err(|e| format!("{}", e))?;
     let (parts1, body1) = resp1.into_parts();
 
     use http_body_util::BodyExt;
-    let bytes1 = body1.collect().await.map_err(|e| format!("{}", e))?.to_bytes();
+    let bytes1 = body1
+        .collect()
+        .await
+        .map_err(|e| format!("{}", e))?
+        .to_bytes();
 
     println!("✅ First request completed:");
     println!("   - Status: {}", parts1.status);
@@ -102,9 +110,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .body(())
         .unwrap();
 
-    let resp2 = service.clone().oneshot(req2).await.map_err(|e| format!("{}", e))?;
+    let resp2 = service
+        .clone()
+        .oneshot(req2)
+        .await
+        .map_err(|e| format!("{}", e))?;
     let (parts2, body2) = resp2.into_parts();
-    let bytes2 = body2.collect().await.map_err(|e| format!("{}", e))?.to_bytes();
+    let bytes2 = body2
+        .collect()
+        .await
+        .map_err(|e| format!("{}", e))?
+        .to_bytes();
 
     println!("✅ Range request completed:");
     println!("   - Status: {}", parts2.status);
@@ -130,9 +146,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .body(())
         .unwrap();
 
-    let resp3 = service.clone().oneshot(req3).await.map_err(|e| format!("{}", e))?;
+    let resp3 = service
+        .clone()
+        .oneshot(req3)
+        .await
+        .map_err(|e| format!("{}", e))?;
     let (parts3, body3) = resp3.into_parts();
-    let bytes3 = body3.collect().await.map_err(|e| format!("{}", e))?.to_bytes();
+    let bytes3 = body3
+        .collect()
+        .await
+        .map_err(|e| format!("{}", e))?
+        .to_bytes();
 
     println!("✅ Second range request completed:");
     println!("   - Status: {}", parts3.status);

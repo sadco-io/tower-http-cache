@@ -36,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .address("127.0.0.1:11211")
         .namespace("myapp_prod")
         .max_connections(20) // Pool size for production load
-        .min_connections(5)  // Keep minimum connections warm
+        .min_connections(5) // Keep minimum connections warm
         .connection_timeout(Duration::from_secs(5))
         .build()
         .await?;
@@ -88,9 +88,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let test_value = "ok";
 
     // Write test
-    use tower_http_cache::backend::{CacheBackend, CacheEntry};
     use bytes::Bytes;
     use http::StatusCode;
+    use tower_http_cache::backend::{CacheBackend, CacheEntry};
 
     let entry = CacheEntry::new(
         StatusCode::OK,

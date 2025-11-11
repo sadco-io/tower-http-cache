@@ -94,8 +94,16 @@ async fn demo_cache_tags() -> Result<(), Box<dyn std::error::Error>> {
 
     let req2 = Request::builder().uri("/users/456").body(()).unwrap();
 
-    let _resp1 = service.clone().oneshot(req1).await.map_err(|e| format!("{}", e))?;
-    let _resp2 = service.clone().oneshot(req2).await.map_err(|e| format!("{}", e))?;
+    let _resp1 = service
+        .clone()
+        .oneshot(req1)
+        .await
+        .map_err(|e| format!("{}", e))?;
+    let _resp2 = service
+        .clone()
+        .oneshot(req2)
+        .await
+        .map_err(|e| format!("{}", e))?;
 
     println!("  ✓ Cached 2 user entries with tags");
     println!("  ✓ Tags: user:123, user:456, users");
@@ -134,7 +142,13 @@ async fn demo_multi_tier() -> Result<(), Box<dyn std::error::Error>> {
     let req = Request::builder().uri("/api/hot-data").body(()).unwrap();
 
     // First request: stored in both L1 and L2
-    let _resp = service.ready().await.map_err(|e| format!("{}", e))?.call(req.clone()).await.map_err(|e| format!("{}", e))?;
+    let _resp = service
+        .ready()
+        .await
+        .map_err(|e| format!("{}", e))?
+        .call(req.clone())
+        .await
+        .map_err(|e| format!("{}", e))?;
     println!("  ✓ First request: stored in L1 and L2");
 
     // Simulate L1 eviction
@@ -143,7 +157,13 @@ async fn demo_multi_tier() -> Result<(), Box<dyn std::error::Error>> {
 
     // Multiple requests to trigger promotion
     for i in 1..=3 {
-        let _resp = service.ready().await.map_err(|e| format!("{}", e))?.call(req.clone()).await.map_err(|e| format!("{}", e))?;
+        let _resp = service
+            .ready()
+            .await
+            .map_err(|e| format!("{}", e))?
+            .call(req.clone())
+            .await
+            .map_err(|e| format!("{}", e))?;
         println!("  ✓ Request {}: L2 hit", i);
     }
 
@@ -267,7 +287,13 @@ async fn demo_combined_features() -> Result<(), Box<dyn std::error::Error>> {
     req.headers_mut()
         .insert("x-request-id", request_id.as_str().parse().unwrap());
 
-    let _resp = service.ready().await.map_err(|e| format!("{}", e))?.call(req).await.map_err(|e| format!("{}", e))?;
+    let _resp = service
+        .ready()
+        .await
+        .map_err(|e| format!("{}", e))?
+        .call(req)
+        .await
+        .map_err(|e| format!("{}", e))?;
 
     println!("  ✓ Request processed with all features:");
     println!("    - Request ID: {}", request_id);
