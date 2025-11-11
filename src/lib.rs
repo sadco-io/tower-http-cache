@@ -40,6 +40,7 @@
 
 pub mod admin;
 pub mod backend;
+pub mod chunks;
 pub mod codec;
 pub mod error;
 pub mod layer;
@@ -52,6 +53,7 @@ pub mod request_id;
 pub mod streaming;
 pub mod tags;
 
+pub use chunks::{ChunkCache, ChunkCacheStats, ChunkMetadata, ChunkedEntry};
 pub use layer::{CacheLayer, CacheLayerBuilder, KeyExtractor};
 pub use logging::{CacheEvent, CacheEventType, MLLoggingConfig};
 pub use range::{RangeHandling, RangeRequest};
