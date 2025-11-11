@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3] - 2025-11-10
+
+### Removed
+- **Unused dependencies identified by `cargo-udeps`**:
+  - Removed `serde_bytes` from main dependencies (never used in codebase)
+  - Removed `hyper` from dev-dependencies (never used in tests/benches/examples)
+  - Reduces dependency count and compilation time
+  - No functional changes - all 137 tests passing
+
+### Note
+- Dev dependencies `axum`, `redis`, and `tracing-subscriber` flagged by `cargo-udeps` are false positives - they are used in examples and tests
+
 ## [0.4.2] - 2025-11-10
 
 ### Fixed
