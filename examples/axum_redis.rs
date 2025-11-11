@@ -28,7 +28,6 @@ use tower::ServiceBuilder;
 #[cfg(feature = "redis-backend")]
 use tower_http_cache::prelude::*;
 #[cfg(feature = "redis-backend")]
-use tracing_subscriber;
 
 #[cfg(feature = "redis-backend")]
 #[tokio::main]

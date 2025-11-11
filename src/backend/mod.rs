@@ -5,10 +5,14 @@
 //! - [`memory::InMemoryBackend`] — a fast, process-local cache backed by [`moka`].
 //! - `redis::RedisBackend` *(optional)* — a distributed cache when the
 //!   `redis-backend` crate feature is enabled.
+//! - `memcached::MemcachedBackend` *(optional)* — a distributed cache when the
+//!   `memcached-backend` crate feature is enabled.
 //!
 //! Backends are responsible for answering cache lookups, storing entries,
 //! and enforcing per-entry stale windows.
 
+#[cfg(feature = "memcached-backend")]
+pub mod memcached;
 pub mod memory;
 pub mod multi_tier;
 #[cfg(feature = "redis-backend")]
@@ -23,12 +27,95 @@ use crate::error::CacheError;
 
 /// Cached response payload captured by the cache layer.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CacheEntry {
+    #[cfg_attr(feature = "serde", serde(with = "status_code_serde"))]
     pub status: StatusCode,
+    #[cfg_attr(feature = "serde", serde(with = "version_serde"))]
     pub version: Version,
     pub headers: Vec<(String, Vec<u8>)>,
+    #[cfg_attr(feature = "serde", serde(with = "bytes_serde"))]
     pub body: Bytes,
     pub tags: Option<Vec<String>>,
+}
+
+// Custom serde helpers for http types
+#[cfg(feature = "serde")]
+mod status_code_serde {
+    use http::StatusCode;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(status: &StatusCode, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        status.as_u16().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<StatusCode, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let code = u16::deserialize(deserializer)?;
+        StatusCode::from_u16(code).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(feature = "serde")]
+mod version_serde {
+    use http::Version;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(version: &Version, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let v = match *version {
+            Version::HTTP_09 => 0,
+            Version::HTTP_10 => 1,
+            Version::HTTP_11 => 2,
+            Version::HTTP_2 => 3,
+            Version::HTTP_3 => 4,
+            _ => 5,
+        };
+        v.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Version, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let v = u8::deserialize(deserializer)?;
+        Ok(match v {
+            0 => Version::HTTP_09,
+            1 => Version::HTTP_10,
+            2 => Version::HTTP_11,
+            3 => Version::HTTP_2,
+            4 => Version::HTTP_3,
+            _ => Version::HTTP_11, // Default fallback
+        })
+    }
+}
+
+#[cfg(feature = "serde")]
+mod bytes_serde {
+    use bytes::Bytes;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &Bytes, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(bytes)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Bytes, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let vec = Vec::<u8>::deserialize(deserializer)?;
+        Ok(Bytes::from(vec))
+    }
 }
 
 impl CacheEntry {
@@ -58,8 +145,19 @@ impl CacheEntry {
     }
 
     /// Converts the entry back into an `http::Response`.
-    pub fn into_response(self) -> Response<http_body_util::Full<Bytes>> {
-        let mut response = Response::new(http_body_util::Full::from(self.body));
+    pub fn into_response(
+        self,
+    ) -> Response<
+        http_body_util::combinators::BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>,
+    > {
+        use http_body_util::BodyExt;
+
+        let full_body = http_body_util::Full::from(self.body);
+        let boxed_body = full_body
+            .map_err(|never| -> Box<dyn std::error::Error + Send + Sync> { match never {} })
+            .boxed();
+
+        let mut response = Response::new(boxed_body);
         *response.status_mut() = self.status;
         *response.version_mut() = self.version;
 

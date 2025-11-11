@@ -10,6 +10,7 @@ use futures_util::future::BoxFuture;
 use http::header::{CACHE_CONTROL, PRAGMA};
 use http::{HeaderMap, Method, Request, Response, Uri};
 use http_body::Body;
+use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tower::{Layer, Service, ServiceExt};
@@ -19,10 +20,15 @@ use metrics::{counter, histogram};
 
 use crate::backend::memory::InMemoryBackend;
 use crate::backend::{CacheBackend, CacheEntry, CacheRead};
+use crate::chunks::{ChunkCache, ChunkMetadata};
 #[cfg(feature = "compression")]
 use crate::policy::CompressionStrategy;
 use crate::policy::{CachePolicy, CompressionConfig};
+use crate::range::{is_partial_content, parse_range_header, RangeHandling};
 use crate::refresh::{AutoRefreshConfig, RefreshCallback, RefreshManager, RefreshMetadata};
+#[cfg(feature = "tracing")]
+use crate::streaming::extract_size_info;
+use crate::streaming::{should_stream, StreamingDecision};
 
 pub type BoxError = Box<dyn StdError + Send + Sync>;
 
@@ -44,6 +50,7 @@ pub struct CacheLayer<B> {
     key_extractor: KeyExtractor,
     locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
     refresh_manager: Option<Arc<RefreshManager>>,
+    chunk_cache: Option<Arc<ChunkCache>>,
 }
 
 /// Strategy used to turn requests into cache keys.
@@ -226,12 +233,22 @@ where
             .filter(|cfg| cfg.enabled)
             .map(|cfg| Arc::new(RefreshManager::new(cfg)));
 
+        // Create chunk cache if enabled in streaming policy
+        let chunk_cache = if self.policy.streaming_policy().enable_chunk_cache {
+            Some(Arc::new(ChunkCache::new(
+                self.policy.streaming_policy().chunk_size,
+            )))
+        } else {
+            None
+        };
+
         CacheLayer {
             backend: self.backend,
             policy: self.policy,
             key_extractor: self.key_extractor,
             locks: Arc::new(DashMap::new()),
             refresh_manager,
+            chunk_cache,
         }
     }
 }
@@ -385,6 +402,7 @@ where
             key_extractor: self.key_extractor.clone(),
             locks: self.locks.clone(),
             refresh_manager: self.refresh_manager.clone(),
+            chunk_cache: self.chunk_cache.clone(),
         }
     }
 }
@@ -414,6 +432,7 @@ pub struct CacheService<S, B> {
     key_extractor: KeyExtractor,
     locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
     refresh_manager: Option<Arc<RefreshManager>>,
+    chunk_cache: Option<Arc<ChunkCache>>,
 }
 
 /// Implementation of RefreshCallback for CacheService.
@@ -537,11 +556,11 @@ where
     S::Future: Send + 'static,
     S::Error: Into<BoxError> + Send,
     ReqBody: Send + 'static,
-    ResBody: Body<Data = Bytes> + Send + 'static,
+    ResBody: Body<Data = Bytes> + Send + Sync + 'static,
     ResBody::Error: Into<BoxError> + Send,
     B: CacheBackend,
 {
-    type Response = Response<Full<Bytes>>;
+    type Response = Response<BoxBody<Bytes, BoxError>>;
     type Error = BoxError;
     type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
@@ -568,6 +587,10 @@ where
         let stale_window = policy.stale_while_revalidate();
         let refresh_before = policy.refresh_before();
         let refresh_manager = self.refresh_manager.clone();
+        let chunk_cache = self.chunk_cache.clone();
+
+        // Check for range request early
+        let range_request = parse_range_header(req.headers());
 
         // Prepare refresh metadata if auto-refresh is enabled
         let refresh_metadata = if refresh_manager.is_some() && key.is_some() {
@@ -579,6 +602,72 @@ where
         Box::pin(async move {
             #[cfg(feature = "tracing")]
             tracing::debug!(method = %method, uri = %uri, "cache_call");
+
+            // Try to serve from chunk cache if this is a range request
+            if let (Some(range_req), Some(ref chunk_cache), Some(ref key_ref)) =
+                (range_request.as_ref(), &chunk_cache, &key)
+            {
+                if let Some(entry) = chunk_cache.get(key_ref) {
+                    // Check if range is satisfiable and normalize it
+                    if let Some(normalized) = range_req.normalize(entry.metadata.total_size) {
+                        let end = normalized.end.unwrap_or(entry.metadata.total_size - 1);
+
+                        // Try to get range from chunks
+                        if let Some(range_data) = entry.get_range(normalized.start, end) {
+                            #[cfg(feature = "metrics")]
+                            counter!("tower_http_cache.chunk_cache_hit").increment(1);
+
+                            #[cfg(feature = "tracing")]
+                            tracing::debug!(
+                                key = %key_ref,
+                                start = normalized.start,
+                                end = end,
+                                "chunk_cache_hit"
+                            );
+
+                            // Build 206 Partial Content response
+                            let mut response = Response::builder()
+                                .status(http::StatusCode::PARTIAL_CONTENT)
+                                .body(Full::from(range_data).map_err(Into::into).boxed())
+                                .unwrap();
+
+                            // Copy headers from metadata
+                            for (name, value) in &entry.metadata.headers {
+                                if let (Ok(header_name), Ok(header_value)) = (
+                                    http::header::HeaderName::from_bytes(name.as_bytes()),
+                                    http::header::HeaderValue::from_bytes(value),
+                                ) {
+                                    response.headers_mut().insert(header_name, header_value);
+                                }
+                            }
+
+                            // Add Content-Range header
+                            let content_range = format!(
+                                "bytes {}-{}/{}",
+                                normalized.start,
+                                end,
+                                entry.metadata.total_size
+                            );
+                            response.headers_mut().insert(
+                                http::header::CONTENT_RANGE,
+                                http::header::HeaderValue::from_str(&content_range).unwrap(),
+                            );
+
+                            // Add Content-Length
+                            let content_length = (end - normalized.start + 1).to_string();
+                            response.headers_mut().insert(
+                                http::header::CONTENT_LENGTH,
+                                http::header::HeaderValue::from_str(&content_length).unwrap(),
+                            );
+
+                            return Ok(response);
+                        }
+                    }
+                }
+
+                #[cfg(feature = "metrics")]
+                counter!("tower_http_cache.chunk_cache_miss").increment(1);
+            }
 
             let mut stale_entry: Option<CacheEntry> = None;
             if let Some(ref key_ref) = key {
@@ -664,6 +753,79 @@ where
 
             let (parts, body) = response.into_parts();
 
+            // NEW: Early streaming decision
+            let content_type = parts
+                .headers
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok());
+
+            let content_length = parts
+                .headers
+                .get(http::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok());
+
+            let size_hint = body.size_hint();
+
+            let streaming_decision = should_stream(
+                policy.streaming_policy(),
+                &size_hint,
+                content_type,
+                content_length,
+            );
+
+            // Check for range requests
+            let is_range_request = parse_range_header(&parts.headers).is_some();
+            let is_partial_response = is_partial_content(parts.status);
+            let range_handling = policy.streaming_policy().range_handling;
+
+            // Handle range requests according to policy
+            if (is_range_request || is_partial_response)
+                && range_handling == RangeHandling::PassThrough
+            {
+                #[cfg(feature = "metrics")]
+                counter!("tower_http_cache.range_request_passthrough").increment(1);
+
+                #[cfg(feature = "tracing")]
+                tracing::debug!(
+                    method = %method,
+                    uri = %uri,
+                    is_range = is_range_request,
+                    is_partial = is_partial_response,
+                    "range_request_passthrough"
+                );
+
+                // Stream through without buffering for range requests
+                let boxed_body = body.map_err(Into::into).boxed();
+                drop(primary_guard);
+                return Ok(Response::from_parts(parts, boxed_body));
+            }
+
+            // Check if we should skip caching and pass through
+            match streaming_decision {
+                StreamingDecision::SkipCache | StreamingDecision::StreamThrough => {
+                    // TRUE STREAMING: Pass through without buffering!
+                    #[cfg(feature = "metrics")]
+                    counter!("tower_http_cache.streaming_passthrough").increment(1);
+
+                    #[cfg(feature = "tracing")]
+                    tracing::debug!(
+                        method = %method,
+                        uri = %uri,
+                        decision = ?streaming_decision,
+                        content_type = ?content_type,
+                        size = ?extract_size_info(&size_hint, content_length),
+                        "streaming_passthrough"
+                    );
+
+                    // Box the body and stream it through without collecting
+                    let boxed_body = body.map_err(Into::into).boxed();
+                    drop(primary_guard);
+                    return Ok(Response::from_parts(parts, boxed_body));
+                }
+                _ => {}
+            }
+
             let streaming = body.size_hint().upper().is_none();
             if streaming && !policy.allow_streaming_bodies() {
                 #[cfg(feature = "metrics")]
@@ -673,6 +835,75 @@ where
             let collected = BodyExt::collect(body).await.map_err(|err| err.into())?;
             let cache_bytes = collected.to_bytes();
             let response_bytes = cache_bytes.clone();
+
+            // Populate chunk cache for large files if enabled
+            if let (Some(ref chunk_cache), Some(ref key_ref)) = (&chunk_cache, &key) {
+                let streaming_policy = policy.streaming_policy();
+
+                if streaming_policy.enable_chunk_cache
+                    && cache_bytes.len() as u64 >= streaming_policy.min_chunk_file_size
+                    && parts.status.is_success()
+                {
+                    #[cfg(feature = "tracing")]
+                    tracing::debug!(
+                        key = %key_ref,
+                        size = cache_bytes.len(),
+                        chunk_size = streaming_policy.chunk_size,
+                        "populating_chunk_cache"
+                    );
+
+                    // Create chunk metadata
+                    let metadata = ChunkMetadata {
+                        total_size: cache_bytes.len() as u64,
+                        content_type: parts
+                            .headers
+                            .get(http::header::CONTENT_TYPE)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("application/octet-stream")
+                            .to_string(),
+                        etag: parts
+                            .headers
+                            .get(http::header::ETAG)
+                            .and_then(|v| v.to_str().ok())
+                            .map(|s| s.to_string()),
+                        last_modified: parts
+                            .headers
+                            .get(http::header::LAST_MODIFIED)
+                            .and_then(|v| v.to_str().ok())
+                            .map(|s| s.to_string()),
+                        status: parts.status,
+                        version: parts.version,
+                        headers: policy.headers_to_cache(&parts.headers),
+                    };
+
+                    // Get or create chunked entry
+                    let entry = chunk_cache.get_or_create(key_ref.clone(), metadata);
+
+                    // Split into chunks and store
+                    let chunk_size = streaming_policy.chunk_size;
+                    let mut offset = 0;
+                    let mut chunk_index = 0;
+
+                    while offset < cache_bytes.len() {
+                        let end = std::cmp::min(offset + chunk_size, cache_bytes.len());
+                        let chunk = cache_bytes.slice(offset..end);
+                        entry.add_chunk(chunk_index, chunk);
+
+                        offset = end;
+                        chunk_index += 1;
+                    }
+
+                    #[cfg(feature = "metrics")]
+                    counter!("tower_http_cache.chunk_cache_stored").increment(1);
+
+                    #[cfg(feature = "tracing")]
+                    tracing::debug!(
+                        key = %key_ref,
+                        chunks = chunk_index,
+                        "chunk_cache_populated"
+                    );
+                }
+            }
 
             let cache_control_block =
                 policy.respect_cache_control() && cache_control_disallows(&parts.headers);
@@ -743,7 +974,10 @@ where
 
             drop(primary_guard);
 
-            Ok(Response::from_parts(parts, Full::from(response_bytes)))
+            // Box the response body
+            let full_body = Full::from(response_bytes);
+            let boxed_body = full_body.map_err(Into::into).boxed();
+            Ok(Response::from_parts(parts, boxed_body))
         })
     }
 }

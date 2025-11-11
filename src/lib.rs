@@ -40,19 +40,25 @@
 
 pub mod admin;
 pub mod backend;
+pub mod chunks;
 pub mod codec;
 pub mod error;
 pub mod layer;
 pub mod logging;
 pub mod policy;
 pub mod prelude;
+pub mod range;
 pub mod refresh;
 pub mod request_id;
+pub mod streaming;
 pub mod tags;
 
+pub use chunks::{ChunkCache, ChunkCacheStats, ChunkMetadata, ChunkedEntry};
 pub use layer::{CacheLayer, CacheLayerBuilder, KeyExtractor};
 pub use logging::{CacheEvent, CacheEventType, MLLoggingConfig};
+pub use range::{RangeHandling, RangeRequest};
 pub use request_id::RequestId;
+pub use streaming::{StreamingDecision, StreamingPolicy};
 pub use tags::{TagIndex, TagPolicy};
 
 #[cfg(feature = "admin-api")]
