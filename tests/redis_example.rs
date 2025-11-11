@@ -28,7 +28,7 @@ async fn redis_backend_round_trip() -> Result<(), Box<dyn std::error::Error>> {
     // Clean slate for the test DB
     let mut conn = manager.clone();
     redis::cmd("FLUSHDB")
-        .query_async::<(), ()>(&mut conn)
+        .query_async::<()>(&mut conn)
         .await?;
 
     let backend = RedisBackend::new(manager).with_namespace("tower_http_cache_test");
@@ -51,23 +51,29 @@ async fn redis_backend_round_trip() -> Result<(), Box<dyn std::error::Error>> {
 
     let first = svc
         .ready()
-        .await?
+        .await
+        .map_err(|e| format!("ready error: {}", e))?
         .call(Request::new(()))
-        .await?
+        .await
+        .map_err(|e| format!("call error: {}", e))?
         .into_body()
         .collect()
-        .await?
+        .await
+        .map_err(|e| format!("collect error: {}", e))?
         .to_bytes();
     assert_eq!(first, "1");
 
     let second = svc
         .ready()
-        .await?
+        .await
+        .map_err(|e| format!("ready error: {}", e))?
         .call(Request::new(()))
-        .await?
+        .await
+        .map_err(|e| format!("call error: {}", e))?
         .into_body()
         .collect()
-        .await?
+        .await
+        .map_err(|e| format!("collect error: {}", e))?
         .to_bytes();
     assert_eq!(second, "1");
 
