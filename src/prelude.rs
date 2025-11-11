@@ -9,6 +9,8 @@
 //!     .build();
 //! ```
 
+#[cfg(feature = "memcached-backend")]
+pub use crate::backend::memcached::MemcachedBackend;
 pub use crate::backend::memory::InMemoryBackend;
 #[cfg(feature = "redis-backend")]
 pub use crate::backend::redis::RedisBackend;

@@ -10,6 +10,7 @@ use futures_util::future::BoxFuture;
 use http::header::{CACHE_CONTROL, PRAGMA};
 use http::{HeaderMap, Method, Request, Response, Uri};
 use http_body::Body;
+use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tower::{Layer, Service, ServiceExt};
@@ -22,8 +23,11 @@ use crate::backend::{CacheBackend, CacheEntry, CacheRead};
 #[cfg(feature = "compression")]
 use crate::policy::CompressionStrategy;
 use crate::policy::{CachePolicy, CompressionConfig};
+use crate::range::{is_partial_content, parse_range_header, RangeHandling};
 use crate::refresh::{AutoRefreshConfig, RefreshCallback, RefreshManager, RefreshMetadata};
-use crate::streaming::{extract_size_info, should_stream, StreamingDecision};
+#[cfg(feature = "tracing")]
+use crate::streaming::extract_size_info;
+use crate::streaming::{should_stream, StreamingDecision};
 
 pub type BoxError = Box<dyn StdError + Send + Sync>;
 
@@ -538,11 +542,11 @@ where
     S::Future: Send + 'static,
     S::Error: Into<BoxError> + Send,
     ReqBody: Send + 'static,
-    ResBody: Body<Data = Bytes> + Send + 'static,
+    ResBody: Body<Data = Bytes> + Send + Sync + 'static,
     ResBody::Error: Into<BoxError> + Send,
     B: CacheBackend,
 {
-    type Response = Response<Full<Bytes>>;
+    type Response = Response<BoxBody<Bytes, BoxError>>;
     type Error = BoxError;
     type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
@@ -686,11 +690,37 @@ where
                 content_length,
             );
 
+            // Check for range requests
+            let is_range_request = parse_range_header(&parts.headers).is_some();
+            let is_partial_response = is_partial_content(parts.status);
+            let range_handling = policy.streaming_policy().range_handling;
+
+            // Handle range requests according to policy
+            if (is_range_request || is_partial_response)
+                && range_handling == RangeHandling::PassThrough
+            {
+                #[cfg(feature = "metrics")]
+                counter!("tower_http_cache.range_request_passthrough").increment(1);
+
+                #[cfg(feature = "tracing")]
+                tracing::debug!(
+                    method = %method,
+                    uri = %uri,
+                    is_range = is_range_request,
+                    is_partial = is_partial_response,
+                    "range_request_passthrough"
+                );
+
+                // Stream through without buffering for range requests
+                let boxed_body = body.map_err(Into::into).boxed();
+                drop(primary_guard);
+                return Ok(Response::from_parts(parts, boxed_body));
+            }
+
             // Check if we should skip caching and pass through
             match streaming_decision {
                 StreamingDecision::SkipCache | StreamingDecision::StreamThrough => {
-                    // Pass through without caching - but we still need to collect
-                    // the body to match the return type
+                    // TRUE STREAMING: Pass through without buffering!
                     #[cfg(feature = "metrics")]
                     counter!("tower_http_cache.streaming_passthrough").increment(1);
 
@@ -704,13 +734,10 @@ where
                         "streaming_passthrough"
                     );
 
-                    // We need to collect the body to return the right type
-                    // In the future, this could be optimized with true streaming
-                    let collected = BodyExt::collect(body).await.map_err(|err| err.into())?;
-                    let response_bytes = collected.to_bytes();
-
+                    // Box the body and stream it through without collecting
+                    let boxed_body = body.map_err(Into::into).boxed();
                     drop(primary_guard);
-                    return Ok(Response::from_parts(parts, Full::from(response_bytes)));
+                    return Ok(Response::from_parts(parts, boxed_body));
                 }
                 _ => {}
             }
@@ -794,7 +821,10 @@ where
 
             drop(primary_guard);
 
-            Ok(Response::from_parts(parts, Full::from(response_bytes)))
+            // Box the response body
+            let full_body = Full::from(response_bytes);
+            let boxed_body = full_body.map_err(Into::into).boxed();
+            Ok(Response::from_parts(parts, boxed_body))
         })
     }
 }

@@ -7,6 +7,8 @@
 
 use std::collections::HashSet;
 
+use crate::range::RangeHandling;
+
 /// Decision on how to handle a response body based on size and content type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamingDecision {
@@ -33,6 +35,7 @@ pub enum StreamingDecision {
 ///
 /// ```
 /// use tower_http_cache::streaming::StreamingPolicy;
+/// use tower_http_cache::range::RangeHandling;
 /// use std::collections::HashSet;
 ///
 /// let policy = StreamingPolicy {
@@ -42,6 +45,7 @@ pub enum StreamingDecision {
 ///         "application/pdf".to_string(),
 ///         "video/*".to_string(),
 ///     ]),
+///     range_handling: RangeHandling::PassThrough,
 ///     ..Default::default()
 /// };
 /// ```
@@ -65,6 +69,9 @@ pub struct StreamingPolicy {
     /// Use streaming for bodies above this size (default: 512KB)
     /// Currently used for decision making; actual streaming not yet implemented
     pub stream_threshold: usize,
+
+    /// How to handle HTTP Range requests (default: PassThrough)
+    pub range_handling: RangeHandling,
 }
 
 impl Default for StreamingPolicy {
@@ -89,6 +96,7 @@ impl Default for StreamingPolicy {
                 "text/*".to_string(),
             ]),
             stream_threshold: 512 * 1024, // 512KB
+            range_handling: RangeHandling::default(),
         }
     }
 }
@@ -103,6 +111,7 @@ impl StreamingPolicy {
             excluded_content_types: HashSet::new(),
             force_cache_content_types: HashSet::new(),
             stream_threshold: usize::MAX,
+            range_handling: RangeHandling::PassThrough,
         }
     }
 
@@ -114,6 +123,7 @@ impl StreamingPolicy {
             excluded_content_types: HashSet::new(),
             force_cache_content_types: HashSet::new(),
             stream_threshold: max_size,
+            range_handling: RangeHandling::PassThrough,
         }
     }
 
@@ -125,6 +135,7 @@ impl StreamingPolicy {
             excluded_content_types: excluded,
             force_cache_content_types: HashSet::new(),
             stream_threshold: usize::MAX,
+            range_handling: RangeHandling::PassThrough,
         }
     }
 }

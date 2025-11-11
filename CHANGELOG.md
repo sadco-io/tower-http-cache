@@ -11,6 +11,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### True Streaming Pass-Through (Zero-Copy)
+- **BoxBody architecture**: Complete replacement of `Full<Bytes>` with `BoxBody<Bytes, BoxError>`
+  - Eliminates unnecessary buffering for large responses
+  - Zero-copy streaming for excluded content types
+  - Preserves `Content-Length` headers during streaming
+  - Memory efficient handling of multi-GB responses
+  - Full backward compatibility with existing middleware
+
+#### HTTP Range Request Support
+- **RFC 7233 compliant range handling**: Proper support for partial content requests
+  - New `range` module with `parse_range_header()` utilities
+  - `RangeRequest` type for parsing "bytes=start-end" specifications
+  - `RangeHandling` policy enum (PassThrough/CacheFullServeRanges/CacheChunks)
+  - Automatic detection of 206 Partial Content responses
+  - Configurable behavior via `StreamingPolicy::range_handling`
+  - Content-Range header generation and parsing
+  - 15+ comprehensive range request tests
+
+#### Memcached Backend
+- **High-performance distributed caching**: Production-ready Memcached support
+  - Async `MemcachedBackend` implementation via `async-memcached`
+  - Namespace support for multi-tenant deployments
+  - TTL and stale-while-revalidate handling
+  - Custom serialization for HTTP types (StatusCode, Version, Bytes)
+  - Connection pooling with Arc<Mutex<Client>>
+  - Optional feature flag: `memcached-backend`
+  - Compatible with memcached protocol 1.6+
+
+#### Enhanced Observability
+- **Streaming-specific metrics**: Better visibility into cache behavior
+  - `tower_http_cache.streaming_passthrough` counter
+  - `tower_http_cache.range_request_passthrough` counter
+  - Detailed tracing logs with size and content-type info
+  - Body size histograms for performance analysis
+
 #### Smart Streaming & Large File Handling
 - **Intelligent body size detection**: Prevent large files from overwhelming cache
   - `StreamingPolicy` for configurable streaming behavior
@@ -20,7 +55,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Wildcard content-type matching (e.g., `video/*`, `audio/*`)
   - Force-cache lists for critical API responses
   - Multi-tier size protection (large entries excluded from L1)
-  - 14 comprehensive integration tests
   - 20+ unit tests with 100% branch coverage
 
 #### Multi-Tier Size Protection
@@ -32,14 +66,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Zero performance impact on small entries
 
 ### Changed
+- **BREAKING**: `CacheService` now returns `Response<BoxBody<Bytes, BoxError>>` instead of `Response<Full<Bytes>>`
+  - This enables true streaming but requires downstream services to handle `BoxBody`
+  - Migration: Use `.map_err(Into::into).boxed()` on bodies if needed
+  - Most Tower middleware is compatible without changes
+- **BREAKING**: Added `Sync` bound to `ResBody` in Service implementation
+  - Required for BoxBody's Send + Sync + 'static constraint
+  - Should not affect most use cases
+- `CacheEntry` now has conditional Serde derives with custom serializers for HTTP types
+- `StreamingPolicy` now includes `range_handling` field (defaults to `PassThrough`)
+- Range requests pass through by default without caching
 - Streaming policy enabled by default (can be disabled)
 - Size limits now apply consistently to all content types (including forced-cache types)
 
 ### Performance
+- **Zero-copy streaming**: Eliminated buffering for excluded content types
+- Memory efficient: Handles multi-GB responses without collecting into memory
 - Eliminates memory exhaustion from large file responses
 - Prevents cache pollution from 5-20MB files
 - Protects L1 cache from unnecessary large entry storage
 - < 1% overhead on streaming decision path
+- Range requests bypass cache entirely (configurable)
+
+### Fixed
+- Conditional compilation for `extract_size_info` import (tracing feature)
+- BoxBody compatibility with Tower service ecosystem
+- Proper Sync bounds for concurrent body handling
 
 ## [0.3.0] - 2025-11-10
 

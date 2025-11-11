@@ -46,6 +46,7 @@ pub mod layer;
 pub mod logging;
 pub mod policy;
 pub mod prelude;
+pub mod range;
 pub mod refresh;
 pub mod request_id;
 pub mod streaming;
@@ -53,6 +54,7 @@ pub mod tags;
 
 pub use layer::{CacheLayer, CacheLayerBuilder, KeyExtractor};
 pub use logging::{CacheEvent, CacheEventType, MLLoggingConfig};
+pub use range::{RangeHandling, RangeRequest};
 pub use request_id::RequestId;
 pub use streaming::{StreamingDecision, StreamingPolicy};
 pub use tags::{TagIndex, TagPolicy};

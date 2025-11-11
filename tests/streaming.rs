@@ -6,7 +6,7 @@ use std::convert::Infallible;
 use std::time::Duration;
 use tower::{Layer, Service, ServiceExt};
 use tower_http_cache::backend::memory::InMemoryBackend;
-use tower_http_cache::backend::multi_tier::{MultiTierBackend, MultiTierBuilder};
+use tower_http_cache::backend::multi_tier::MultiTierBuilder;
 use tower_http_cache::backend::CacheBackend;
 use tower_http_cache::layer::CacheLayer;
 use tower_http_cache::policy::CachePolicy;
