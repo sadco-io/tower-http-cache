@@ -1,6 +1,6 @@
 [package]
 name = "tower-http-cache"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 rust-version = "1.75.0"
 description = "Tower-compatible caching layer with pluggable backends (in-memory, Redis, and more)"
@@ -42,7 +42,6 @@ hex = "0.4"
 chrono = "0.4"
 axum = { version = "0.8", optional = true }
 governor = { version = "0.6", optional = true }
-sync_wrapper = "1.0"
 
 [features]
 default = ["in-memory", "serde"]
