@@ -4,7 +4,6 @@
 //! - ML-Ready Structured Logging
 //! - Request ID Propagation
 
-use bytes::Bytes;
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::Full;
 use std::time::Duration;
