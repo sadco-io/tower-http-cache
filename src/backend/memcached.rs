@@ -1,4 +1,4 @@
-//! Memcached cache backend implementation.
+//! Memcached cache backend implementation with connection pooling.
 //!
 //! This module provides a distributed caching backend using Memcached,
 //! a high-performance, distributed memory caching system. Memcached is
@@ -9,87 +9,234 @@
 //! - Simple key-value storage with TTL
 //! - Memory-efficient caching at scale
 //!
+//! # Connection Pooling
+//!
+//! The backend uses bb8 connection pooling for efficient connection management:
+//! - Configurable pool size (default: 10 connections)
+//! - Automatic connection health checks
+//! - Connection reuse for better performance
+//! - Graceful failover handling
+//!
 //! # Example
 //!
 //! ```no_run
-//! use tower_http_cache::backend::MemcachedBackend;
+//! use tower_http_cache::backend::memcached::MemcachedBackend;
 //! use std::time::Duration;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! // Connect to a single Memcached instance
+//! // Simple setup with defaults
 //! let backend = MemcachedBackend::new("127.0.0.1:11211").await?;
 //!
-//! // Or connect to multiple servers for distribution
-//! let backend = MemcachedBackend::new_with_servers(vec![
-//!     "127.0.0.1:11211",
-//!     "127.0.0.1:11212",
-//! ]).await?;
+//! // Advanced setup with builder
+//! let backend = MemcachedBackend::builder()
+//!     .address("127.0.0.1:11211")
+//!     .namespace("myapp")
+//!     .max_connections(20)
+//!     .min_connections(5)
+//!     .connection_timeout(Duration::from_secs(5))
+//!     .build()
+//!     .await?;
 //! # Ok(())
 //! # }
 //! ```
 
 use async_memcached::{AsciiProtocol, Client};
 use async_trait::async_trait;
-use std::sync::Arc;
+use bb8::{Pool, PooledConnection};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex;
 
 use super::{CacheBackend, CacheEntry, CacheRead};
 use crate::error::CacheError;
 
-/// Memcached cache backend.
+/// Connection manager for bb8 pool.
 ///
-/// Provides distributed caching using the Memcached protocol. Entries are
-/// serialized with bincode and stored with appropriate TTL values.
+/// Manages the lifecycle of Memcached connections including creation,
+/// health checks, and cleanup.
+pub struct MemcachedConnectionManager {
+    address: String,
+}
+
+impl MemcachedConnectionManager {
+    /// Creates a new connection manager for the given address.
+    pub fn new(address: impl Into<String>) -> Self {
+        Self {
+            address: address.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl bb8::ManageConnection for MemcachedConnectionManager {
+    type Connection = Client;
+    type Error = async_memcached::Error;
+
+    async fn connect(&self) -> Result<Self::Connection, Self::Error> {
+        Client::new(&self.address).await
+    }
+
+    async fn is_valid(&self, conn: &mut Self::Connection) -> Result<(), Self::Error> {
+        // Simple health check: try to get the version
+        conn.version().await?;
+        Ok(())
+    }
+
+    fn has_broken(&self, _conn: &mut Self::Connection) -> bool {
+        // Let is_valid handle health checking
+        false
+    }
+}
+
+type MemcachedPool = Pool<MemcachedConnectionManager>;
+
+/// Memcached cache backend with connection pooling.
+///
+/// Provides distributed caching using the Memcached protocol with efficient
+/// connection management via bb8 pooling. Entries are serialized with bincode
+/// and stored with appropriate TTL values.
 #[derive(Clone)]
 pub struct MemcachedBackend {
-    client: Arc<Mutex<Client>>,
+    pool: MemcachedPool,
     namespace: String,
 }
 
 impl MemcachedBackend {
-    /// Creates a new Memcached backend connected to a single server.
+    /// Creates a new Memcached backend with default pool settings.
+    ///
+    /// The default pool configuration:
+    /// - Max connections: 10
+    /// - Min idle connections: 2
+    /// - Connection timeout: 30 seconds
     ///
     /// # Arguments
     ///
-    /// * `server` - The Memcached server address (e.g., "127.0.0.1:11211")
+    /// * `address` - The Memcached server address (e.g., "127.0.0.1:11211")
     ///
     /// # Errors
     ///
-    /// Returns an error if the connection to the server fails.
-    pub async fn new(server: impl AsRef<str>) -> Result<Self, CacheError> {
-        let client = Client::new(server.as_ref())
-            .await
-            .map_err(|e| CacheError::Backend(format!("Failed to connect to Memcached: {}", e)))?;
-
-        Ok(Self {
-            client: Arc::new(Mutex::new(client)),
-            namespace: "tower_http_cache".to_owned(),
-        })
+    /// Returns an error if the connection pool cannot be created or the
+    /// initial connection fails.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use tower_http_cache::backend::memcached::MemcachedBackend;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let backend = MemcachedBackend::new("127.0.0.1:11211").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn new(address: impl Into<String>) -> Result<Self, CacheError> {
+        Self::builder().address(address).build().await
     }
 
-    /// Creates a new Memcached backend connected to multiple servers.
+    /// Creates a builder for advanced configuration.
     ///
-    /// The client will automatically distribute keys across the servers
-    /// using consistent hashing.
+    /// # Examples
     ///
-    /// # Arguments
-    ///
-    /// * `servers` - A vector of Memcached server addresses
+    /// ```no_run
+    /// # use tower_http_cache::backend::memcached::MemcachedBackend;
+    /// # use std::time::Duration;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let backend = MemcachedBackend::builder()
+    ///     .address("127.0.0.1:11211")
+    ///     .namespace("myapp")
+    ///     .max_connections(20)
+    ///     .min_connections(5)
+    ///     .connection_timeout(Duration::from_secs(5))
+    ///     .build()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn builder() -> MemcachedBackendBuilder {
+        MemcachedBackendBuilder::default()
+    }
+
+    /// Gets a connection from the pool.
     ///
     /// # Errors
     ///
-    /// Returns an error if any connection fails.
-    pub async fn new_with_servers(servers: Vec<impl AsRef<str>>) -> Result<Self, CacheError> {
-        // For now, we'll use the first server. In the future, we could implement
-        // proper multi-server support with consistent hashing.
-        if servers.is_empty() {
-            return Err(CacheError::Backend(
-                "At least one server address required".to_owned(),
-            ));
-        }
+    /// Returns an error if no connection is available within the timeout period.
+    async fn get_connection(
+        &self,
+    ) -> Result<PooledConnection<'_, MemcachedConnectionManager>, CacheError> {
+        self.pool
+            .get()
+            .await
+            .map_err(|e| CacheError::Backend(format!("Failed to get connection: {}", e)))
+    }
 
-        Self::new(servers[0].as_ref()).await
+    /// Constructs a namespaced cache key.
+    fn make_key(&self, key: &str) -> String {
+        format!("{}:{}", self.namespace, key)
+    }
+
+    /// Gets pool statistics.
+    ///
+    /// Returns information about the current state of the connection pool.
+    pub fn pool_state(&self) -> PoolState {
+        let state = self.pool.state();
+        PoolState {
+            connections: state.connections,
+            idle_connections: state.idle_connections,
+        }
+    }
+}
+
+/// Connection pool state information.
+#[derive(Debug, Clone)]
+pub struct PoolState {
+    /// Total number of connections in the pool
+    pub connections: u32,
+    /// Number of idle connections available
+    pub idle_connections: u32,
+}
+
+/// Builder for configuring a Memcached backend.
+///
+/// Provides fine-grained control over connection pooling and backend behavior.
+pub struct MemcachedBackendBuilder {
+    address: Option<String>,
+    namespace: String,
+    max_connections: u32,
+    min_connections: u32,
+    connection_timeout: Duration,
+}
+
+impl Default for MemcachedBackendBuilder {
+    fn default() -> Self {
+        Self {
+            address: None,
+            namespace: "tower_http_cache".to_string(),
+            max_connections: 10,
+            min_connections: 2,
+            connection_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+impl MemcachedBackendBuilder {
+    /// Sets the Memcached server address.
+    ///
+    /// # Arguments
+    ///
+    /// * `address` - Server address (e.g., "127.0.0.1:11211")
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use tower_http_cache::backend::memcached::MemcachedBackend;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let backend = MemcachedBackend::builder()
+    ///     .address("127.0.0.1:11211")
+    ///     .build()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn address(mut self, address: impl Into<String>) -> Self {
+        self.address = Some(address.into());
+        self
     }
 
     /// Sets a custom namespace prefix for cache keys.
@@ -97,25 +244,135 @@ impl MemcachedBackend {
     /// This is useful for avoiding key collisions when multiple applications
     /// share the same Memcached instance.
     ///
-    /// # Example
+    /// Default: "tower_http_cache"
+    ///
+    /// # Examples
     ///
     /// ```no_run
-    /// # use tower_http_cache::backend::MemcachedBackend;
+    /// # use tower_http_cache::backend::memcached::MemcachedBackend;
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let backend = MemcachedBackend::new("127.0.0.1:11211")
-    ///     .await?
-    ///     .with_namespace("myapp");
+    /// let backend = MemcachedBackend::builder()
+    ///     .address("127.0.0.1:11211")
+    ///     .namespace("myapp")
+    ///     .build()
+    ///     .await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn with_namespace(mut self, namespace: impl Into<String>) -> Self {
+    pub fn namespace(mut self, namespace: impl Into<String>) -> Self {
         self.namespace = namespace.into();
         self
     }
 
-    /// Constructs a namespaced cache key.
-    fn make_key(&self, key: &str) -> String {
-        format!("{}:{}", self.namespace, key)
+    /// Sets the maximum number of connections in the pool.
+    ///
+    /// Default: 10
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use tower_http_cache::backend::memcached::MemcachedBackend;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let backend = MemcachedBackend::builder()
+    ///     .address("127.0.0.1:11211")
+    ///     .max_connections(20)
+    ///     .build()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn max_connections(mut self, max: u32) -> Self {
+        self.max_connections = max;
+        self
+    }
+
+    /// Sets the minimum number of idle connections to maintain.
+    ///
+    /// Default: 2
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use tower_http_cache::backend::memcached::MemcachedBackend;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let backend = MemcachedBackend::builder()
+    ///     .address("127.0.0.1:11211")
+    ///     .min_connections(5)
+    ///     .build()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn min_connections(mut self, min: u32) -> Self {
+        self.min_connections = min;
+        self
+    }
+
+    /// Sets the connection timeout.
+    ///
+    /// This is the maximum time to wait when acquiring a connection from the pool.
+    ///
+    /// Default: 30 seconds
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use tower_http_cache::backend::memcached::MemcachedBackend;
+    /// # use std::time::Duration;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let backend = MemcachedBackend::builder()
+    ///     .address("127.0.0.1:11211")
+    ///     .connection_timeout(Duration::from_secs(5))
+    ///     .build()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn connection_timeout(mut self, timeout: Duration) -> Self {
+        self.connection_timeout = timeout;
+        self
+    }
+
+    /// Builds the Memcached backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - No address was provided
+    /// - The connection pool cannot be created
+    /// - The initial connection fails
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use tower_http_cache::backend::memcached::MemcachedBackend;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let backend = MemcachedBackend::builder()
+    ///     .address("127.0.0.1:11211")
+    ///     .build()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn build(self) -> Result<MemcachedBackend, CacheError> {
+        let address = self
+            .address
+            .ok_or_else(|| CacheError::Backend("address is required".to_string()))?;
+
+        let manager = MemcachedConnectionManager::new(address);
+
+        let pool = Pool::builder()
+            .max_size(self.max_connections)
+            .min_idle(Some(self.min_connections))
+            .connection_timeout(self.connection_timeout)
+            .build(manager)
+            .await
+            .map_err(|e| CacheError::Backend(format!("Failed to create connection pool: {}", e)))?;
+
+        Ok(MemcachedBackend {
+            pool,
+            namespace: self.namespace,
+        })
     }
 }
 
@@ -156,16 +413,15 @@ fn duration_millis(duration: Duration) -> u64 {
 impl CacheBackend for MemcachedBackend {
     async fn get(&self, key: &str) -> Result<Option<CacheRead>, CacheError> {
         let namespaced_key = self.make_key(key);
-        let mut client = self.client.lock().await;
+        let mut conn = self.get_connection().await?;
 
-        let value = client
+        let value = (*conn)
             .get(namespaced_key.as_bytes())
             .await
             .map_err(|e| CacheError::Backend(format!("Memcached get failed: {}", e)))?;
 
         if let Some(data) = value {
             // Extract the bytes from the Value
-            // data.data is Option<Vec<u8>>
             let data_bytes = data
                 .data
                 .as_ref()
@@ -221,8 +477,8 @@ impl CacheBackend for MemcachedBackend {
         // Memcached TTL is u32 (max ~136 years)
         let ttl_u32 = ttl_secs.min(u32::MAX as u64) as u32;
 
-        let mut client = self.client.lock().await;
-        client
+        let mut conn = self.get_connection().await?;
+        (*conn)
             .set(
                 namespaced_key.as_bytes(),
                 bytes.as_slice(),
@@ -237,9 +493,9 @@ impl CacheBackend for MemcachedBackend {
 
     async fn invalidate(&self, key: &str) -> Result<(), CacheError> {
         let namespaced_key = self.make_key(key);
-        let mut client = self.client.lock().await;
+        let mut conn = self.get_connection().await?;
 
-        client
+        (*conn)
             .delete(namespaced_key.as_bytes())
             .await
             .map_err(|e| CacheError::Backend(format!("Memcached delete failed: {}", e)))?;
@@ -256,10 +512,9 @@ mod tests {
 
     #[test]
     fn test_make_key() {
-        // Create a fake backend just for testing make_key
-        // We don't need a real client for this test
-        let namespace = "test_app".to_owned();
-
+        // We can't easily create a MemcachedBackend without a connection,
+        // so we'll test the key format directly
+        let namespace = "test_app";
         let make_key = |key: &str| format!("{}:{}", namespace, key);
 
         assert_eq!(make_key("my_key"), "test_app:my_key");
@@ -282,9 +537,6 @@ mod tests {
 
     #[test]
     fn test_memcached_record_serialization() {
-        // This test requires serialization to work, which depends on the
-        // exact serde implementation. Since we have custom serializers,
-        // let's test that CacheEntry fields can be accessed correctly.
         let entry = CacheEntry::new(
             StatusCode::OK,
             http::Version::HTTP_11,
@@ -305,9 +557,35 @@ mod tests {
         assert_eq!(record.expires_at_ms, 1000000);
         assert_eq!(record.stale_until_ms, 2000000);
 
-        // Note: Full serialization/deserialization testing should be done
-        // in integration tests with an actual Memcached instance, as bincode
-        // serialization details are implementation-dependent.
+        // Note: Serialization round-trip testing should be done in integration tests
+        // with an actual Memcached instance, as bincode serialization details are
+        // implementation-dependent and the custom serde implementations may have
+        // specific requirements.
+    }
+
+    #[test]
+    fn test_builder_defaults() {
+        let builder = MemcachedBackendBuilder::default();
+        assert_eq!(builder.namespace, "tower_http_cache");
+        assert_eq!(builder.max_connections, 10);
+        assert_eq!(builder.min_connections, 2);
+        assert_eq!(builder.connection_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_builder_customization() {
+        let builder = MemcachedBackendBuilder::default()
+            .address("127.0.0.1:11211")
+            .namespace("custom")
+            .max_connections(20)
+            .min_connections(5)
+            .connection_timeout(Duration::from_secs(10));
+
+        assert_eq!(builder.address, Some("127.0.0.1:11211".to_string()));
+        assert_eq!(builder.namespace, "custom");
+        assert_eq!(builder.max_connections, 20);
+        assert_eq!(builder.min_connections, 5);
+        assert_eq!(builder.connection_timeout, Duration::from_secs(10));
     }
 
     // Integration tests would require a running Memcached instance
