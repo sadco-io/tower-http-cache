@@ -11,6 +11,7 @@ use crate::range::RangeHandling;
 
 /// Decision on how to handle a response body based on size and content type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::manual_non_exhaustive)]
 pub enum StreamingDecision {
     /// Buffer the body and cache it (small enough, appropriate type)
     Buffer,
@@ -18,7 +19,8 @@ pub enum StreamingDecision {
     /// Skip caching entirely (too large or excluded content type)
     SkipCache,
 
-    /// Stream the body without buffering (not implemented yet)
+    /// Stream the body without buffering (reserved for future use).
+    #[doc(hidden)]
     StreamThrough,
 
     /// Try to stream if possible, fallback to buffer (unknown size)
@@ -62,8 +64,8 @@ pub struct StreamingPolicy {
     /// Supports wildcards like "video/*"
     pub excluded_content_types: HashSet<String>,
 
-    /// Always cache these content types regardless of size
-    /// Useful for API responses that should always be cached
+    /// Bypass content-type exclusions for these types (size limits still apply).
+    /// Useful for API responses that should be cached even if they match an exclusion pattern.
     pub force_cache_content_types: HashSet<String>,
 
     /// Use streaming for bodies above this size (default: 512KB)
@@ -277,6 +279,9 @@ fn is_forced_content_type(content_type: &str, forced: &HashSet<String>) -> bool 
 }
 
 /// Matches a content type against a pattern (supports wildcards).
+///
+/// For non-wildcard patterns, matches if the content type equals the pattern
+/// or starts with it followed by a semicolon (to handle parameters like `; charset=utf-8`).
 fn matches_pattern(content_type: &str, pattern: &str) -> bool {
     let pattern_lower = pattern.to_lowercase();
 
@@ -285,8 +290,9 @@ fn matches_pattern(content_type: &str, pattern: &str) -> bool {
         let prefix = &pattern_lower[..pattern_lower.len() - 2];
         content_type.starts_with(prefix)
     } else {
-        // Exact match or substring match
-        content_type.contains(&pattern_lower)
+        // Exact match (with optional parameter suffix)
+        content_type == pattern_lower
+            || content_type.starts_with(&format!("{};", pattern_lower))
     }
 }
 
@@ -413,8 +419,13 @@ mod tests {
     #[test]
     fn test_exact_pattern_matching() {
         assert!(matches_pattern("application/pdf", "application/pdf"));
-        assert!(matches_pattern("application/pdf", "pdf")); // substring match
+        assert!(!matches_pattern("application/pdf", "pdf")); // no substring match
         assert!(!matches_pattern("text/plain", "application/pdf"));
+        // Matches with parameter suffix
+        assert!(matches_pattern(
+            "application/json; charset=utf-8",
+            "application/json"
+        ));
     }
 
     #[test]

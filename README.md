@@ -30,13 +30,13 @@ Tower middleware for HTTP response caching with pluggable storage backends (in-m
 
 ```toml
 [dependencies]
-tower-http-cache = "0.3"
+tower-http-cache = "0.5"
 
 # Enable Redis support if required
-tower-http-cache = { version = "0.3", features = ["redis-backend"] }
+tower-http-cache = { version = "0.5", features = ["redis-backend"] }
 
 # With admin API support
-tower-http-cache = { version = "0.3", features = ["admin-api"] }
+tower-http-cache = { version = "0.5", features = ["admin-api"] }
 ```
 
 ---
@@ -220,25 +220,19 @@ let cache_layer = CacheLayer::builder(backend)
 Enable cache introspection and management endpoints:
 
 ```rust
-use tower_http_cache::admin::{AdminConfig, admin_router};
+use tower_http_cache::admin::AdminConfig;
 
-let admin_config = AdminConfig::builder()
-    .require_auth(true)
-    .auth_token("your-secret-token")
-    .build();
+let admin_config = AdminConfig::new()
+    .with_require_auth(true)
+    .with_auth_token("your-secret-token")
+    .with_enabled(true);
 
-// Mount admin routes (Axum example)
-let admin_routes = admin_router(backend.clone(), admin_config);
-let app = Router::new()
-    .nest("/admin/cache", admin_routes)
-    .layer(cache_layer);
-
-// Available endpoints:
-// GET  /admin/cache/health
-// GET  /admin/cache/stats
-// GET  /admin/cache/hot-keys
-// GET  /admin/cache/tags
-// POST /admin/cache/invalidate
+// Available handler functions (wire into your Axum router):
+// tower_http_cache::admin::routes::handle_health
+// tower_http_cache::admin::routes::handle_stats
+// tower_http_cache::admin::routes::handle_hot_keys
+// tower_http_cache::admin::routes::handle_list_tags
+// tower_http_cache::admin::routes::handle_invalidate
 ```
 
 ### ML-Ready Structured Logging
@@ -347,9 +341,10 @@ python3 scripts/redis_smoke.py
 docker compose -f docker-compose.redis.yml down
 
 # Examples
-cargo run --example axum_basic --features middleware
-cargo run --example axum_custom --features middleware
+cargo run --example axum_redis --features redis-backend
+cargo run --example chunk_cache_demo
 cargo run --example redis_smoke --features redis-backend
+cargo run --example v0_3_features --features admin-api
 ```
 
 ---

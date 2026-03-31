@@ -1,6 +1,6 @@
 [package]
 name = "tower-http-cache"
-version = "0.4.3"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.75.0"
 description = "Tower-compatible caching layer with pluggable backends (in-memory, Redis, and more)"
@@ -8,6 +8,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/sadco-io/tower-http-cache"
 documentation = "https://docs.rs/tower-http-cache"
 readme = "README.md"
+exclude = ["._*", "**/.DS_Store", ".cursor/"]
 keywords = ["tower", "cache", "middleware", "http"]
 categories = ["web-programming", "caching"]
 authors = ["Daniel Curtis <drc@danielryancurtis.com>"]
