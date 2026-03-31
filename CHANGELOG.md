@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-03-31
+
+### Fixed
+- **Content-type pattern matching used substring instead of exact match** — `"pdf"` in exclusion list would match any MIME type containing "pdf". Now uses exact match with optional parameter suffix (e.g., `application/json; charset=utf-8` matches pattern `application/json`).
+- **`force_cache_content_types` doc claimed "regardless of size"** — size limits always applied. Fixed doc to accurately describe behavior: bypasses content-type exclusions only.
+- **`unsafe impl Sync for SyncBoxBody` safety comment was incorrect** — claimed "single-threaded" context which is wrong for Tower. Updated with correct safety justification.
+- **README documented non-existent `admin_router()` and `AdminConfig::builder()` API** — updated to match actual `AdminConfig::new().with_*()` API.
+- **README referenced non-existent examples and `middleware` feature flag** — updated to list actual examples.
+- **README installation instructions referenced version `"0.3"`** — updated to `"0.5"`.
+- **`._*` macOS resource fork files were included in crates.io package** — added to `exclude` in Cargo.toml and `.gitignore`.
+- **CHANGELOG footer links missing for v0.4.0–v0.4.3**.
+
+### Changed
+- `StreamingDecision::StreamThrough` is now `#[doc(hidden)]` (reserved for future implementation).
+- Bumped version to 0.5.0 due to content-type matching behavior change (may affect users relying on substring matching).
+
 ## [0.4.3] - 2025-11-10
 
 ### Removed
@@ -309,7 +325,12 @@ All v0.3.0 features are opt-in and backward compatible:
 - Benchmark suite with Criterion
 - Examples for Axum and Redis integration
 
-[Unreleased]: https://github.com/sadco-io/tower-http-cache/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/sadco-io/tower-http-cache/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/sadco-io/tower-http-cache/compare/v0.4.3...v0.5.0
+[0.4.3]: https://github.com/sadco-io/tower-http-cache/compare/v0.4.2...v0.4.3
+[0.4.2]: https://github.com/sadco-io/tower-http-cache/compare/v0.4.1...v0.4.2
+[0.4.1]: https://github.com/sadco-io/tower-http-cache/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/sadco-io/tower-http-cache/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/sadco-io/tower-http-cache/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/sadco-io/tower-http-cache/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/sadco-io/tower-http-cache/compare/v0.1.1...v0.1.2

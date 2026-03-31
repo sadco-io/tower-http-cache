@@ -36,8 +36,7 @@ pin_project_lite::pin_project! {
     /// Response body type that implements Sync for Axum compatibility.
     ///
     /// This wraps BoxBody and manually implements Sync using the same pattern as Axum.
-    /// The inner body is wrapped with SyncWrapper to satisfy Send + Sync requirements
-    /// while still providing HttpBody implementation.
+    /// See the `unsafe impl Sync` below for the safety justification.
     pub struct SyncBoxBody {
         #[pin]
         inner: BoxBody<Bytes, BoxError>,
@@ -51,8 +50,9 @@ impl SyncBoxBody {
     }
 }
 
-// SAFETY: BoxBody is Send, and we're using this in a single-threaded Tower service context.
-// This is the same pattern used by Axum's Body type.
+// SAFETY: The inner BoxBody is Send + 'static. Access to the body is exclusively through
+// poll_frame which requires Pin<&mut Self>, preventing concurrent access without external
+// synchronization. This is the same pattern used by Axum's own Body type.
 unsafe impl Sync for SyncBoxBody {}
 
 impl Body for SyncBoxBody {

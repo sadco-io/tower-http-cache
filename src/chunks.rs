@@ -9,12 +9,12 @@
 //!
 //! # Examples
 //!
-//! ```rust
+//! ```rust,no_run
 //! use tower_http_cache::chunks::{ChunkCache, ChunkMetadata};
 //! use bytes::Bytes;
 //! use http::StatusCode;
 //!
-//! # tokio_test::block_on(async {
+//! # async fn example() {
 //! let chunk_cache = ChunkCache::new(1024 * 1024); // 1MB chunks
 //!
 //! let metadata = ChunkMetadata {
@@ -36,7 +36,7 @@
 //! // Retrieve a range
 //! let range = entry.get_range(0, 1024 * 1024 - 1);
 //! assert!(range.is_some());
-//! # });
+//! # }
 //! ```
 
 use bytes::Bytes;

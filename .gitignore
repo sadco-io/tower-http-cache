@@ -8,6 +8,8 @@ Cargo.lock
 *.swo
 *~
 .DS_Store
+._*
+.cursor/
 
 # Internal planning docs
 ROADMAP.md
