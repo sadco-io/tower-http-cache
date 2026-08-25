@@ -433,7 +433,7 @@ impl<L1, L2> Default for MultiTierBuilder<L1, L2> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "in-memory"))]
 mod tests {
     use super::*;
     use crate::backend::memory::InMemoryBackend;

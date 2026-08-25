@@ -1160,7 +1160,7 @@ fn maybe_compress(bytes: Bytes, _config: CompressionConfig) -> (Bytes, bool) {
     (bytes, false)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "in-memory"))]
 mod tests {
     use super::*;
     use crate::backend::CacheEntry;

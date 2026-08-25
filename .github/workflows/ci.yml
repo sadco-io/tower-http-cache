@@ -32,10 +32,13 @@ jobs:
       - run: cargo test --features in-memory,serde,redis-backend,metrics,tracing,compression,admin-api --all-targets
       - run: cargo test --features in-memory,serde --doc
       - run: cargo test --no-default-features --features in-memory
+      # Reduced feature sets skip doctests: the crate-level examples use
+      # InMemoryBackend, which is a default feature. Doctests are covered
+      # by the default and --all-features runs above.
+      - run: cargo test --no-default-features --lib --tests
+      - run: cargo test --no-default-features --features serde --lib --tests
       # The feature matrix regressed twice before CI existed: `serde` and
       # `in-memory` were both load-bearing without being declared as such.
-      - run: cargo check --no-default-features
-      - run: cargo check --no-default-features --features serde
       - run: cargo clippy --no-default-features --features in-memory -- -D warnings
       - run: cargo test --all-features --all-targets
 

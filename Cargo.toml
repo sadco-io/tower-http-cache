@@ -72,6 +72,50 @@ criterion = { version = "0.7", features = ["html_reports"] }
 # No-op recorder for the `metrics` bench in cache_benchmarks.rs.
 metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
 
+# Every integration test and example is built on a concrete backend, so each
+# declares the feature that provides it. Without these, `cargo test` on a
+# reduced feature set fails to resolve the backend type.
+[[test]]
+name = "auto_refresh"
+required-features = ["in-memory"]
+
+[[test]]
+name = "cache_stale"
+required-features = ["in-memory"]
+
+[[test]]
+name = "integration_cache"
+required-features = ["in-memory"]
+
+[[test]]
+name = "streaming"
+required-features = ["in-memory"]
+
+[[test]]
+name = "redis_example"
+required-features = ["redis-backend"]
+
+[[example]]
+name = "chunk_cache_demo"
+required-features = ["in-memory"]
+
+[[example]]
+name = "v0_3_features"
+required-features = ["in-memory", "serde"]
+
+[[example]]
+name = "axum_redis"
+required-features = ["redis-backend"]
+
+[[example]]
+name = "redis_smoke"
+required-features = ["redis-backend"]
+
+[[example]]
+name = "memcached_production"
+required-features = ["memcached-backend"]
+
 [[bench]]
 name = "cache_benchmarks"
 harness = false
+required-features = ["in-memory"]

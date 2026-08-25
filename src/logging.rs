@@ -408,6 +408,7 @@ mod tests {
         assert_eq!(hash1.len(), 64); // SHA-256 produces 64 hex chars
     }
 
+    #[cfg(feature = "serde")]
     #[test]
     fn cache_event_builder() {
         let request_id = RequestId::new();
@@ -433,6 +434,7 @@ mod tests {
         assert!(!event.promoted);
     }
 
+    #[cfg(feature = "serde")]
     #[test]
     fn cache_event_log_disabled() {
         let config = MLLoggingConfig::new().with_enabled(false);
@@ -443,6 +445,7 @@ mod tests {
         event.log(&config);
     }
 
+    #[cfg(feature = "serde")]
     #[test]
     fn cache_event_log_with_hashing() {
         let config = MLLoggingConfig::new()
@@ -455,6 +458,7 @@ mod tests {
         event.log(&config);
     }
 
+    #[cfg(feature = "serde")]
     #[test]
     fn log_cache_operation_helper() {
         let config = MLLoggingConfig::new().with_enabled(true);

@@ -49,6 +49,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--no-default-features --features in-memory` no longer pulls `bincode` at all, so those
   users are not exposed to RUSTSEC-2025-0141 (see Known issues). Default builds are
   unchanged -- `serde` is still a default feature.
+- **Every integration test, example and bench now declares the backend feature it needs.**
+  Once `in-memory` and `serde` became real gates, `cargo test` on a reduced feature set
+  failed to resolve `InMemoryBackend` / `CacheEvent` in four integration tests, five
+  examples, the benches, and two internal `#[cfg(test)]` modules. All now declare
+  `required-features` or are `#[cfg]`-gated. Found by the new CI job -- the earlier local
+  sweep used `cargo check`, which does not compile test modules.
 - **`backend::memory` was not gated on `in-memory`.** Its siblings `redis` and
   `memcached` were, but `memory` (which needs `moka`) was not, so `--no-default-features`
   failed on an unresolved `moka`. The module, its `prelude` re-export, and the
