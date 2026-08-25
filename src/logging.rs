@@ -4,11 +4,16 @@
 //! machine learning training and analysis. All cache operations emit
 //! JSON-formatted logs with rich metadata for correlation and analysis.
 
+#[cfg(feature = "serde")]
 use crate::request_id::RequestId;
+#[cfg(feature = "serde")]
 use http::{Method, StatusCode, Uri, Version};
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "serde")]
 use serde_json::json;
 use sha2::{Digest, Sha256};
+#[cfg(feature = "serde")]
 use std::time::{Duration, SystemTime};
 
 /// Configuration for ML-ready structured logging.
@@ -86,8 +91,9 @@ impl MLLoggingConfig {
 }
 
 /// Types of cache events that can be logged.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum CacheEventType {
     /// Cache lookup hit (fresh entry)
     Hit,
@@ -108,6 +114,11 @@ pub enum CacheEventType {
 }
 
 /// Structured cache event for ML training.
+/// Structured cache event, emitted as JSON.
+///
+/// Requires the `serde` feature: the `metadata` field is a
+/// [`serde_json::Value`] and the payload is emitted as JSON.
+#[cfg(feature = "serde")]
 #[derive(Debug, Clone)]
 pub struct CacheEvent {
     /// Timestamp of the event
@@ -159,6 +170,7 @@ pub struct CacheEvent {
     pub metadata: serde_json::Value,
 }
 
+#[cfg(feature = "serde")]
 impl CacheEvent {
     /// Creates a new cache event.
     pub fn new(event_type: CacheEventType, request_id: RequestId, key: String) -> Self {
@@ -322,6 +334,7 @@ pub fn hash_key(key: &str) -> String {
 }
 
 /// Helper to log a simple cache operation.
+#[cfg(feature = "serde")]
 pub fn log_cache_operation(
     config: &MLLoggingConfig,
     event_type: CacheEventType,
@@ -395,6 +408,7 @@ mod tests {
         assert_eq!(hash1.len(), 64); // SHA-256 produces 64 hex chars
     }
 
+    #[cfg(feature = "serde")]
     #[test]
     fn cache_event_builder() {
         let request_id = RequestId::new();
@@ -420,6 +434,7 @@ mod tests {
         assert!(!event.promoted);
     }
 
+    #[cfg(feature = "serde")]
     #[test]
     fn cache_event_log_disabled() {
         let config = MLLoggingConfig::new().with_enabled(false);
@@ -430,6 +445,7 @@ mod tests {
         event.log(&config);
     }
 
+    #[cfg(feature = "serde")]
     #[test]
     fn cache_event_log_with_hashing() {
         let config = MLLoggingConfig::new()
@@ -442,6 +458,7 @@ mod tests {
         event.log(&config);
     }
 
+    #[cfg(feature = "serde")]
     #[test]
     fn log_cache_operation_helper() {
         let config = MLLoggingConfig::new().with_enabled(true);

@@ -6,11 +6,11 @@
 //! Run: cargo run --example chunk_cache_demo
 
 use bytes::Bytes;
-use http::{Method, Request, Response, StatusCode, Uri};
+use http::{Method, Request, Response, StatusCode};
 use http_body_util::Full;
 use std::collections::HashSet;
 use std::time::Duration;
-use tower::{Service, ServiceBuilder, ServiceExt};
+use tower::{ServiceBuilder, ServiceExt};
 use tower_http_cache::prelude::*;
 use tower_http_cache::streaming::StreamingPolicy;
 

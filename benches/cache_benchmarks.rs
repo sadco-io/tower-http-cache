@@ -29,8 +29,7 @@ fn request(path_and_query: &str) -> Request<()> {
 }
 
 fn sample_entry(body_len: usize) -> CacheEntry {
-    let mut headers = Vec::new();
-    headers.push(("content-type".to_string(), b"application/json".to_vec()));
+    let headers = vec![("content-type".to_string(), b"application/json".to_vec())];
     let payload = vec![b'x'; body_len];
 
     CacheEntry::new(
@@ -387,7 +386,7 @@ fn bench_stale_while_revalidate(c: &mut Criterion) {
 }
 
 fn bench_codec_and_compression(c: &mut Criterion) {
-    let codec = BincodeCodec::default();
+    let codec = BincodeCodec;
     let entry_small = sample_entry(512);
     let entry_large = sample_entry(256 * 1024);
 
@@ -527,13 +526,16 @@ fn bench_negative_cache(c: &mut Criterion) {
 
 #[cfg(feature = "metrics")]
 fn bench_instrumentation_overhead(c: &mut Criterion) {
-    use metrics_exporter_null::NullBuilder;
+    // `metrics_exporter_null` does not exist on crates.io -- this bench never
+    // compiled with `--features metrics`. metrics-util's DebuggingRecorder is
+    // the maintained stand-in for a recorder that swallows everything.
+    use metrics_util::debugging::DebuggingRecorder;
 
     static RECORDER: OnceLock<()> = OnceLock::new();
     RECORDER.get_or_init(|| {
-        NullBuilder::default()
+        DebuggingRecorder::new()
             .install()
-            .expect("null recorder to install");
+            .expect("debugging recorder to install");
     });
 
     let rt = tokio_runtime();
@@ -552,7 +554,7 @@ fn bench_instrumentation_overhead(c: &mut Criterion) {
         )
     });
 
-    let mut instrumented_service = instrumented_layer.layer(origin.clone());
+    let mut instrumented_service = instrumented_layer.layer(origin);
     let mut raw_service = origin;
 
     c.bench_function("instrumentation/with_metrics", |b| {

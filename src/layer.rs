@@ -18,6 +18,7 @@ use tower::{Layer, Service, ServiceExt};
 #[cfg(feature = "metrics")]
 use metrics::{counter, histogram};
 
+#[cfg(feature = "in-memory")]
 use crate::backend::memory::InMemoryBackend;
 use crate::backend::{CacheBackend, CacheEntry, CacheRead};
 use crate::chunks::{ChunkCache, ChunkMetadata};
@@ -296,6 +297,7 @@ where
     }
 }
 
+#[cfg(feature = "in-memory")]
 impl CacheLayer<InMemoryBackend> {
     /// Creates a cache layer backed by an in-memory [`InMemoryBackend`].
     pub fn new_in_memory(max_capacity: u64) -> Self {
@@ -1158,7 +1160,7 @@ fn maybe_compress(bytes: Bytes, _config: CompressionConfig) -> (Bytes, bool) {
     (bytes, false)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "in-memory"))]
 mod tests {
     use super::*;
     use crate::backend::CacheEntry;

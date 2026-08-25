@@ -1,0 +1,62 @@
+# cargo-deny configuration. Run locally with `cargo deny check`.
+
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+ignore = [
+    # RUSTSEC-2025-0141: bincode 1.3.3 is unmaintained (the team ceased
+    # development permanently in Dec 2025). There is no patched release.
+    # bincode is reachable from the default feature set via `serde`, and it
+    # defines the on-disk / on-wire encoding for the Redis and Memcached
+    # backends -- migrating to bincode 3 or postcard invalidates every live
+    # cache entry, so it is scheduled for 0.6.0 rather than a patch.
+    # See CHANGELOG 0.5.1 "Known issues".
+    "RUSTSEC-2025-0141",
+
+    # The two below are reachable ONLY through the opt-in `memcached-backend`
+    # feature, and only because `async-memcached` declares `toxiproxy_rust` -- a
+    # test fixture -- as a normal dependency, dragging in reqwest 0.11 ->
+    # hyper 0.14 -> h2. One test fixture, three advisories. Still present in
+    # async-memcached 0.7.0, so the planned 0.5 -> 0.7 bump does not fix it.
+    #
+    # RUSTSEC-2026-0258 is a real denial-of-service vulnerability, not an
+    # unmaintained notice. `memcached-backend` is documented as not recommended
+    # for production until this is resolved upstream. Delete both entries the
+    # moment async-memcached moves toxiproxy_rust to [dev-dependencies].
+    "RUSTSEC-2026-0258",  # h2: unbounded empty DATA frames (DoS)
+    "RUSTSEC-2025-0057",  # fxhash: unmaintained
+    "RUSTSEC-2025-0134",  # rustls-pemfile: unmaintained
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+skip = [
+    # `memcached-backend` pulls async-memcached, which depends on
+    # toxiproxy_rust unconditionally, which drags in reqwest 0.11 and its
+    # hyper 0.14 / native-tls / openssl subtree. Duplicated against the
+    # modern http stack. Tracked upstream; see CHANGELOG 0.5.1.
+]
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    # notify (CC0-1.0) and tiny-keccak via ahash/const-random. CC0-1.0 is a
+    # public-domain dedication: permissive, no obligations, FSF Free/Libre.
+    "CC0-1.0",
+    # webpki-roots ships the Mozilla CA bundle under CDLA-Permissive-2.0.
+    "CDLA-Permissive-2.0",
+    "Zlib",
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

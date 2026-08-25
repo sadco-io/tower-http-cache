@@ -38,9 +38,11 @@
 //! ## Status
 //! The project is under active development. The public API is not yet stabilized.
 
+#[cfg(feature = "admin-api")]
 pub mod admin;
 pub mod backend;
 pub mod chunks;
+#[cfg(feature = "serde")]
 pub mod codec;
 pub mod error;
 pub mod layer;
@@ -55,7 +57,9 @@ pub mod tags;
 
 pub use chunks::{ChunkCache, ChunkCacheStats, ChunkMetadata, ChunkedEntry};
 pub use layer::{CacheLayer, CacheLayerBuilder, KeyExtractor};
-pub use logging::{CacheEvent, CacheEventType, MLLoggingConfig};
+#[cfg(feature = "serde")]
+pub use logging::CacheEvent;
+pub use logging::{CacheEventType, MLLoggingConfig};
 pub use range::{RangeHandling, RangeRequest};
 pub use request_id::RequestId;
 pub use streaming::{StreamingDecision, StreamingPolicy};

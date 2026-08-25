@@ -285,10 +285,13 @@ where
 
         // Optionally write to L1 if write-through is enabled and size is acceptable
         if self.config.write_through {
-            let should_write_l1 = if let Some(max_size) = self.config.max_l1_entry_size {
-                if entry_size <= max_size {
-                    true
-                } else {
+            // Written as a mutable flag rather than an if/else returning bool
+            // literals: with `metrics` and `tracing` both off, the cfg'd
+            // statements vanish and the else branch collapses to a bare
+            // `false`, which trips `clippy::needless_bool`.
+            let mut should_write_l1 = true;
+            if let Some(max_size) = self.config.max_l1_entry_size {
+                if entry_size > max_size {
                     #[cfg(feature = "metrics")]
                     metrics::counter!("tower_http_cache.tier.l1_skipped_large").increment(1);
 
@@ -300,11 +303,9 @@ where
                         "skipping L1 write for large entry"
                     );
 
-                    false
+                    should_write_l1 = false;
                 }
-            } else {
-                true
-            };
+            }
 
             if should_write_l1 {
                 let _ = self.l1.set(key.clone(), entry, ttl, stale_for).await;
@@ -432,7 +433,7 @@ impl<L1, L2> Default for MultiTierBuilder<L1, L2> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "in-memory"))]
 mod tests {
     use super::*;
     use crate::backend::memory::InMemoryBackend;

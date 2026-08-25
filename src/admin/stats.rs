@@ -98,7 +98,7 @@ impl GlobalStats {
             })
             .collect();
 
-        keys.sort_by(|a, b| b.hits.cmp(&a.hits));
+        keys.sort_by_key(|a| std::cmp::Reverse(a.hits));
         keys.truncate(limit);
         keys
     }

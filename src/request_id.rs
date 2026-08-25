@@ -5,6 +5,7 @@
 //! from headers (e.g., X-Request-ID) or generated automatically.
 
 use http::{HeaderValue, Request};
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
@@ -15,7 +16,8 @@ use uuid::Uuid;
 /// Request IDs enable correlation of logs, metrics, and traces across
 /// different components and services. They can be extracted from incoming
 /// headers or generated automatically.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct RequestId(String);
 
 impl RequestId {

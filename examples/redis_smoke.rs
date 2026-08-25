@@ -57,7 +57,7 @@ struct AppState {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".into());
     let client = Client::open(redis_url)?;
-    let manager: ConnectionManager = client.get_tokio_connection_manager().await?;
+    let manager: ConnectionManager = client.get_connection_manager().await?;
 
     let backend = RedisBackend::new(manager);
 

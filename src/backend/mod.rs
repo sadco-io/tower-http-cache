@@ -13,6 +13,7 @@
 
 #[cfg(feature = "memcached-backend")]
 pub mod memcached;
+#[cfg(feature = "in-memory")]
 pub mod memory;
 pub mod multi_tier;
 #[cfg(feature = "redis-backend")]
