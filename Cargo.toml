@@ -2,8 +2,11 @@
 name = "tower-http-cache"
 version = "0.5.1"
 edition = "2021"
-# 1.85 is the real floor: uuid 1.25 (a non-optional dependency) declares it,
-# as do axum 0.8 (1.80), redis 0.32 (1.80) and criterion 0.7 (1.80).
+# 1.85 covers the default feature set and everything except the shared
+# backends. `redis-backend` and `memcached-backend` both pull `url` -> `idna`
+# -> `icu_*`, which require 1.88; there is no Cargo.lock in this repo, so a
+# consumer resolving fresh gets those versions too. Both floors are enforced
+# by separate CI jobs.
 rust-version = "1.85"
 description = "Tower-compatible caching layer with pluggable backends (in-memory, Redis, and more)"
 license = "MIT OR Apache-2.0"
