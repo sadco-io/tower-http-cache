@@ -7,6 +7,121 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-08-25
+
+### Fixed
+
+- **`governor` was declared but never used.** The `admin-api` feature pulled
+  `governor 0.6` and its entire rate-limiting subtree; nothing in `src/`, `tests/`,
+  `examples/` or `benches/` referenced it. Removed. Same class of finding as the
+  `cargo-udeps` sweeps in 0.4.2 / 0.4.3.
+- **The `metrics` bench never compiled.** `benches/cache_benchmarks.rs` imported
+  `metrics_exporter_null`, a crate that does not exist on crates.io, so
+  `cargo bench --features metrics` failed with E0432. Now uses
+  `metrics_util::debugging::DebuggingRecorder`.
+- **Declared MSRV was wrong for the default build.** `rust-version` said `1.75.0`, but
+  the non-optional `uuid = "1.0"` resolves to 1.25, which declares `1.85.0` -- and with
+  no committed lockfile there was nothing holding it back. `axum` 0.8 (1.80), `redis`
+  0.32 (1.80) and dev `criterion` 0.7 (1.80) compound it. Now `1.85`.
+- **The crate did not build without the `serde` feature, and `serde` was not properly
+  gated.** `codec.rs`, `logging.rs`, `request_id.rs`, `admin/routes.rs` and
+  `admin/stats.rs` all `use serde` unconditionally, so `--no-default-features` failed with
+  six unresolved imports. Rather than making `serde` mandatory, the serde-shaped surfaces
+  are now gated on it properly:
+
+  - `codec` (backend serialization) is behind `serde`
+  - `admin` is behind `admin-api` -- **the module was not gated at all**, only its
+    re-export was, so the two most serde-heavy files in the crate compiled into every build
+  - `CacheEvent` and `log_cache_operation` are behind `serde`; they carry a
+    `serde_json::Value` and emit JSON, so serde is genuinely load-bearing there.
+    `MLLoggingConfig` and `CacheEventType` stay ungated -- `CachePolicy` embeds the former,
+    and neither needs serialization to be useful.
+  - `RequestId`'s derives are now `cfg_attr`'d; they were ornamental.
+  - `redis-backend`, `memcached-backend` and `admin-api` each enable `serde`, because for
+    those it really is load-bearing.
+
+  **This takes `bincode` out of the default-adjacent dependency graph.** A build of
+  `--no-default-features --features in-memory` no longer pulls `bincode` at all, so those
+  users are not exposed to RUSTSEC-2025-0141 (see Known issues). Default builds are
+  unchanged -- `serde` is still a default feature.
+- **`backend::memory` was not gated on `in-memory`.** Its siblings `redis` and
+  `memcached` were, but `memory` (which needs `moka`) was not, so `--no-default-features`
+  failed on an unresolved `moka`. The module, its `prelude` re-export, and the
+  `CacheLayer::new_in_memory` constructor are now behind `#[cfg(feature = "in-memory")]`,
+  consistent with the other backends.
+- **`concurrent_requests_share_refresh_work` was ~50% flaky.** Measured at 6/20 passes on
+  the released code. It asserted that of two racing requests, one receives the stale body
+  and the other the refreshed one -- but which body a given racer observes is not part of
+  the stale-while-revalidate contract; it depends on how the tasks interleave with the
+  background refresh. The test now asserts what the contract actually guarantees: each
+  response is one of the two legitimate bodies, **and the origin is called exactly twice**,
+  which is the real single-flight coalescing property. That second assertion is unchanged
+  and still deterministic. Now 25/25.
+- `examples/redis_smoke.rs` used the deprecated `Client::get_tokio_connection_manager`;
+  switched to `get_connection_manager`. Cleared unused imports in
+  `examples/chunk_cache_demo.rs` and clippy warnings in `src/admin/stats.rs`,
+  `src/streaming.rs` and the benches so `clippy -D warnings` passes.
+
+### Changed
+
+- `dashmap` `5.5` -> `6.2`. Technically a major, shipped in a patch because `dashmap` is
+  not part of this crate's public API -- `src/tags.rs` and `src/chunks.rs` use only
+  `DashMap::new`, `get`, `insert` and `entry`, all unchanged across 5 -> 6. Staying on
+  5.x forced a duplicate `dashmap` into any tree that also depended on a 6.x consumer.
+- Dependency floors raised to current, all semver-compatible: `tokio` `1.40` -> `1.53`,
+  `http` `1.3` -> `1.5`, `http-body` `1.0` -> `1.1`, `http-body-util` `0.1` -> `0.1.5`,
+  `bytes` `1.7` -> `1.12`, `moka` `0.12` -> `0.12.16`, `tokio-util` `0.7` -> `0.7.19`,
+  `flate2` `1.0` -> `1.1`, `uuid` `1.0` -> `1.25`, `chrono` `0.4` -> `0.4.45`,
+  `futures-util` `0.3` -> `0.3.34`, `tower` `0.5` -> `0.5.3`, `axum` `0.8` -> `0.8.9`,
+  `tracing-subscriber` `0.3` -> `0.3.23`.
+
+### Added
+
+- CI (`.github/workflows/ci.yml`): stable + beta tests across the feature matrix
+  (including `--no-default-features`), an MSRV job pinned to 1.85.0, `fmt` +
+  `clippy -D warnings`, `cargo doc -D warnings`, and `cargo deny check`.
+- `deny.toml`, with the bincode advisory ignore documented inline.
+
+### Known issues
+
+- **`bincode 1.3.3` is unmaintained (RUSTSEC-2025-0141).** Filed 2025-12-16; upstream has
+  ceased development permanently and there is no patched release. `bincode` is reachable
+  from the default feature set, so downstream `cargo audit` runs will flag it -- though as
+  of this release a `--no-default-features --features in-memory` build does not pull it at
+  all, which is the recommended configuration for anyone who does not need a shared backend. It defines
+  the on-disk and on-wire encoding for the Redis and Memcached backends, so migrating to
+  bincode 3 or postcard invalidates every live cache entry -- scheduled for 0.6.0, with a
+  documented ignore in `deny.toml` until then.
+- **`memcached-backend` is NOT recommended for production in this release.** One
+  dependency brings three advisories, one of them a live vulnerability:
+  `async-memcached` declares `toxiproxy_rust` -- a *test fixture* -- as a normal
+  dependency, which pulls `reqwest 0.11` -> `hyper 0.14` -> `h2`:
+  - **RUSTSEC-2026-0258** — `h2` unbounded empty DATA frames (**denial of service**)
+  - RUSTSEC-2025-0134 — `rustls-pemfile` unmaintained
+  - RUSTSEC-2025-0057 — `fxhash` unmaintained
+
+  All three are suppressed in `deny.toml` with comments naming this cause, so the rest of
+  the tree stays auditable; they are to be deleted the moment upstream moves
+  `toxiproxy_rust` to `[dev-dependencies]`. The feature is opt-in and off by default, and
+  no other feature is affected. **Confirmed still present in `async-memcached` 0.7.0**, so
+  the planned bump does not resolve it.
+
+- **`memcached-backend` also drags in a second HTTP stack.** `async-memcached` depends on
+  `toxiproxy_rust` unconditionally, which pulls `reqwest 0.11` -> `hyper 0.14` ->
+  `native-tls` -> `openssl-sys`. Enabling the feature therefore requires `libssl-dev` and
+  `pkg-config` on the build host and duplicates the entire HTTP stack. Confirmed still
+  present in `async-memcached 0.7.0`, so the planned bump does not resolve it; this needs
+  an upstream fix (moving `toxiproxy_rust` to `[dev-dependencies]`) or a different client.
+  The `memcached-backend` feature is excluded from CI for this reason.
+
+### Notes
+
+- Deferred to 0.6.0: the `bincode` migration above, `redis` `0.32.7` -> `1.6` (MSRV 1.88),
+  `sha2` `0.10` -> `0.11` (used in `src/logging.rs`; moves to the `digest` 0.11 traits),
+  `async-memcached` `0.5` -> `0.7` with `bb8` `0.8` -> `0.9`, and dev `criterion`
+  `0.7` -> `0.8`.
+
+
 ## [0.5.0] - 2026-03-31
 
 ### Fixed

@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: test (${{ matrix.rust }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: [stable, beta]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+      - uses: Swatinem/rust-cache@v2
+      # `memcached-backend` reaches native-tls via async-memcached -> toxiproxy_rust.
+      - name: install openssl headers
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+      # The feature-selected run below is the primary gate; async-memcached pulls toxiproxy_rust
+      # -> reqwest 0.11 -> native-tls -> openssl-sys, which needs libssl-dev.
+      - run: cargo test --features in-memory,serde,redis-backend,metrics,tracing,compression,admin-api --all-targets
+      - run: cargo test --features in-memory,serde --doc
+      - run: cargo test --no-default-features --features in-memory
+      # The feature matrix regressed twice before CI existed: `serde` and
+      # `in-memory` were both load-bearing without being declared as such.
+      - run: cargo check --no-default-features
+      - run: cargo check --no-default-features --features serde
+      - run: cargo clippy --no-default-features --features in-memory -- -D warnings
+      - run: cargo test --all-features --all-targets
+
+  msrv:
+    name: msrv (1.85.0)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      # Build only: dev-dependencies are allowed to outrun the MSRV.
+      - run: cargo build --features in-memory,serde,redis-backend,metrics,tracing,compression,admin-api
+
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --features in-memory,serde,redis-backend,metrics,tracing,compression,admin-api --all-targets -- -D warnings
+
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --no-deps --features in-memory,serde,redis-backend,metrics,tracing,compression,admin-api
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check

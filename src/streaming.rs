@@ -291,8 +291,7 @@ fn matches_pattern(content_type: &str, pattern: &str) -> bool {
         content_type.starts_with(prefix)
     } else {
         // Exact match (with optional parameter suffix)
-        content_type == pattern_lower
-            || content_type.starts_with(&format!("{};", pattern_lower))
+        content_type == pattern_lower || content_type.starts_with(&format!("{};", pattern_lower))
     }
 }
 

@@ -278,11 +278,26 @@ async fn concurrent_requests_share_refresh_work() {
     let resp_b = String::from_utf8(resp_b).expect("valid utf-8 body");
 
     let bodies = [resp_a.as_str(), resp_b.as_str()];
+
+    // Both racers must see a body the cache legitimately holds. Which one each
+    // observes is *not* part of the stale-while-revalidate contract: whether a
+    // given caller gets the stale entry or the already-refreshed one depends on
+    // how the two tasks interleave with the background refresh. Asserting one of
+    // each made this test ~50% flaky.
     assert!(
-        bodies.contains(&"1") && bodies.contains(&"2"),
-        "one response should be stale, other refreshed: got {bodies:?}"
+        bodies.iter().all(|b| *b == "1" || *b == "2"),
+        "each response should be either the stale or the refreshed body: got {bodies:?}"
     );
-    assert_eq!(counter.load(Ordering::SeqCst), 2);
+
+    // This is the actual contract, and it is deterministic: the origin is hit
+    // exactly twice -- once to warm the cache, once for the single coalesced
+    // refresh. A third hit would mean the two concurrent requests each kicked
+    // off their own refresh instead of sharing one.
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        2,
+        "concurrent requests must share one refresh, not trigger one each"
+    );
 }
 
 #[tokio::test]

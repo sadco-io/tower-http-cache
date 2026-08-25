@@ -54,7 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Step 3: Create cache layer with production settings
     println!("\n⚙️  Configuring cache policy...");
 
-    let cache_layer = CacheLayer::builder(backend.clone())
+    let _cache_layer = CacheLayer::builder(backend.clone())
         .policy(
             CachePolicy::default()
                 .with_ttl(Duration::from_secs(300)) // 5 minutes

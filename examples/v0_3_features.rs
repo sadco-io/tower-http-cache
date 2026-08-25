@@ -68,7 +68,7 @@ async fn demo_cache_tags() -> Result<(), Box<dyn std::error::Error>> {
                 .with_tag_policy(tag_policy)
                 .with_tag_extractor(|method, uri| {
                     // Extract tags from URI path
-                    if method == &Method::GET {
+                    if method == Method::GET {
                         let path = uri.path();
                         if path.starts_with("/users/") {
                             let parts: Vec<&str> = path.split('/').collect();
@@ -186,7 +186,7 @@ async fn demo_ml_logging() -> Result<(), Box<dyn std::error::Error>> {
 
     let backend = InMemoryBackend::new(1000);
 
-    let layer = CacheLayer::builder(backend)
+    let _layer = CacheLayer::builder(backend)
         .policy(CachePolicy::default().with_ml_logging(ml_config))
         .build();
 
@@ -306,7 +306,7 @@ async fn demo_combined_features() -> Result<(), Box<dyn std::error::Error>> {
     println!("  ✓ Tags in cache: {:?}", tags);
 
     // Get stats
-    let stats = backend.stats();
+    let _stats = backend.stats();
     println!("  ✓ Tier stats available for monitoring");
 
     Ok(())
