@@ -22,7 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Declared MSRV was wrong for the default build.** `rust-version` said `1.75.0`, but
   the non-optional `uuid = "1.0"` resolves to 1.25, which declares `1.85.0` -- and with
   no committed lockfile there was nothing holding it back. `axum` 0.8 (1.80), `redis`
-  0.32 (1.80) and dev `criterion` 0.7 (1.80) compound it. Now `1.85`.
+  0.32 (1.80) and dev `criterion` 0.7 (1.80) compound it. Now **`1.85` for the core and
+  `1.88` for the shared backends** -- `redis-backend` and `memcached-backend` both reach
+  `url` -> `idna` -> `icu_*`, which declare 1.88. With no committed lockfile a consumer
+  resolving fresh gets those versions too, so pinning them in our own lock would hide the
+  constraint rather than fix it. Both floors are enforced by separate CI jobs. The split
+  was found by the new MSRV job on the first push.
 - **The crate did not build without the `serde` feature, and `serde` was not properly
   gated.** `codec.rs`, `logging.rs`, `request_id.rs`, `admin/routes.rs` and
   `admin/stats.rs` all `use serde` unconditionally, so `--no-default-features` failed with
@@ -78,7 +83,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - CI (`.github/workflows/ci.yml`): stable + beta tests across the feature matrix
-  (including `--no-default-features`), an MSRV job pinned to 1.85.0, `fmt` +
+  (including `--no-default-features`), MSRV jobs for 1.85 and 1.88, `fmt` +
   `clippy -D warnings`, `cargo doc -D warnings`, and `cargo deny check`.
 - `deny.toml`, with the bincode advisory ignore documented inline.
 
