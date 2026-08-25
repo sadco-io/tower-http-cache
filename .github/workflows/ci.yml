@@ -47,7 +47,7 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@1.100.0
       - uses: Swatinem/rust-cache@v2
       # Build only: dev-dependencies are allowed to outrun the MSRV.
       # 1.85 covers everything except the shared backends.
@@ -55,7 +55,7 @@ jobs:
       - run: cargo build --features in-memory,serde,metrics,tracing,compression,admin-api
       # redis-backend / memcached-backend reach url -> idna -> icu_*, which
       # require 1.88. Enforced separately rather than papered over.
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@1.100.0
       - run: cargo build --features redis-backend
       - run: cargo build --features memcached-backend
 
