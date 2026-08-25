@@ -39,7 +39,6 @@ jobs:
       - run: cargo test --no-default-features --features serde --lib --tests
       # The feature matrix regressed twice before CI existed: `serde` and
       # `in-memory` were both load-bearing without being declared as such.
-      - run: cargo clippy --no-default-features --features in-memory -- -D warnings
       - run: cargo test --all-features --all-targets
 
   msrv:
@@ -70,6 +69,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --features in-memory,serde,redis-backend,metrics,tracing,compression,admin-api --all-targets -- -D warnings
+      # The minimal build has its own lints (cfg-gated code paths).
+      - run: cargo clippy --no-default-features --features in-memory -- -D warnings
 
   docs:
     name: docs
