@@ -68,7 +68,7 @@ http-body-util = "0.1.5"
 axum = "0.8.9"
 redis = { version = "0.32.7", features = ["aio", "tokio-comp", "connection-manager"] }
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
-criterion = { version = "0.7", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 # No-op recorder for the `metrics` bench in cache_benchmarks.rs.
 metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
 
