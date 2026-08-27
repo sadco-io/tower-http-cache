@@ -41,6 +41,9 @@ pin-project-lite = "0.2"
 thiserror = "2.0"
 dashmap = "6.2"
 bincode = { version = "1.3.3", optional = true }
+# Wire format for cached entries. `default-features = false` is required: the
+# default feature set pulls `heapless` for embedded targets.
+postcard = { version = "1.1.3", default-features = false, features = ["use-std"], optional = true }
 tracing = { version = "0.1", optional = true }
 flate2 = { version = "1.1", optional = true, default-features = false, features = ["rust_backend"] }
 uuid = { version = "1.25", features = ["v4", "serde"] }
@@ -53,7 +56,7 @@ default = ["in-memory", "serde"]
 in-memory = ["moka"]
 redis-backend = ["redis", "tokio-util", "serde"]
 memcached-backend = ["async-memcached", "dep:bb8", "serde"]
-serde = ["dep:serde", "dep:serde_json", "dep:bincode"]
+serde = ["dep:serde", "dep:serde_json", "dep:bincode", "dep:postcard"]
 metrics = ["dep:metrics"]
 tracing = ["dep:tracing"]
 compression = ["dep:flate2"]
@@ -97,6 +100,12 @@ required-features = ["in-memory"]
 name = "redis_example"
 required-features = ["redis-backend"]
 
+# Byte-level wire format tests. No server needed: the codec, the envelope and
+# the legacy readers all operate on plain slices.
+[[test]]
+name = "wire_compat"
+required-features = ["serde"]
+
 [[example]]
 name = "chunk_cache_demo"
 required-features = ["in-memory"]
@@ -120,4 +129,5 @@ required-features = ["memcached-backend"]
 [[bench]]
 name = "cache_benchmarks"
 harness = false
-required-features = ["in-memory"]
+# `bench_codec_and_compression` uses the codec, which lives behind `serde`.
+required-features = ["in-memory", "serde"]

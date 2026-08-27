@@ -386,18 +386,18 @@ fn bench_stale_while_revalidate(c: &mut Criterion) {
 }
 
 fn bench_codec_and_compression(c: &mut Criterion) {
-    let codec = BincodeCodec;
+    let codec = PostcardCodec;
     let entry_small = sample_entry(512);
     let entry_large = sample_entry(256 * 1024);
 
-    c.bench_function("codec/bincode_encode_small", |b| {
+    c.bench_function("codec/postcard_encode_small", |b| {
         b.iter(|| {
             let bytes = codec.encode(black_box(&entry_small)).unwrap();
             black_box(bytes);
         });
     });
 
-    c.bench_function("codec/bincode_decode_small", |b| {
+    c.bench_function("codec/postcard_decode_small", |b| {
         let encoded = codec.encode(&entry_small).unwrap();
         b.iter(|| {
             let entry = codec.decode(black_box(&encoded)).unwrap();
@@ -405,14 +405,14 @@ fn bench_codec_and_compression(c: &mut Criterion) {
         });
     });
 
-    c.bench_function("codec/bincode_encode_large", |b| {
+    c.bench_function("codec/postcard_encode_large", |b| {
         b.iter(|| {
             let bytes = codec.encode(black_box(&entry_large)).unwrap();
             black_box(bytes.len());
         });
     });
 
-    c.bench_function("codec/bincode_decode_large", |b| {
+    c.bench_function("codec/postcard_decode_large", |b| {
         let encoded = codec.encode(&entry_large).unwrap();
         b.iter(|| {
             let entry = codec.decode(black_box(&encoded)).unwrap();

@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The on-the-wire cache format changed, and `tags` are now part of it.**
+  Entries stored in Redis and Memcached are now written as a 21-byte versioned
+  envelope (`"THC"` magic, format byte, codec byte, and the expiry/stale
+  timestamps as little-endian `u64`) followed by a `postcard`-encoded payload.
+  Previously the two backends used two *different* undocumented `bincode 1`
+  layouts.
+
+  **Rolling back to 0.5.x is safe.** A 0.5.x binary encountering a 0.6.0 entry
+  gets a clean decode error, which the cache layer already treats as a miss.
+  You get a cold cache, not corrupted responses. (This is exactly what the
+  envelope header buys: without it, an old reader would have silently accepted
+  the new bytes and ignored the trailing remainder.)
+
+  The envelope is documented in `tower_http_cache::codec::envelope`, and byte 4
+  records which codec wrote the entry. Entries written by one codec are
+  reported as a miss rather than handed to another.
+
+- **`BincodeCodec` is renamed `PostcardCodec`.** A deprecated type alias keeps
+  `BincodeCodec` working through 0.6.x; it is removed in 0.7.0. Because
+  `RedisBackend<C = PostcardCodec>` resolves through the alias, most downstream
+  code is untouched.
+
+- **`CacheCodec` gained a defaulted `CODEC_ID` associated constant.** It names
+  the codec in the envelope header. The default is `0x80`, the start of the
+  range reserved for codecs implemented outside this crate, so existing
+  downstream `impl CacheCodec` blocks keep compiling unchanged.
+
+- **`MemcachedBackend` now honours `CacheCodec`.** It previously called
+  `bincode` directly, bypassing the codec entirely, so `with_codec` had no
+  memcached equivalent and the two shared backends disagreed about the format.
+  Both now route through one codec and one envelope. `MemcachedBackend` gained
+  a defaulted codec type parameter (`MemcachedBackend<C = PostcardCodec>`) and
+  a `with_codec` method mirroring `RedisBackend`; `MemcachedBackendBuilder` is
+  unchanged and still builds the default-codec backend.
+
+- Redis no longer double-encodes. 0.5.x encoded the entry into a `Vec<u8>`,
+  then encoded that vector into a second `Vec<u8>`; the envelope removes one
+  full copy of the body on every `set`.
+
+### Fixed
+
+- **Cache tags were silently dropped by the Redis codec.** `BincodeCodec::encode`
+  serialized a private struct with no `tags` field, and `decode` rebuilt the entry
+  through `CacheEntry::new`, which always sets `tags: None`. Tags never crossed the
+  Redis wire. They now do. (Memcached was unaffected — it serialized `CacheEntry`
+  whole. That inconsistency is also fixed.)
+
+- The `cache_benchmarks` bench now declares `serde` in its `required-features`.
+  It uses the codec, which lives behind that feature, so
+  `cargo bench --no-default-features --features in-memory` did not build.
+
 ## [0.5.2] - 2026-08-26
 
 A dependency-reduction and edition release. No wire-format change, no public

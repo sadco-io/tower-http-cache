@@ -43,9 +43,11 @@
 use async_memcached::{AsciiProtocol, Client};
 use async_trait::async_trait;
 use bb8::{Pool, PooledConnection};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use super::{CacheBackend, CacheEntry, CacheRead};
+use crate::codec::envelope::{self, LegacyShape};
+use crate::codec::{CacheCodec, PostcardCodec};
 use crate::error::CacheError;
 
 /// Connection manager for bb8 pool.
@@ -91,15 +93,18 @@ type MemcachedPool = Pool<MemcachedConnectionManager>;
 /// Memcached cache backend with connection pooling.
 ///
 /// Provides distributed caching using the Memcached protocol with efficient
-/// connection management via bb8 pooling. Entries are serialized with bincode
-/// and stored with appropriate TTL values.
+/// connection management via bb8 pooling. Entries are serialized by the
+/// configured [`CacheCodec`] and wrapped in the shared
+/// [envelope](crate::codec::envelope), the same format the Redis backend
+/// writes.
 #[derive(Clone)]
-pub struct MemcachedBackend {
+pub struct MemcachedBackend<C = PostcardCodec> {
     pool: MemcachedPool,
     namespace: String,
+    codec: C,
 }
 
-impl MemcachedBackend {
+impl MemcachedBackend<PostcardCodec> {
     /// Creates a new Memcached backend with default pool settings.
     ///
     /// The default pool configuration:
@@ -150,6 +155,33 @@ impl MemcachedBackend {
     /// ```
     pub fn builder() -> MemcachedBackendBuilder {
         MemcachedBackendBuilder::default()
+    }
+}
+
+impl<C> MemcachedBackend<C> {
+    /// Replaces the codec used to serialize entries.
+    ///
+    /// The codec's [`CacheCodec::CODEC_ID`] is recorded in the envelope
+    /// header, so entries written by one codec are not handed to another.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use tower_http_cache::backend::memcached::MemcachedBackend;
+    /// # use tower_http_cache::codec::PostcardCodec;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let backend = MemcachedBackend::new("127.0.0.1:11211")
+    ///     .await?
+    ///     .with_codec(PostcardCodec);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_codec<NC>(self, codec: NC) -> MemcachedBackend<NC> {
+        MemcachedBackend {
+            pool: self.pool,
+            namespace: self.namespace,
+            codec,
+        }
     }
 
     /// Gets a connection from the pool.
@@ -354,7 +386,7 @@ impl MemcachedBackendBuilder {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn build(self) -> Result<MemcachedBackend, CacheError> {
+    pub async fn build(self) -> Result<MemcachedBackend<PostcardCodec>, CacheError> {
         let address = self
             .address
             .ok_or_else(|| CacheError::Backend("address is required".to_string()))?;
@@ -372,45 +404,16 @@ impl MemcachedBackendBuilder {
         Ok(MemcachedBackend {
             pool,
             namespace: self.namespace,
+            codec: PostcardCodec,
         })
     }
 }
 
-/// Serializable record stored in Memcached.
-///
-/// We store the entry along with timing metadata so we can properly
-/// handle stale-while-revalidate semantics.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct MemcachedRecord {
-    entry: CacheEntry,
-    expires_at_ms: u64,
-    stale_until_ms: u64,
-}
-
-/// Converts a SystemTime to milliseconds since UNIX_EPOCH.
-fn system_time_to_unix_ms(time: SystemTime) -> Result<u64, CacheError> {
-    time.duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .map_err(|e| CacheError::Backend(format!("Time conversion error: {}", e)))
-}
-
-/// Converts milliseconds since UNIX_EPOCH to SystemTime.
-fn unix_ms_to_system_time(ms: u64) -> Result<SystemTime, CacheError> {
-    Ok(UNIX_EPOCH + Duration::from_millis(ms))
-}
-
-/// Gets the current time in milliseconds since UNIX_EPOCH.
-fn current_millis() -> Result<u64, CacheError> {
-    system_time_to_unix_ms(SystemTime::now())
-}
-
-/// Converts a Duration to milliseconds.
-fn duration_millis(duration: Duration) -> u64 {
-    duration.as_millis() as u64
-}
-
 #[async_trait]
-impl CacheBackend for MemcachedBackend {
+impl<C> CacheBackend for MemcachedBackend<C>
+where
+    C: CacheCodec,
+{
     async fn get(&self, key: &str) -> Result<Option<CacheRead>, CacheError> {
         let namespaced_key = self.make_key(key);
         let mut conn = self.get_connection().await?;
@@ -427,15 +430,11 @@ impl CacheBackend for MemcachedBackend {
                 .as_ref()
                 .ok_or_else(|| CacheError::Backend("Memcached value has no data".to_string()))?;
 
-            // Deserialize the record
-            let record: MemcachedRecord = bincode::deserialize(data_bytes.as_slice())
-                .map_err(|e| CacheError::Backend(format!("Deserialization failed: {}", e)))?;
-
-            Ok(Some(CacheRead {
-                entry: record.entry,
-                expires_at: Some(unix_ms_to_system_time(record.expires_at_ms)?),
-                stale_until: Some(unix_ms_to_system_time(record.stale_until_ms)?),
-            }))
+            envelope::read_stored(
+                data_bytes.as_slice(),
+                &self.codec,
+                LegacyShape::MemcachedOuter,
+            )
         } else {
             Ok(None)
         }
@@ -455,20 +454,13 @@ impl CacheBackend for MemcachedBackend {
         let namespaced_key = self.make_key(&key);
 
         // Calculate expiration times
-        let now_ms = current_millis()?;
-        let expires_at_ms = now_ms.saturating_add(duration_millis(ttl));
-        let stale_until_ms = expires_at_ms.saturating_add(duration_millis(stale_for));
+        let now_ms = envelope::current_millis()?;
+        let expires_at_ms = now_ms.saturating_add(envelope::duration_millis(ttl));
+        let stale_until_ms = expires_at_ms.saturating_add(envelope::duration_millis(stale_for));
 
-        // Create the record
-        let record = MemcachedRecord {
-            entry,
-            expires_at_ms,
-            stale_until_ms,
-        };
-
-        // Serialize the record
-        let bytes = bincode::serialize(&record)
-            .map_err(|e| CacheError::Backend(format!("Serialization failed: {}", e)))?;
+        // Serialize the entry and wrap it in the shared envelope
+        let payload = self.codec.encode(&entry)?;
+        let bytes = envelope::wrap(C::CODEC_ID, expires_at_ms, stale_until_ms, &payload);
 
         // Memcached TTL is the total time (fresh + stale)
         let total_ttl = ttl.saturating_add(stale_for);
@@ -509,6 +501,7 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use http::StatusCode;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn test_make_key() {
@@ -524,8 +517,8 @@ mod tests {
     #[test]
     fn test_system_time_conversion() {
         let now = SystemTime::now();
-        let ms = system_time_to_unix_ms(now).unwrap();
-        let converted = unix_ms_to_system_time(ms).unwrap();
+        let ms = now.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        let converted = envelope::unix_ms_to_system_time(ms);
 
         // Should be within 1ms of each other
         let diff = now
@@ -535,32 +528,41 @@ mod tests {
         assert!(diff.as_millis() < 2);
     }
 
+    /// Round-trips an entry through the codec and the shared envelope, which
+    /// is exactly what `set`/`get` do either side of the network. Replaces the
+    /// old `test_memcached_record_serialization`, which asserted the fields it
+    /// had just set and explicitly did not test serialization.
     #[test]
-    fn test_memcached_record_serialization() {
+    fn record_round_trips_through_envelope() {
         let entry = CacheEntry::new(
             StatusCode::OK,
             http::Version::HTTP_11,
             vec![("content-type".to_string(), b"application/json".to_vec())],
             Bytes::from_static(b"{\"test\":true}"),
+        )
+        .with_tags(vec!["user:123".to_string(), "tenant:acme".to_string()]);
+
+        let codec = PostcardCodec;
+        let payload = codec.encode(&entry).unwrap();
+        let bytes = envelope::wrap(PostcardCodec::CODEC_ID, 1_000_000, 2_000_000, &payload);
+
+        let read = envelope::read_stored(&bytes, &codec, LegacyShape::MemcachedOuter)
+            .unwrap()
+            .expect("entry should decode");
+
+        assert_eq!(read.entry.status, entry.status);
+        assert_eq!(read.entry.version, entry.version);
+        assert_eq!(read.entry.headers, entry.headers);
+        assert_eq!(read.entry.body, entry.body);
+        assert_eq!(read.entry.tags, entry.tags);
+        assert_eq!(
+            read.expires_at,
+            Some(envelope::unix_ms_to_system_time(1_000_000))
         );
-
-        let record = MemcachedRecord {
-            entry: entry.clone(),
-            expires_at_ms: 1000000,
-            stale_until_ms: 2000000,
-        };
-
-        // Verify record was created correctly
-        assert_eq!(record.entry.status, StatusCode::OK);
-        assert_eq!(record.entry.version, http::Version::HTTP_11);
-        assert_eq!(record.entry.body, Bytes::from_static(b"{\"test\":true}"));
-        assert_eq!(record.expires_at_ms, 1000000);
-        assert_eq!(record.stale_until_ms, 2000000);
-
-        // Note: Serialization round-trip testing should be done in integration tests
-        // with an actual Memcached instance, as bincode serialization details are
-        // implementation-dependent and the custom serde implementations may have
-        // specific requirements.
+        assert_eq!(
+            read.stale_until,
+            Some(envelope::unix_ms_to_system_time(2_000_000))
+        );
     }
 
     #[test]
