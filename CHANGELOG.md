@@ -159,6 +159,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`RedisBackend` serialized every cache operation through a single mutex.**
+  The connection was held as `Arc<Mutex<ConnectionManager>>`, but
+  `ConnectionManager` is `pub struct ConnectionManager(Arc<Internals>)` with
+  `#[derive(Clone)]` and multiplexes internally — the mutex defeated the
+  multiplexing it was wrapping, turning a pool into a queue. It is now cloned
+  per operation, which is what the type is designed for.
+
+  This is a pre-existing bug, not a consequence of the redis upgrade: the
+  definition is identical in 0.32.7 and 1.6.0, so 0.5.x was affected too. The
+  field is private and `RedisBackend::new` still takes a `ConnectionManager`,
+  so there is no public API change, and `RedisBackend` remains
+  `Send + Sync + Clone + 'static` (pinned by a test).
+
 - **0.5.x's memcached backend could not read back what it had written.**
   `CacheEntry`'s `version_serde` helper wrote its discriminant as `i32` —
   the match arms had no type annotation, so the literals defaulted to `i32` —

@@ -1,10 +1,8 @@
-use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
-use tokio::sync::Mutex;
 
 use super::{CacheBackend, CacheEntry, CacheRead};
 use crate::codec::envelope::{self, LegacyShape};
@@ -13,7 +11,12 @@ use crate::error::CacheError;
 
 #[derive(Clone)]
 pub struct RedisBackend<C = PostcardCodec> {
-    connection: Arc<Mutex<ConnectionManager>>,
+    // `ConnectionManager` is `pub struct ConnectionManager(Arc<Internals>)`
+    // with `#[derive(Clone)]`, and it multiplexes internally. Wrapping it in
+    // an `Arc<Mutex<..>>` -- as this field did up to 0.5.x -- serialised every
+    // cache operation through one lock and defeated the multiplexing it was
+    // wrapping. Clone it per operation instead; that is what the type is for.
+    connection: ConnectionManager,
     namespace: String,
     codec: C,
 }
@@ -64,7 +67,7 @@ impl RedisBackend<PostcardCodec> {
     /// [`CacheError::Redis`]: crate::error::CacheError::Redis
     pub fn new(connection: ConnectionManager) -> Self {
         Self {
-            connection: Arc::new(Mutex::new(connection)),
+            connection,
             namespace: "tower_http_cache".to_owned(),
             codec: PostcardCodec,
         }
@@ -96,9 +99,8 @@ where
     C: CacheCodec,
 {
     async fn get(&self, key: &str) -> Result<Option<CacheRead>, CacheError> {
-        let mut conn = self.connection.lock().await;
+        let mut conn = self.connection.clone();
         let data: Option<Vec<u8>> = conn.get(self.make_key(key)).await?;
-        drop(conn);
 
         match data {
             Some(bytes) => envelope::read_stored(&bytes, &self.codec, LegacyShape::RedisOuter),
@@ -128,13 +130,13 @@ where
         let total_ttl = ttl.saturating_add(stale_for);
         let ttl_secs = total_ttl.as_secs().max(1);
 
-        let mut conn = self.connection.lock().await;
+        let mut conn = self.connection.clone();
         let _: () = conn.set_ex(self.make_key(&key), bytes, ttl_secs).await?;
         Ok(())
     }
 
     async fn invalidate(&self, key: &str) -> Result<(), CacheError> {
-        let mut conn = self.connection.lock().await;
+        let mut conn = self.connection.clone();
         let _: () = conn.del(self.make_key(key)).await?;
         Ok(())
     }
@@ -172,4 +174,20 @@ fn unsupported_tags() -> CacheError {
          not available on it. Planned for 0.7.0 as an opt-in Redis-native index."
             .to_string(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_send_sync_clone_static<T: Send + Sync + Clone + 'static>() {}
+
+    /// Removing the `Arc<Mutex<..>>` must not change what `RedisBackend` is:
+    /// `CacheBackend` requires all four bounds, and `ConnectionManager`
+    /// supplies them on its own because it is already `Arc`-backed and
+    /// `Clone`.
+    #[test]
+    fn redis_backend_is_send_sync_clone_static() {
+        assert_send_sync_clone_static::<RedisBackend<PostcardCodec>>();
+    }
 }
