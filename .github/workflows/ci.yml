@@ -36,6 +36,36 @@ jobs:
       # The feature matrix regressed twice before CI existed: `serde` and
       # `in-memory` were both load-bearing without being declared as such.
       - run: cargo test --all-features --all-targets
+      # The 0.5.x legacy reader must build and pass with the feature both on
+      # and off, for the default set and for redis-backend. It is in `default`,
+      # so only the explicit off legs actually exercise the cfg-gated absence.
+      - run: cargo test --no-default-features --features in-memory,serde
+      - run: cargo test --no-default-features --features in-memory,serde,legacy-bincode1-read
+      - run: cargo test --no-default-features --features in-memory,serde,redis-backend
+      - run: cargo test --no-default-features --features in-memory,serde,redis-backend,legacy-bincode1-read
+
+  no-bincode:
+    name: bincode absent from the graph
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # 0.6.0 deleted the RUSTSEC-2025-0141 suppression from deny.toml by
+      # removing bincode entirely; the 0.5.x reader is hand-written and pulls no
+      # dependency. Without this guard a transitive reintroduction would surface
+      # as an unexplained cargo-deny failure instead of here.
+      #
+      # `cargo tree -i` exits non-zero when the package is NOT found, which is
+      # the outcome we want -- hence the deliberate inversion.
+      - name: cargo tree -i bincode must find nothing
+        run: |
+          if cargo tree -i bincode --all-features >/dev/null 2>&1; then
+            echo "bincode is back in the dependency graph:"
+            cargo tree -i bincode --all-features
+            exit 1
+          fi
 
   msrv:
     name: msrv (1.85 core / 1.88 backends)
