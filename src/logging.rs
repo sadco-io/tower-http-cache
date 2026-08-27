@@ -278,17 +278,8 @@ impl CacheEvent {
             self.key.clone()
         };
 
-        let timestamp = self
-            .timestamp
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default();
-
         let log_data = json!({
-            "timestamp": format!("{}.{:03}Z",
-                chrono::DateTime::<chrono::Utc>::from(self.timestamp)
-                    .format("%Y-%m-%dT%H:%M:%S"),
-                timestamp.subsec_millis()
-            ),
+            "timestamp": crate::time_fmt::format_iso8601_millis(self.timestamp),
             "level": "info",
             "event": format!("{:?}", self.event_type).to_lowercase(),
             "request_id": self.request_id.as_str(),

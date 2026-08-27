@@ -54,6 +54,9 @@ pub mod refresh;
 pub mod request_id;
 pub mod streaming;
 pub mod tags;
+/// UTC timestamp formatting. Private: replaces the former `chrono` dependency
+/// and is not part of the public API.
+mod time_fmt;
 
 pub use chunks::{ChunkCache, ChunkCacheStats, ChunkMetadata, ChunkedEntry};
 pub use layer::{CacheLayer, CacheLayerBuilder, KeyExtractor};

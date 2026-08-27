@@ -82,7 +82,7 @@ pub struct ErrorResponse {
 pub fn handle_health() -> HealthResponse {
     HealthResponse {
         status: "healthy".to_string(),
-        timestamp: chrono::Utc::now().to_rfc3339(),
+        timestamp: crate::time_fmt::format_rfc3339(std::time::SystemTime::now()),
     }
 }
 
@@ -120,7 +120,7 @@ pub fn handle_hot_keys<B: CacheBackend>(
             .map(|k| HotKeyEntry {
                 key: k.key,
                 hits: k.hits,
-                last_accessed: chrono::DateTime::<chrono::Utc>::from(k.last_accessed).to_rfc3339(),
+                last_accessed: crate::time_fmt::format_rfc3339(k.last_accessed),
             })
             .collect(),
     }

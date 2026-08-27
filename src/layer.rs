@@ -1,4 +1,6 @@
 use std::error::Error as StdError;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
@@ -6,7 +8,6 @@ use std::time::{Duration, SystemTime};
 use bytes::Bytes;
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
-use futures_util::future::BoxFuture;
 use http::header::{CACHE_CONTROL, PRAGMA};
 use http::{HeaderMap, Method, Request, Response, Uri};
 use http_body::Body;
@@ -32,6 +33,13 @@ use crate::streaming::extract_size_info;
 use crate::streaming::{should_stream, StreamingDecision};
 
 pub type BoxError = Box<dyn StdError + Send + Sync>;
+
+/// Boxed, `Send` future used as `CacheService::Future`.
+///
+/// Structurally identical to `futures_util::future::BoxFuture<'static, T>`,
+/// which this replaced -- keeping `futures-util` out of the runtime
+/// dependency tree costs one type alias.
+type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
 pin_project_lite::pin_project! {
     /// Response body type that implements Sync for Axum compatibility.
@@ -607,7 +615,7 @@ where
 {
     type Response = Response<SyncBoxBody>;
     type Error = BoxError;
-    type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
+    type Future = BoxFuture<Result<Self::Response, Self::Error>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx).map_err(Into::into)
