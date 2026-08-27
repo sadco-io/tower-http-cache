@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-08-27
+
 ### Fixed
 
 - **Stampede protection no longer lets a second origin request through.** A
@@ -854,7 +856,8 @@ All v0.3.0 features are opt-in and backward compatible:
 - Benchmark suite with Criterion
 - Examples for Axum and Redis integration
 
-[Unreleased]: https://github.com/sadco-io/tower-http-cache/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/sadco-io/tower-http-cache/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/sadco-io/tower-http-cache/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/sadco-io/tower-http-cache/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/sadco-io/tower-http-cache/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/sadco-io/tower-http-cache/compare/v0.5.0...v0.5.1

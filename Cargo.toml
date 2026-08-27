@@ -1,6 +1,6 @@
 [package]
 name = "tower-http-cache"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 # 1.85 covers the default feature set and everything except `redis-backend`,
 # which requires 1.88 -- redis 1.6 declares `rust-version = "1.88"` outright,
