@@ -7,6 +7,111 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-08-26
+
+A dependency-reduction and edition release. No wire-format change, no public
+API change, no cache invalidation -- an existing cache stays readable across
+the upgrade.
+
+Two of these were deferred to 0.6.0 in the 0.5.1 notes. On inspection both
+turned out to be non-breaking for this crate, so they ship here instead and
+0.6.0 keeps its scope: the `bincode` migration and the backend bumps.
+
+### Removed
+
+- **`chrono` is gone entirely.** It was pulled in for one job -- rendering a
+  `SystemTime` as an RFC 3339 / ISO 8601 string -- across four call sites, with
+  no parsing, no local time and no timezone handling anywhere in the crate.
+  That is now a private `time_fmt` module (civil-from-days, ~90 lines) and one
+  fewer dependency, along with its `iana-time-zone` and `num-traits` subtree.
+
+  These strings go into ML training logs (`CacheEvent::log`) and admin API JSON
+  responses (`/health`, hot keys, stats), so the bar was **byte-identical
+  output**, not merely correct output. A change in shape would be a silent
+  break for anything parsing them. The replacement was validated by
+  differential-testing it against `chrono` 0.4.45 over **2,364,037 cases**
+  spanning chrono's entire representable range (years -262143 to +262142),
+  every fractional-second precision, leap days, year boundaries, pre-epoch
+  instants and the range boundaries: zero mismatches.
+
+  Three chrono behaviours turned out to be load-bearing, and are preserved
+  deliberately rather than tidied up, each pinned by a regression test:
+
+  - `to_rfc3339` spells the UTC offset `+00:00`, **not** `Z`. (The ML log
+    timestamp is a different format string and does end in `Z`.)
+  - Its fractional-second precision is *variable* -- the shortest lossless
+    choice of zero, 3, 6 or 9 digits. A fixed-width fraction would have been
+    wrong for most inputs.
+  - Extended years pad the magnitude to four digits after the sign (`-0001`,
+    `+10000`), not five.
+
+  The admin stats serializer's `secs as i64` was an unchecked cast, so a `u64`
+  above `i64::MAX` wrapped to a negative timestamp instead of saturating. That
+  is reproduced exactly rather than "fixed", because fixing it would change
+  output.
+
+- **`futures-util` is no longer a runtime dependency.** The library imported it
+  for exactly one thing: `BoxFuture` as `CacheService::Future`. That is now a
+  local `Pin<Box<dyn Future<Output = T> + Send + 'static>>` alias -- the same
+  concrete type, so the associated type is unchanged for callers and this is
+  not an API break. It moves to `[dev-dependencies]` rather than being deleted,
+  because `tests/integration_cache.rs` still uses `futures_util::stream::unfold`
+  to build a chunked body. It remains in the tree transitively via `moka` and
+  `tower`; what changes is that this crate no longer declares it.
+
+### Changed
+
+- `edition` `2021` -> `2024`. MSRV is already `1.85`, exactly the edition-2024
+  floor, so this costs no compatibility. `cargo fix --edition` was run across
+  the feature matrix and every hunk reviewed by hand; the only substantive
+  changes were three `if let (Some(ref x), ...)` patterns over tuples of
+  references dropping their now-rejected `ref`, plus rustfmt's 2024 import
+  ordering. One suggested rewrite was **rejected**: `cargo fix` converted
+  `InMemoryBackend::get`'s `if let`/`else` into a `match` on account of the
+  changed `if let` temporary scope, but moka's `get` returns an owned
+  `Option<StoredEntry>` -- no guard, no lock -- and the binding moves the value
+  out, so the rescope has nothing to observe. Similarly,
+  `clippy::let_and_return` began firing on `StampedeGuard::acquire_handle`
+  because clippy suppresses that lint pre-2024 when a `let` affects drop order;
+  the binding pins the drop of a `DashMap` shard write guard and is kept, with
+  a scoped allow, rather than letting lock release depend on edition-specific
+  tail-expression rules in a path that then awaits.
+- `sha2` `0.10` -> `0.11` (closes #9). The `Digest` trait path,
+  `new`/`update`/`finalize` and the `hex::encode` of the output all survived the
+  `digest` 0.11 bump unchanged, so `logging::hash_key` needed no edits. **Digest
+  values are identical, so no cache invalidation.** sha2 0.11 declares
+  `rust-version = 1.85`, exactly our floor.
+- Dev-dependency `criterion` `0.7` -> `0.8` (closes #15). No source changes
+  were needed: the bench already used `std::hint::black_box` rather than the
+  deprecated `criterion::black_box`. criterion 0.8 declares `rust-version 1.86`,
+  above our 1.85 floor, which is fine because dev-dependencies are not built by
+  the MSRV job's `cargo build` -- the same allowance the 1.85 job already
+  documents.
+
+### Known issues
+
+Unchanged from 0.5.1, and all four `deny.toml` suppressions still apply:
+
+- **`bincode 1.3.3` is unmaintained (RUSTSEC-2025-0141).** Still deferred to
+  0.6.0 -- it defines the on-disk and on-wire encoding for the Redis and
+  Memcached backends, so migrating invalidates every live cache entry, which is
+  not a patch-release change. It is reachable from the default feature set; a
+  `--no-default-features --features in-memory` build still does not pull it at
+  all, which remains the recommended configuration for anyone who does not need
+  a shared backend.
+- **`memcached-backend` is still NOT recommended for production**, for the same
+  three advisories reached through `async-memcached` -> `toxiproxy_rust` ->
+  `reqwest 0.11` (RUSTSEC-2026-0258 h2 DoS, RUSTSEC-2025-0134, RUSTSEC-2025-0057),
+  and it still drags in a second HTTP stack requiring `libssl-dev` and
+  `pkg-config`.
+- `tests/integration_cache.rs::concurrent_requests_share_refresh_work` remains
+  timing-sensitive under heavy machine load. Measured over ~9,000 runs at
+  6-way parallelism: **2.2% failure rate on this release against 2.8% on
+  0.5.1**, so it is pre-existing and marginally improved, not a regression. The
+  0.5.1 fix removed the ~50% flakiness; what is left is the deterministic
+  coalescing assertion timing out when the 300 ms stale window is missed on a
+  saturated host.
+
 ## [0.5.1] - 2026-08-25
 
 ### Fixed
@@ -451,7 +556,9 @@ All v0.3.0 features are opt-in and backward compatible:
 - Benchmark suite with Criterion
 - Examples for Axum and Redis integration
 
-[Unreleased]: https://github.com/sadco-io/tower-http-cache/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/sadco-io/tower-http-cache/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/sadco-io/tower-http-cache/compare/v0.5.1...v0.5.2
+[0.5.1]: https://github.com/sadco-io/tower-http-cache/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/sadco-io/tower-http-cache/compare/v0.4.3...v0.5.0
 [0.4.3]: https://github.com/sadco-io/tower-http-cache/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/sadco-io/tower-http-cache/compare/v0.4.1...v0.4.2

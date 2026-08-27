@@ -1,7 +1,7 @@
 [package]
 name = "tower-http-cache"
-version = "0.5.1"
-edition = "2021"
+version = "0.5.2"
+edition = "2024"
 # 1.85 covers the default feature set and everything except the shared
 # backends. `redis-backend` and `memcached-backend` both pull `url` -> `idna`
 # -> `icu_*`, which require 1.88; there is no Cargo.lock in this repo, so a
@@ -40,14 +40,12 @@ metrics = { version = "0.24", optional = true }
 pin-project-lite = "0.2"
 thiserror = "2.0"
 dashmap = "6.2"
-futures-util = { version = "0.3.34", default-features = false, features = ["alloc"] }
 bincode = { version = "1.3.3", optional = true }
 tracing = { version = "0.1", optional = true }
 flate2 = { version = "1.1", optional = true, default-features = false, features = ["rust_backend"] }
 uuid = { version = "1.25", features = ["v4", "serde"] }
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
-chrono = "0.4.45"
 axum = { version = "0.8.9", optional = true }
 
 [features]
@@ -63,12 +61,16 @@ admin-api = ["dep:axum", "serde"]
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["full"] }
+# Test-only: `tests/integration_cache.rs` builds a chunked body with
+# `futures_util::stream::unfold`. The library itself no longer needs it --
+# `CacheService::Future` uses a local `Pin<Box<dyn Future + Send>>` alias.
+futures-util = { version = "0.3.34", default-features = false, features = ["alloc"] }
 tower = { version = "0.5.3", features = ["util"] }
 http-body-util = "0.1.5"
 axum = "0.8.9"
 redis = { version = "0.32.7", features = ["aio", "tokio-comp", "connection-manager"] }
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
-criterion = { version = "0.7", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 # No-op recorder for the `metrics` bench in cache_benchmarks.rs.
 metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
 

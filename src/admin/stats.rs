@@ -2,8 +2,8 @@
 
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Global statistics collector.
@@ -210,9 +210,7 @@ where
 {
     let duration = time.duration_since(UNIX_EPOCH).unwrap_or_default();
     let secs = duration.as_secs();
-    let timestamp =
-        chrono::DateTime::from_timestamp(secs as i64, 0).unwrap_or(chrono::DateTime::UNIX_EPOCH);
-    serializer.serialize_str(&timestamp.to_rfc3339())
+    serializer.serialize_str(&crate::time_fmt::format_rfc3339_from_secs(secs))
 }
 
 #[cfg(test)]
