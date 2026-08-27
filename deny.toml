@@ -55,6 +55,11 @@ allow = [
     # webpki-roots ships the Mozilla CA bundle under CDLA-Permissive-2.0.
     "CDLA-Permissive-2.0",
     "Zlib",
+    # redis 1.6 depends on xxhash-rust, which is BSL-1.0 (Boost Software
+    # License 1.0) -- OSI approved, FSF Free/Libre, permissive, and compatible
+    # with this crate's MIT OR Apache-2.0. Arrived with the redis 0.32 -> 1.x
+    # upgrade; redis 0.32.7 had no xxhash-rust dependency.
+    "BSL-1.0",
 ]
 
 [sources]
