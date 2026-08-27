@@ -5,8 +5,8 @@
 //! concurrency limits.
 
 use http::{Method, Request, Response, StatusCode, Uri};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tower::{Layer, Service, ServiceExt};
 use tower_http_cache::backend::memory::InMemoryBackend;

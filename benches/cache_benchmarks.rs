@@ -1,12 +1,12 @@
 use std::convert::Infallible;
 use std::hint::black_box;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use http::{Method, Request, Response, StatusCode, Uri, Version};
 use http_body_util::Full;
 use tokio::runtime::Runtime;
@@ -422,8 +422,8 @@ fn bench_codec_and_compression(c: &mut Criterion) {
 
     #[cfg(feature = "compression")]
     {
-        use flate2::write::GzEncoder;
         use flate2::Compression;
+        use flate2::write::GzEncoder;
         use std::io::Write;
 
         let payload = vec![b'a'; 256 * 1024];

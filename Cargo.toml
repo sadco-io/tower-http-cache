@@ -1,7 +1,7 @@
 [package]
 name = "tower-http-cache"
 version = "0.5.2"
-edition = "2021"
+edition = "2024"
 # 1.85 covers the default feature set and everything except the shared
 # backends. `redis-backend` and `memcached-backend` both pull `url` -> `idna`
 # -> `icu_*`, which require 1.88; there is no Cargo.lock in this repo, so a

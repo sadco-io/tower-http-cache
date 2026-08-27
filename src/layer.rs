@@ -6,8 +6,8 @@ use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
-use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use http::header::{CACHE_CONTROL, PRAGMA};
 use http::{HeaderMap, Method, Request, Response, Uri};
 use http_body::Body;
@@ -26,11 +26,11 @@ use crate::chunks::{ChunkCache, ChunkMetadata};
 #[cfg(feature = "compression")]
 use crate::policy::CompressionStrategy;
 use crate::policy::{CachePolicy, CompressionConfig};
-use crate::range::{is_partial_content, parse_range_header, RangeHandling};
+use crate::range::{RangeHandling, is_partial_content, parse_range_header};
 use crate::refresh::{AutoRefreshConfig, RefreshCallback, RefreshManager, RefreshMetadata};
 #[cfg(feature = "tracing")]
 use crate::streaming::extract_size_info;
-use crate::streaming::{should_stream, StreamingDecision};
+use crate::streaming::{StreamingDecision, should_stream};
 
 pub type BoxError = Box<dyn StdError + Send + Sync>;
 
@@ -657,7 +657,7 @@ where
             tracing::debug!(method = %method, uri = %uri, "cache_call");
 
             // Try to serve from chunk cache if this is a range request
-            if let (Some(range_req), Some(ref chunk_cache), Some(ref key_ref)) =
+            if let (Some(range_req), Some(chunk_cache), Some(key_ref)) =
                 (range_request.as_ref(), &chunk_cache, &key)
             {
                 if let Some(entry) = chunk_cache.get(key_ref) {
@@ -890,7 +890,7 @@ where
             let response_bytes = cache_bytes.clone();
 
             // Populate chunk cache for large files if enabled
-            if let (Some(ref chunk_cache), Some(ref key_ref)) = (&chunk_cache, &key) {
+            if let (Some(chunk_cache), Some(key_ref)) = (&chunk_cache, &key) {
                 let streaming_policy = policy.streaming_policy();
 
                 if streaming_policy.enable_chunk_cache
@@ -1011,7 +1011,7 @@ where
                                 counter!("tower_http_cache.store").increment(1);
 
                                 // Store refresh metadata if auto-refresh is enabled
-                                if let (Some(ref manager), Some(metadata)) =
+                                if let (Some(manager), Some(metadata)) =
                                     (&refresh_manager, refresh_metadata)
                                 {
                                     manager.store_metadata(key_ref.clone(), metadata);
@@ -1052,6 +1052,16 @@ impl StampedeGuard {
         locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
         key: String,
     ) -> StampedeHandle {
+        // The `let` binding is deliberate: `DashMap::entry` returns a guard
+        // holding the shard's write lock, and binding the match result pins
+        // the drop point to the end of this statement -- identically in both
+        // edition 2021 and 2024. Edition 2024 changed when tail-expression
+        // temporaries drop, which is why clippy only started flagging this as
+        // redundant after the edition bump. Returning the `match` directly
+        // would make lock release depend on those edition rules; in a path
+        // that acquires a stampede lock and then awaits, that is not a
+        // trade worth making to save one line.
+        #[allow(clippy::let_and_return)]
         let handle = match locks.entry(key.clone()) {
             Entry::Occupied(entry) => StampedeHandle::Secondary(entry.get().clone()),
             Entry::Vacant(entry) => {
@@ -1141,7 +1151,7 @@ fn cache_control_disallows(headers: &HeaderMap) -> bool {
 
 #[cfg(feature = "compression")]
 fn maybe_compress(bytes: Bytes, config: CompressionConfig) -> (Bytes, bool) {
-    use flate2::{write::GzEncoder, Compression};
+    use flate2::{Compression, write::GzEncoder};
     use std::io::Write;
 
     match config.strategy {
