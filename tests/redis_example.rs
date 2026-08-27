@@ -8,9 +8,20 @@ use http::Request;
 use http::Response;
 use http_body_util::{BodyExt, Full};
 use redis::Client;
+use redis::aio::ConnectionManagerConfig;
 use tower::service_fn;
 use tower::{Service, ServiceBuilder, ServiceExt};
 use tower_http_cache::prelude::*;
+
+/// redis 1.x defaults to a 500 ms response timeout and a 1 s connection
+/// timeout. A response cache holds whole response bodies, so those defaults can
+/// convert a slow success into an error. The tests pick their own bound rather
+/// than inheriting one meant for small values.
+fn manager_config() -> ConnectionManagerConfig {
+    ConnectionManagerConfig::new()
+        .set_response_timeout(Some(Duration::from_secs(10)))
+        .set_connection_timeout(Some(Duration::from_secs(5)))
+}
 
 #[tokio::test]
 async fn redis_backend_round_trip() -> Result<(), Box<dyn std::error::Error>> {
@@ -23,7 +34,9 @@ async fn redis_backend_round_trip() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let client = Client::open(redis_url.clone())?;
-    let manager = client.get_connection_manager().await?;
+    let manager = client
+        .get_connection_manager_with_config(manager_config())
+        .await?;
 
     // Clean slate for the test DB
     let mut conn = manager.clone();
@@ -93,8 +106,12 @@ async fn redis_backend_reports_tags_unsupported() -> Result<(), Box<dyn std::err
     };
 
     let client = Client::open(redis_url)?;
-    let backend =
-        RedisBackend::new(client.get_connection_manager().await?).with_namespace("thc_tag_test");
+    let backend = RedisBackend::new(
+        client
+            .get_connection_manager_with_config(manager_config())
+            .await?,
+    )
+    .with_namespace("thc_tag_test");
 
     let err = backend.get_keys_by_tag("tenant:acme").await.unwrap_err();
     assert!(err.is_unsupported(), "get_keys_by_tag: {err}");
@@ -129,7 +146,9 @@ async fn redis_reads_a_real_0_5_1_entry_and_writes_the_envelope()
     };
 
     let client = Client::open(redis_url)?;
-    let manager = client.get_connection_manager().await?;
+    let manager = client
+        .get_connection_manager_with_config(manager_config())
+        .await?;
     let mut conn = manager.clone();
     redis::cmd("FLUSHDB").query_async::<()>(&mut conn).await?;
 

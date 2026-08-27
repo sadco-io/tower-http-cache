@@ -75,6 +75,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   variants are additive. `CacheError::is_unsupported()` is provided so callers
   do not have to match at all.
 
+- **`redis` `0.32.7` -> `1.6.0`.** No source changes were needed in this crate:
+  the `ConnectionManager` path and construction, `AsyncCommands::{get, set_ex,
+  del}`, `set_ex`'s `u64` TTL, `Option<Vec<u8>>` via `FromRedisValue`,
+  `#[from] redis::RedisError`, and the `aio` / `tokio-comp` /
+  `connection-manager` features are all unchanged. The documented 1.0 breaks
+  miss this crate: it never iterates, implements no `FromRedisValue`, and uses
+  `tokio-comp` rather than `async-std`.
+
+  The `redis-backend` MSRV floor is **unchanged at 1.88**. It moved from being
+  transitive (`url` -> `idna` -> `icu_*`) to being declared outright — redis
+  1.6.0 sets `rust-version = "1.88"` — but the number and the split CI jobs are
+  the same.
+
+  **One behavioural change to be aware of, and it is the reason this is under
+  Changed rather than a dependency-bump footnote.** redis 1.x changed
+  `ConnectionManagerConfig`'s defaults from *no timeouts* to a **500 ms
+  response timeout and a 1 s connection timeout**, and
+  `Client::get_connection_manager()` uses those defaults. Verified in both
+  crates' sources: 0.32.7 had `DEFAULT_RESPONSE_TIMEOUT = None` and
+  `DEFAULT_CONNECTION_TIMEOUT = None`; 1.6.0 has `Some(500ms)` and `Some(1s)`.
+
+  For an HTTP response cache the values are whole response bodies, so a large
+  entry over a loaded or cross-AZ Redis can exceed 500 ms — and every such
+  `get` or `set` then fails with `CacheError::Redis` instead of succeeding
+  slowly. A slow cache silently becomes a broken one.
+
+  `RedisBackend::new` takes an already-constructed `ConnectionManager`, so this
+  crate cannot choose for you. Choose explicitly at construction:
+
+  ```rust
+  use redis::aio::ConnectionManagerConfig;
+
+  let config = ConnectionManagerConfig::new()
+      .set_response_timeout(Some(Duration::from_secs(10)))
+      .set_connection_timeout(Some(Duration::from_secs(5)));
+  let manager = client.get_connection_manager_with_config(config).await?;
+  let backend = RedisBackend::new(manager);
+  ```
+
+  Pass `None` to restore the 0.5.x behaviour of no timeout at all. A generous
+  bound is usually the better answer; pick it against your body sizes, not
+  against the client library's default. `RedisBackend::new`'s documentation
+  carries this note, and both Redis examples and the Redis integration tests
+  now set the timeouts explicitly rather than inheriting them.
+
 ### Added
 
 - **`legacy-bincode1-read` feature, on by default.** Reads cache entries

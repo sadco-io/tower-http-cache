@@ -19,6 +19,49 @@ pub struct RedisBackend<C = PostcardCodec> {
 }
 
 impl RedisBackend<PostcardCodec> {
+    /// Builds a backend over an already-connected [`ConnectionManager`].
+    ///
+    /// # Set the response timeout deliberately
+    ///
+    /// `redis` 1.x changed [`ConnectionManagerConfig`]'s defaults from *no
+    /// timeouts* to a **500 ms response timeout and a 1 s connection
+    /// timeout**. `Client::get_connection_manager()` uses those defaults.
+    ///
+    /// For an HTTP response cache that is a live hazard rather than a
+    /// nicety: the values held here are whole response bodies, and a large
+    /// entry over a loaded or cross-AZ Redis can take longer than 500 ms.
+    /// Every such `get` or `set` then fails with [`CacheError::Redis`]
+    /// instead of succeeding slowly — a slow cache silently becomes a
+    /// broken one.
+    ///
+    /// This constructor takes an already-built `ConnectionManager`, so the
+    /// crate cannot choose for you. Choose explicitly:
+    ///
+    /// ```no_run
+    /// use redis::aio::ConnectionManagerConfig;
+    /// use tower_http_cache::backend::redis::RedisBackend;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let client = redis::Client::open("redis://127.0.0.1/")?;
+    ///
+    /// // Restores the 0.5.x behaviour: no response or connection timeout.
+    /// let config = ConnectionManagerConfig::new()
+    ///     .set_response_timeout(None)
+    ///     .set_connection_timeout(None);
+    ///
+    /// let manager = client.get_connection_manager_with_config(config).await?;
+    /// let backend = RedisBackend::new(manager);
+    /// # let _ = backend;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// A generous bound (say, several seconds) is usually a better answer than
+    /// `None` — but pick it against your body sizes, not against the client
+    /// library's default.
+    ///
+    /// [`ConnectionManagerConfig`]: redis::aio::ConnectionManagerConfig
+    /// [`CacheError::Redis`]: crate::error::CacheError::Redis
     pub fn new(connection: ConnectionManager) -> Self {
         Self {
             connection: Arc::new(Mutex::new(connection)),
