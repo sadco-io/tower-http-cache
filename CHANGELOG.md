@@ -67,6 +67,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Backed by golden fixtures under `tests/fixtures/v0_5_1/`: real bytes produced
   by the published 0.5.1 code path, decoded field by field.
 
+### Removed
+
+- **`bincode` is no longer a dependency.** RUSTSEC-2025-0141 marked it
+  permanently unmaintained in December 2025 with no patched release.
+
+  To be precise about what this is and is not: RUSTSEC-2025-0141 is
+  `informational = "unmaintained"`, **not a vulnerability**. There is no known
+  exploit in `bincode 1.3.3`. The reason to move is that a permanently-ignored
+  advisory trains people to ignore advisories.
+
+  The reader for 0.5.x-format entries is hand-written against the (fixed,
+  simple) bincode 1 layout rather than calling `bincode`, which is what allowed
+  the dependency to be dropped in the same release that keeps backward
+  compatibility. `cargo tree -i bincode` finds no match under any feature
+  combination, including `--all-features`.
+
+- **Note for anyone tracking dependabot: do not merge a `bincode 3.0` bump.**
+  `bincode` 3.0.0 is a tombstone release. Its entire `src/lib.rs` is
+  `compile_error!("https://xkcd.com/2347/");` — it was published only to signal
+  the crate's status, since crates.io has no way to archive a crate. It has no
+  features and no dependencies, and bumping to it does not compile. The last
+  functional release is 2.0.1, which is covered by the same advisory (it has no
+  version bound), so it was not a useful destination either.
+
 ### Fixed
 
 - **0.5.x's memcached backend could not read back what it had written.**

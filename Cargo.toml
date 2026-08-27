@@ -40,7 +40,6 @@ metrics = { version = "0.24", optional = true }
 pin-project-lite = "0.2"
 thiserror = "2.0"
 dashmap = "6.2"
-bincode = { version = "1.3.3", optional = true }
 # Wire format for cached entries. `default-features = false` is required: the
 # default feature set pulls `heapless` for embedded targets.
 postcard = { version = "1.1.3", default-features = false, features = ["use-std"], optional = true }
@@ -56,7 +55,7 @@ default = ["in-memory", "serde", "legacy-bincode1-read"]
 in-memory = ["moka"]
 redis-backend = ["redis", "tokio-util", "serde"]
 memcached-backend = ["async-memcached", "dep:bb8", "serde"]
-serde = ["dep:serde", "dep:serde_json", "dep:bincode", "dep:postcard"]
+serde = ["dep:serde", "dep:serde_json", "dep:postcard"]
 metrics = ["dep:metrics"]
 tracing = ["dep:tracing"]
 compression = ["dep:flate2"]
