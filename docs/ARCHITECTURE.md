@@ -25,6 +25,9 @@
 - Use per-key async mutex or coalescing future stored in backend guard map.
 - On miss, first caller populates; others await result or serve stale depending on policy.
 - Guard storage maintained via `dashmap` keyed by cache key to avoid global lock.
+- The lookup in step 3 and the lock acquisition are not atomic, so both paths
+  re-read the key once they hold or have waited on the lock: the holder may
+  have been populated by a caller that finished inside that window.
 
 ## Backends
 ### In-Memory
