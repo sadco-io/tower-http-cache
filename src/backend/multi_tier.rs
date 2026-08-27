@@ -327,10 +327,21 @@ where
         l1_result.and(l2_result)
     }
 
+    /// Merges both tiers.
+    ///
+    /// A tier that reports [`CacheError::Unsupported`] — the shared backends
+    /// keep no tag index — contributes nothing rather than failing the whole
+    /// call, so the common `InMemoryBackend` over `RedisBackend` arrangement
+    /// keeps working off the L1 index. Only if *neither* tier has an index is
+    /// the `Unsupported` error propagated.
     async fn get_keys_by_tag(&self, tag: &str) -> Result<Vec<String>, CacheError> {
-        // Query both tiers and merge results
-        let mut keys = self.l1.get_keys_by_tag(tag).await?;
-        let l2_keys = self.l2.get_keys_by_tag(tag).await?;
+        let l1 = self.l1.get_keys_by_tag(tag).await;
+        let l2 = self.l2.get_keys_by_tag(tag).await;
+
+        let (mut keys, l2_keys) = match merge_tiers(l1, l2)? {
+            Some(pair) => pair,
+            None => return Ok(Vec::new()),
+        };
 
         // Deduplicate
         keys.extend(l2_keys);
@@ -340,24 +351,53 @@ where
         Ok(keys)
     }
 
+    /// Invalidates in both tiers, tolerating a tier without a tag index in the
+    /// same way as [`get_keys_by_tag`](Self::get_keys_by_tag).
     async fn invalidate_by_tag(&self, tag: &str) -> Result<usize, CacheError> {
-        // Invalidate in both tiers
-        let l1_count = self.l1.invalidate_by_tag(tag).await?;
-        let l2_count = self.l2.invalidate_by_tag(tag).await?;
+        let l1 = self.l1.invalidate_by_tag(tag).await;
+        let l2 = self.l2.invalidate_by_tag(tag).await;
 
-        Ok(l1_count + l2_count)
+        match merge_tiers(l1, l2)? {
+            Some((l1_count, l2_count)) => Ok(l1_count + l2_count),
+            None => Ok(0),
+        }
     }
 
+    /// Merges both tiers, tolerating a tier without a tag index in the same
+    /// way as [`get_keys_by_tag`](Self::get_keys_by_tag).
     async fn list_tags(&self) -> Result<Vec<String>, CacheError> {
-        // Merge tags from both tiers
-        let mut tags = self.l1.list_tags().await?;
-        let l2_tags = self.l2.list_tags().await?;
+        let l1 = self.l1.list_tags().await;
+        let l2 = self.l2.list_tags().await;
+
+        let (mut tags, l2_tags) = match merge_tiers(l1, l2)? {
+            Some(pair) => pair,
+            None => return Ok(Vec::new()),
+        };
 
         tags.extend(l2_tags);
         tags.sort();
         tags.dedup();
 
         Ok(tags)
+    }
+}
+
+/// Combines a tag-index result from each tier.
+///
+/// `Ok(Some((l1, l2)))` when at least one tier answered — an `Unsupported`
+/// tier contributes `T::default()`. `Ok(None)` when *both* tiers reported
+/// `Unsupported`, which the caller renders as an empty answer. Any other error
+/// propagates unchanged.
+fn merge_tiers<T: Default>(
+    l1: Result<T, CacheError>,
+    l2: Result<T, CacheError>,
+) -> Result<Option<(T, T)>, CacheError> {
+    match (l1, l2) {
+        (Ok(a), Ok(b)) => Ok(Some((a, b))),
+        (Ok(a), Err(e)) if e.is_unsupported() => Ok(Some((a, T::default()))),
+        (Err(e), Ok(b)) if e.is_unsupported() => Ok(Some((T::default(), b))),
+        (Err(a), Err(b)) if a.is_unsupported() && b.is_unsupported() => Ok(None),
+        (Err(e), _) | (_, Err(e)) => Err(e),
     }
 }
 
@@ -602,5 +642,50 @@ mod tests {
 
         // Should be promoted to L1
         assert!(l1.get("key").await.unwrap().is_some());
+    }
+}
+
+#[cfg(test)]
+mod merge_tier_tests {
+    use super::merge_tiers;
+    use crate::error::CacheError;
+
+    fn unsupported<T>() -> Result<T, CacheError> {
+        Err(CacheError::Unsupported("no tag index".to_string()))
+    }
+
+    #[test]
+    fn both_tiers_answer() {
+        let merged = merge_tiers(Ok(vec!["a".to_string()]), Ok(vec!["b".to_string()])).unwrap();
+        assert_eq!(merged, Some((vec!["a".to_string()], vec!["b".to_string()])));
+    }
+
+    /// The common arrangement: an in-memory L1 with a tag index over a shared
+    /// L2 without one. The L1 index must keep working.
+    #[test]
+    fn an_unsupported_tier_contributes_nothing_instead_of_failing() {
+        let merged = merge_tiers(Ok(vec!["a".to_string()]), unsupported()).unwrap();
+        assert_eq!(merged, Some((vec!["a".to_string()], Vec::new())));
+
+        let merged = merge_tiers(unsupported(), Ok(vec!["b".to_string()])).unwrap();
+        assert_eq!(merged, Some((Vec::new(), vec!["b".to_string()])));
+    }
+
+    #[test]
+    fn neither_tier_has_an_index() {
+        assert_eq!(
+            merge_tiers::<Vec<String>>(unsupported(), unsupported()).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_real_error_still_propagates() {
+        let err = merge_tiers::<Vec<String>>(
+            Ok(Vec::new()),
+            Err(CacheError::Backend("connection reset".to_string())),
+        )
+        .unwrap_err();
+        assert!(!err.is_unsupported());
     }
 }

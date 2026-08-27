@@ -54,6 +54,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   then encoded that vector into a second `Vec<u8>`; the envelope removes one
   full copy of the body on every `set`.
 
+- **BREAKING: `RedisBackend` and `MemcachedBackend` now report that they have
+  no tag index.** `get_keys_by_tag` and `list_tags` return
+  `Err(CacheError::Unsupported(..))`, and the trait's defaulted
+  `invalidate_by_tag` propagates it. Previously all three inherited the trait
+  defaults and answered `Ok(vec![])` / `Ok(0)`, so a caller could not tell
+  "nothing carried that tag" from "this backend cannot do tags at all" — which
+  is precisely the population being silently failed today. If you call
+  `invalidate_by_tag` on a shared backend and ignore the count, you now get an
+  error; handle it, or check `CacheError::is_unsupported`.
+
+  `MultiTierBackend` deliberately tolerates this: a tier that reports
+  `Unsupported` contributes nothing rather than failing the call, so the usual
+  `InMemoryBackend` over `RedisBackend` arrangement keeps working off the L1
+  index. Only if *neither* tier has an index does the error propagate.
+
+- **BREAKING: `CacheError` is `#[non_exhaustive]` and gained an `Unsupported`
+  variant.** Exhaustive matches on it need a `_` arm. Both changes are breaking
+  and are made together, in the release that is breaking anyway, so future
+  variants are additive. `CacheError::is_unsupported()` is provided so callers
+  do not have to match at all.
+
 ### Added
 
 - **`legacy-bincode1-read` feature, on by default.** Reads cache entries
@@ -108,6 +129,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   serializing `CacheEntry` directly. The legacy reader decodes the four-byte
   form, so entries 0.5.x wrote to memcached become readable for the first time.
 
+- **`CachePolicy::with_tag_extractor` did nothing.** `CachePolicy::extract_tags`
+  had no callers anywhere in the crate: both places where the layer builds a
+  `CacheEntry` used `CacheEntry::new(..)` and never attached tags. Tags
+  configured through the middleware — the mechanism the README documents —
+  never reached any backend, including the in-memory one. The layer now calls
+  `extract_tags` on both the store and the refresh path and attaches the
+  result.
+
+  This is inert unless you opted in: `TagPolicy::enabled` defaults to `false`,
+  and `extract_tags` returns an empty vector when it is. There is a test for
+  that inertness as well as for the fix.
+
 - **Cache tags were silently dropped by the Redis codec.** `BincodeCodec::encode`
   serialized a private struct with no `tags` field, and `decode` rebuilt the entry
   through `CacheEntry::new`, which always sets `tags: None`. Tags never crossed the
@@ -117,6 +150,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The `cache_benchmarks` bench now declares `serde` in its `required-features`.
   It uses the codec, which lives behind that feature, so
   `cargo bench --no-default-features --features in-memory` did not build.
+
+### Known issues
+
+- **Tag-based invalidation works only on `InMemoryBackend` (and
+  `MultiTierBackend` over one).** `RedisBackend` and `MemcachedBackend`
+  implement `get`, `set` and `invalidate` only; they keep no reverse tag index,
+  so `invalidate_by_tag` has nothing to iterate. 0.6.0 puts tags *on the wire*,
+  which is a prerequisite for fixing this and means a `CacheRead` from a shared
+  backend now carries the tags the entry was stored with — but it does not add
+  a distributed tag index. `TagIndex` also remains process-local
+  (`Arc<DashMap<..>>`), so even on the in-memory backend, invalidating a tag
+  clears only the calling process's index.
+
+  As of 0.6.0 the shared backends report this explicitly rather than returning
+  a silent `Ok(0)`. A Redis-native tag index (Redis sets, opt-in, with
+  TTL-based garbage collection of stale members) is planned for 0.7.0.
+  Memcached has no set type and will continue to report tags as unsupported.
 
 ## [0.5.2] - 2026-08-26
 
@@ -680,3 +730,27 @@ All v0.3.0 features are opt-in and backward compatible:
 [0.1.2]: https://github.com/sadco-io/tower-http-cache/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/sadco-io/tower-http-cache/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/sadco-io/tower-http-cache/releases/tag/v0.1.0
+
+- **Cache tags were silently dropped by the Redis codec.** `BincodeCodec::encode`
+  serialized a private struct with no `tags` field, and `decode` rebuilt the entry
+  through `CacheEntry::new`, which always sets `tags: None`. Tags never crossed the
+  Redis wire. They now do. (Memcached was unaffected — it serialized `CacheEntry`
+  whole. That inconsistency is also fixed.)
+
+### Known issues
+
+- **Tag-based invalidation works only on `InMemoryBackend` (and
+  `MultiTierBackend` over one).** `RedisBackend` and `MemcachedBackend`
+  implement `get`, `set` and `invalidate` only; they keep no reverse tag index,
+  so `invalidate_by_tag` has nothing to iterate. 0.6.0 puts tags *on the wire*,
+  which is a prerequisite for fixing this and means a `CacheRead` from a shared
+  backend now carries the tags the entry was stored with — but it does not add
+  a distributed tag index. `TagIndex` also remains process-local
+  (`Arc<DashMap<..>>`), so even on the in-memory backend, invalidating a tag
+  clears only the calling process's index.
+
+  As of 0.6.0 the shared backends report this explicitly rather than returning
+  a silent `Ok(0)`. A Redis-native tag index (Redis sets, opt-in, with
+  TTL-based garbage collection of stale members) is planned for 0.7.0.
+  Memcached has no set type and will continue to report tags as unsupported.
+

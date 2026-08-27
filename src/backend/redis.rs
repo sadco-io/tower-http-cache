@@ -95,4 +95,38 @@ where
         let _: () = conn.del(self.make_key(key)).await?;
         Ok(())
     }
+
+    /// Always [`CacheError::Unsupported`]: this backend keeps no tag index.
+    ///
+    /// 0.6.0 puts tags on the wire, so a `CacheRead` from this backend carries
+    /// the tags the entry was stored with — but there is no reverse index, so
+    /// tag -> keys cannot be answered. Reporting it is deliberate: inheriting
+    /// the trait default would answer `Ok(vec![])`, and the caller could not
+    /// tell that from "nothing carried that tag". A Redis-native index is
+    /// planned for 0.7.0; memcached has no set type and will keep reporting
+    /// this.
+    async fn get_keys_by_tag(&self, _tag: &str) -> Result<Vec<String>, CacheError> {
+        Err(unsupported_tags())
+    }
+
+    /// Always [`CacheError::Unsupported`]: this backend keeps no tag index.
+    ///
+    /// 0.6.0 puts tags on the wire, so a `CacheRead` from this backend carries
+    /// the tags the entry was stored with — but there is no reverse index, so
+    /// tag -> keys cannot be answered. Reporting it is deliberate: inheriting
+    /// the trait default would answer `Ok(vec![])`, and the caller could not
+    /// tell that from "nothing carried that tag". A Redis-native index is
+    /// planned for 0.7.0; memcached has no set type and will keep reporting
+    /// this.
+    async fn list_tags(&self) -> Result<Vec<String>, CacheError> {
+        Err(unsupported_tags())
+    }
+}
+
+fn unsupported_tags() -> CacheError {
+    CacheError::Unsupported(
+        "RedisBackend keeps no tag index; tag lookup and tag invalidation are \
+         not available on it. Planned for 0.7.0 as an opt-in Redis-native index."
+            .to_string(),
+    )
 }

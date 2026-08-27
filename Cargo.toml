@@ -107,6 +107,10 @@ name = "streaming"
 required-features = ["in-memory"]
 
 [[test]]
+name = "tags"
+required-features = ["in-memory"]
+
+[[test]]
 name = "redis_example"
 required-features = ["redis-backend"]
 
