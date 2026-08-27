@@ -10,10 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **The on-the-wire cache format changed, and `tags` are now part of it.**
-  Entries stored in Redis and Memcached are now written as a 21-byte versioned
-  envelope (`"THC"` magic, format byte, codec byte, and the expiry/stale
-  timestamps as little-endian `u64`) followed by a `postcard`-encoded payload.
-  Previously the two backends used two *different* undocumented `bincode 1`
+  Entries stored in Redis are now written as a 21-byte versioned envelope
+  (`"THC"` magic, format byte, codec byte, and the expiry/stale timestamps as
+  little-endian `u64`) followed by a `postcard`-encoded payload. Previously the
+  Redis and memcached backends used two *different* undocumented `bincode 1`
   layouts.
 
   **Rolling back to 0.5.x is safe.** A 0.5.x binary encountering a 0.6.0 entry
@@ -42,26 +42,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   range reserved for codecs implemented outside this crate, so existing
   downstream `impl CacheCodec` blocks keep compiling unchanged.
 
-- **`MemcachedBackend` now honours `CacheCodec`.** It previously called
-  `bincode` directly, bypassing the codec entirely, so `with_codec` had no
-  memcached equivalent and the two shared backends disagreed about the format.
-  Both now route through one codec and one envelope. `MemcachedBackend` gained
-  a defaulted codec type parameter (`MemcachedBackend<C = PostcardCodec>`) and
-  a `with_codec` method mirroring `RedisBackend`; `MemcachedBackendBuilder` is
-  unchanged and still builds the default-codec backend.
-
 - Redis no longer double-encodes. 0.5.x encoded the entry into a `Vec<u8>`,
   then encoded that vector into a second `Vec<u8>`; the envelope removes one
   full copy of the body on every `set`.
 
-- **BREAKING: `RedisBackend` and `MemcachedBackend` now report that they have
-  no tag index.** `get_keys_by_tag` and `list_tags` return
-  `Err(CacheError::Unsupported(..))`, and the trait's defaulted
-  `invalidate_by_tag` propagates it. Previously all three inherited the trait
-  defaults and answered `Ok(vec![])` / `Ok(0)`, so a caller could not tell
-  "nothing carried that tag" from "this backend cannot do tags at all" — which
-  is precisely the population being silently failed today. If you call
-  `invalidate_by_tag` on a shared backend and ignore the count, you now get an
+- **BREAKING: `RedisBackend` now reports that it has no tag index.**
+  `get_keys_by_tag` and `list_tags` return `Err(CacheError::Unsupported(..))`,
+  and the trait's defaulted `invalidate_by_tag` propagates it. Previously all
+  three inherited the trait defaults and answered `Ok(vec![])` / `Ok(0)`, so a
+  caller could not tell "nothing carried that tag" from "this backend cannot do
+  tags at all" — which is precisely the population being silently failed today.
+  If you call `invalidate_by_tag` on Redis and ignore the count, you now get an
   error; handle it, or check `CacheError::is_unsupported`.
 
   `MultiTierBackend` deliberately tolerates this: a tier that reports
@@ -135,6 +126,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- **BREAKING: the `memcached-backend` feature and `MemcachedBackend` are
+  removed.** Along with them go `MemcachedBackendBuilder`, `PoolState`,
+  `MemcachedConnectionManager`, the `memcached_production` example, and the
+  `async-memcached` and `bb8` dependencies.
+
+  **This is breaking on paper and cannot break a working deployment, because
+  there were none.** The backend never returned a cache hit in its entire
+  existence. `MemcachedRecord` serialized `CacheEntry` whole, and
+  `CacheEntry`'s `version_serde` helper wrote the version as a four-byte `i32`
+  while its `deserialize` read a one-byte `u8`. Every
+  `bincode::deserialize::<MemcachedRecord>` therefore failed on data the
+  backend itself had just written, and the cache layer — which already treats a
+  backend `Err` as a miss — served every single `get` as a miss. A deployment
+  using it had a write-only cache with a 100% miss rate that looked like it was
+  working. Confirmed by round-tripping a `MemcachedRecord` through the real
+  published 0.5.1 crate against `bincode 1.3.3`, and reproduced independently.
+
+  It is *removed*, not deprecated. There is no migration path to write, because
+  there is no working behaviour to migrate: use `RedisBackend` or
+  `InMemoryBackend`.
+
+  Removing it takes a large advisory-bearing subtree with it. `async-memcached`
+  declares `toxiproxy_rust` — a test fixture — as a normal dependency, which
+  dragged in `reqwest 0.11` -> `hyper 0.14` -> `h2 0.3`, plus `native-tls` ->
+  `openssl-sys`. Gone from the graph: `async-memcached`, `bb8`,
+  `toxiproxy_rust`, `reqwest`, `h2`, `fxhash`, `rustls-pemfile`, `openssl-sys`.
+  Building this crate no longer needs `libssl-dev` or `pkg-config`, and CI no
+  longer installs them.
+
+  With this and the `bincode` removal, all four suppressed advisories
+  (RUSTSEC-2025-0141, RUSTSEC-2026-0258, RUSTSEC-2025-0057, RUSTSEC-2025-0134)
+  now report `advisory-not-detected`. The `deny.toml` entries are deleted in a
+  later pass.
+
+  The legacy reader's memcached decoder is removed too: with the backend gone
+  nothing can produce those bytes, so keeping a hand-rolled byte parser
+  reachable from public API bought nothing. `LegacyShape` disappears with it and
+  `codec::envelope::read_stored` now takes two arguments. **The Redis legacy
+  path is untouched.**
+
 - **`bincode` is no longer a dependency.** RUSTSEC-2025-0141 marked it
   permanently unmaintained in December 2025 with no patched release.
 
@@ -172,20 +203,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so there is no public API change, and `RedisBackend` remains
   `Send + Sync + Clone + 'static` (pinned by a test).
 
-- **0.5.x's memcached backend could not read back what it had written.**
-  `CacheEntry`'s `version_serde` helper wrote its discriminant as `i32` —
-  the match arms had no type annotation, so the literals defaulted to `i32` —
-  while the matching `deserialize` read a `u8`. Under `bincode` that is four
-  bytes written against one byte read, so `bincode::deserialize::<MemcachedRecord>`
-  failed on every value the backend itself had stored, and the cache layer
-  served the failure as a miss. `MemcachedBackend` was, in effect, a no-op
-  cache for its entire existence.
+- **`CacheEntry`'s derived `Serialize`/`Deserialize` could not round-trip under
+  a non-self-describing format.** `version_serde::serialize` wrote its
+  discriminant as an `i32` — the match arms had no type annotation, so the
+  literals defaulted to `i32` — while `version_serde::deserialize` read a `u8`.
+  Four bytes written against one byte read. Fixed with `let v: u8 = ...`,
+  pinned by a test that fails without it.
 
-  The helper is fixed (`let v: u8 = ...`), so `CacheEntry`'s derived
-  `Serialize`/`Deserialize` now round-trip under non-self-describing formats,
-  and both shared backends route through the codec and envelope rather than
-  serializing `CacheEntry` directly. The legacy reader decodes the four-byte
-  form, so entries 0.5.x wrote to memcached become readable for the first time.
+  This is the defect that made the memcached backend a no-op; see *Removed*.
 
 - **`CachePolicy::with_tag_extractor` did nothing.** `CachePolicy::extract_tags`
   had no callers anywhere in the crate: both places where the layer builds a
@@ -202,8 +227,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Cache tags were silently dropped by the Redis codec.** `BincodeCodec::encode`
   serialized a private struct with no `tags` field, and `decode` rebuilt the entry
   through `CacheEntry::new`, which always sets `tags: None`. Tags never crossed the
-  Redis wire. They now do. (Memcached was unaffected — it serialized `CacheEntry`
-  whole. That inconsistency is also fixed.)
+  Redis wire. They now do.
 
 - The `cache_benchmarks` bench now declares `serde` in its `required-features`.
   It uses the codec, which lives behind that feature, so
@@ -212,19 +236,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Known issues
 
 - **Tag-based invalidation works only on `InMemoryBackend` (and
-  `MultiTierBackend` over one).** `RedisBackend` and `MemcachedBackend`
-  implement `get`, `set` and `invalidate` only; they keep no reverse tag index,
-  so `invalidate_by_tag` has nothing to iterate. 0.6.0 puts tags *on the wire*,
-  which is a prerequisite for fixing this and means a `CacheRead` from a shared
-  backend now carries the tags the entry was stored with — but it does not add
-  a distributed tag index. `TagIndex` also remains process-local
-  (`Arc<DashMap<..>>`), so even on the in-memory backend, invalidating a tag
-  clears only the calling process's index.
+  `MultiTierBackend` over one).** `RedisBackend` implements `get`, `set` and
+  `invalidate` only; it keeps no reverse tag index, so `invalidate_by_tag` has
+  nothing to iterate. 0.6.0 puts tags *on the wire*, which is a prerequisite
+  for fixing this and means a `CacheRead` from Redis now carries the tags the
+  entry was stored with — but it does not add a distributed tag index.
+  `TagIndex` also remains process-local (`Arc<DashMap<..>>`), so even on the
+  in-memory backend, invalidating a tag clears only the calling process's
+  index.
 
-  As of 0.6.0 the shared backends report this explicitly rather than returning
-  a silent `Ok(0)`. A Redis-native tag index (Redis sets, opt-in, with
-  TTL-based garbage collection of stale members) is planned for 0.7.0.
-  Memcached has no set type and will continue to report tags as unsupported.
+  As of 0.6.0 `RedisBackend` reports this explicitly rather than returning a
+  silent `Ok(0)`. A Redis-native tag index (Redis sets, opt-in, with TTL-based
+  garbage collection of stale members) is planned for 0.7.0.
 
 ## [0.5.2] - 2026-08-26
 
@@ -792,8 +815,7 @@ All v0.3.0 features are opt-in and backward compatible:
 - **Cache tags were silently dropped by the Redis codec.** `BincodeCodec::encode`
   serialized a private struct with no `tags` field, and `decode` rebuilt the entry
   through `CacheEntry::new`, which always sets `tags: None`. Tags never crossed the
-  Redis wire. They now do. (Memcached was unaffected — it serialized `CacheEntry`
-  whole. That inconsistency is also fixed.)
+  Redis wire. They now do.
 
 ### Known issues
 

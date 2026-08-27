@@ -24,11 +24,7 @@ jobs:
         with:
           toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@v2
-      # `memcached-backend` reaches native-tls via async-memcached -> toxiproxy_rust.
-      - name: install openssl headers
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
-      # The feature-selected run below is the primary gate; async-memcached pulls toxiproxy_rust
-      # -> reqwest 0.11 -> native-tls -> openssl-sys, which needs libssl-dev.
+      # The feature-selected run below is the primary gate.
       - run: cargo test --features in-memory,serde,redis-backend,metrics,tracing,compression,admin-api --all-targets
       - run: cargo test --features in-memory,serde --doc
       - run: cargo test --no-default-features --features in-memory
@@ -53,11 +49,11 @@ jobs:
       # 1.85 covers everything except the shared backends.
       - run: cargo build
       - run: cargo build --features in-memory,serde,metrics,tracing,compression,admin-api
-      # redis-backend / memcached-backend reach url -> idna -> icu_*, which
-      # require 1.88. Enforced separately rather than papered over.
+      # redis-backend requires 1.88: redis 1.6 declares it, and it also
+      # reaches url -> idna -> icu_*. Enforced separately rather than papered
+      # over.
       - uses: dtolnay/rust-toolchain@1.88.0
       - run: cargo build --features redis-backend
-      - run: cargo build --features memcached-backend
 
   lint:
     name: fmt + clippy

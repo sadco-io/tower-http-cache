@@ -51,15 +51,6 @@ pub const ENVELOPE_HEADER_LEN: usize = 21;
 /// prefix for the inner payload plus two 8-byte `u64` timestamps.
 pub const LEGACY_REDIS_OVERHEAD: usize = 24;
 
-/// Which 0.5.x layout the calling backend used, for the legacy read path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LegacyShape {
-    /// `bincode1(RedisRecord { payload: bincode1(StoredEntry), expires_at_ms, stale_until_ms })`
-    RedisOuter,
-    /// `bincode1(MemcachedRecord { entry: CacheEntry, expires_at_ms, stale_until_ms })`
-    MemcachedOuter,
-}
-
 /// Wraps an encoded payload in an envelope header.
 pub fn wrap(codec_id: u8, expires_at_ms: u64, stale_until_ms: u64, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(ENVELOPE_HEADER_LEN + payload.len());
@@ -133,7 +124,7 @@ pub fn decode_v2<C: CacheCodec>(bytes: &[u8], codec: &C) -> Result<CacheRead, Ca
     })
 }
 
-/// Reads a stored value, transparently accepting 0.5.x entries.
+/// Reads a stored value, transparently accepting 0.5.x Redis entries.
 ///
 /// Both decoders are attempted before a miss is reported, so the dispatch
 /// order is an optimisation and not a correctness requirement. Bytes that
@@ -146,15 +137,14 @@ pub fn decode_v2<C: CacheCodec>(bytes: &[u8], codec: &C) -> Result<CacheRead, Ca
 pub fn read_stored<C: CacheCodec>(
     bytes: &[u8],
     codec: &C,
-    shape: LegacyShape,
 ) -> Result<Option<CacheRead>, CacheError> {
-    // For the Redis shape the legacy test is exact (see `is_legacy_redis`), so
-    // it runs first when it matches. For the memcached shape the magic test is
-    // exact, so the envelope runs first.
-    let legacy_first = shape == LegacyShape::RedisOuter && is_legacy_redis(bytes);
+    // The legacy test is exact (see `is_legacy_redis`), so it runs first when
+    // it matches; otherwise the envelope is tried first. Both decoders are
+    // attempted either way, so the order is an optimisation.
+    let legacy_first = is_legacy_redis(bytes);
 
     if legacy_first {
-        if let Some(read) = try_legacy(bytes, shape) {
+        if let Some(read) = try_legacy(bytes) {
             return Ok(Some(read));
         }
     }
@@ -167,7 +157,7 @@ pub fn read_stored<C: CacheCodec>(
     }
 
     if !legacy_first {
-        if let Some(read) = try_legacy(bytes, shape) {
+        if let Some(read) = try_legacy(bytes) {
             return Ok(Some(read));
         }
     }
@@ -183,12 +173,8 @@ pub fn read_stored<C: CacheCodec>(
 }
 
 #[cfg(feature = "legacy-bincode1-read")]
-fn try_legacy(bytes: &[u8], shape: LegacyShape) -> Option<CacheRead> {
-    let decoded = match shape {
-        LegacyShape::RedisOuter => super::legacy::decode_legacy_redis(bytes),
-        LegacyShape::MemcachedOuter => super::legacy::decode_legacy_memcached(bytes),
-    };
-    match decoded {
+fn try_legacy(bytes: &[u8]) -> Option<CacheRead> {
+    match super::legacy::decode_legacy_redis(bytes) {
         Ok(read) => Some(read),
         Err(err) => {
             observe_decode_error("legacy-bincode1", &err);
@@ -200,7 +186,7 @@ fn try_legacy(bytes: &[u8], shape: LegacyShape) -> Option<CacheRead> {
 /// Without the `legacy-bincode1-read` feature, 0.5.x entries simply read as a
 /// miss and are overwritten on the next store.
 #[cfg(not(feature = "legacy-bincode1-read"))]
-fn try_legacy(_bytes: &[u8], _shape: LegacyShape) -> Option<CacheRead> {
+fn try_legacy(_bytes: &[u8]) -> Option<CacheRead> {
     None
 }
 
@@ -221,7 +207,7 @@ pub fn unix_ms_to_system_time(ms: u64) -> SystemTime {
 }
 
 /// Current time in milliseconds since `UNIX_EPOCH`.
-#[cfg(any(feature = "redis-backend", feature = "memcached-backend"))]
+#[cfg(feature = "redis-backend")]
 pub(crate) fn current_millis() -> Result<u64, CacheError> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -230,7 +216,7 @@ pub(crate) fn current_millis() -> Result<u64, CacheError> {
 }
 
 /// Saturating conversion of a [`Duration`] to whole milliseconds.
-#[cfg(any(feature = "redis-backend", feature = "memcached-backend"))]
+#[cfg(feature = "redis-backend")]
 pub(crate) fn duration_millis(duration: Duration) -> u64 {
     duration.as_millis().min(u64::MAX as u128) as u64
 }

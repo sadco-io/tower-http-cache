@@ -19,33 +19,22 @@
 //!   little-endian `u64`;
 //! * `Option` as a single `u8` tag, `0` for `None` and `1` for `Some`.
 //!
-//! # The two shapes are not symmetric
+//! # The shape
 //!
 //! ```text
-//! Redis     bincode1(RedisRecord     { payload: bincode1(StoredEntry), expires_at_ms, stale_until_ms })
-//! Memcached bincode1(MemcachedRecord { entry: CacheEntry,              expires_at_ms, stale_until_ms })
+//! bincode1(RedisRecord { payload: bincode1(StoredEntry), expires_at_ms, stale_until_ms })
 //! ```
 //!
-//! ## `version` is encoded differently in the two shapes
-//!
-//! 0.5.x's Redis payload holds `version` as an explicit `u8`. The memcached
-//! shape serializes `CacheEntry` whole, and `CacheEntry`'s `version_serde`
-//! helper wrote `let v = match .. { .. => 2, .. }` with no type annotation --
-//! so the literals defaulted to `i32` and the field went out as **four bytes**
-//! while the matching `deserialize` read one. Reading it as a `u8` here
-//! desynchronises the cursor and fails on every real entry, so this reader
-//! takes four bytes for the memcached shape and one for the Redis shape.
-//!
-//! (That same asymmetry meant 0.5.x's memcached backend could not read back
-//! what it had itself written -- every memcached `get` failed to deserialize
-//! and was served as a miss. 0.6.0 fixes the helper and routes both backends
-//! through the codec, so the situation does not recur.)
-//!
 //! 0.5.x's Redis payload is a private `StoredEntry` with **no `tags` field**,
-//! so [`decode_legacy_redis`] sets `tags: None` unconditionally. 0.5.x's
-//! memcached record serialized `CacheEntry` whole, so [`decode_legacy_memcached`]
-//! **does** read tags. Swapping those produces a decoder that fails on every
-//! real entry.
+//! so [`decode_legacy_redis`] sets `tags: None` unconditionally. Tags did not
+//! cross the 0.5.x Redis wire at all; asserting `None` is what pins the scope
+//! of that fix.
+//!
+//! There was a second decoder here, for 0.5.x's memcached record. It was
+//! removed along with the memcached backend itself in 0.6.0 -- nothing can
+//! produce those bytes any more. See the CHANGELOG for why that backend never
+//! functioned; the decoder and its golden fixtures remain in git history at
+//! `eb026cc` should they ever be needed.
 //!
 //! # Safety against hostile input
 //!
@@ -55,7 +44,7 @@
 //! require the buffer to be consumed exactly.
 
 use bytes::Bytes;
-use http::{StatusCode, Version};
+use http::StatusCode;
 
 use super::envelope::unix_ms_to_system_time;
 use super::version_from_u8;
@@ -106,10 +95,6 @@ impl<'a> Cursor<'a> {
         Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
     }
 
-    fn i32(&mut self) -> Result<i32, CacheError> {
-        Ok(i32::from_le_bytes(self.take(4)?.try_into().unwrap()))
-    }
-
     fn u64(&mut self) -> Result<u64, CacheError> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
@@ -154,21 +139,6 @@ impl<'a> Cursor<'a> {
         Ok(out)
     }
 
-    fn optional_tags(&mut self) -> Result<Option<Vec<String>>, CacheError> {
-        match self.u8()? {
-            0 => Ok(None),
-            1 => {
-                let n = self.len()?;
-                let mut out = Vec::with_capacity(n.min(self.remaining() / 8 + 1));
-                for _ in 0..n {
-                    out.push(self.string()?);
-                }
-                Ok(Some(out))
-            }
-            tag => Err(err(format!("invalid Option tag {tag}"))),
-        }
-    }
-
     /// Rejects trailing bytes. Both 0.5.x records framed their value exactly,
     /// so leftovers mean this is not the shape we think it is.
     fn finish(self) -> Result<(), CacheError> {
@@ -179,21 +149,6 @@ impl<'a> Cursor<'a> {
             )));
         }
         Ok(())
-    }
-}
-
-/// Maps the version discriminant 0.5.x wrote into a [`Version`].
-///
-/// 0.5.x's `CacheEntry` deserializer mapped anything it did not recognise to
-/// HTTP/1.1 rather than failing, so that fallback is reproduced here.
-fn legacy_entry_version(value: i32) -> Version {
-    match value {
-        0 => Version::HTTP_09,
-        1 => Version::HTTP_10,
-        2 => Version::HTTP_11,
-        3 => Version::HTTP_2,
-        4 => Version::HTTP_3,
-        _ => Version::HTTP_11,
     }
 }
 
@@ -227,35 +182,6 @@ pub fn decode_legacy_redis(bytes: &[u8]) -> Result<CacheRead, CacheError> {
             headers,
             body: Bytes::from(body),
             tags: None,
-        },
-        expires_at: Some(unix_ms_to_system_time(expires_at_ms)),
-        stale_until: Some(unix_ms_to_system_time(stale_until_ms)),
-    })
-}
-
-/// Decodes a 0.5.x memcached value: `bincode1(MemcachedRecord)`.
-///
-/// The entry was serialized whole, so tags are present on the wire and are
-/// preserved here.
-pub fn decode_legacy_memcached(bytes: &[u8]) -> Result<CacheRead, CacheError> {
-    let mut cursor = Cursor::new(bytes);
-    let status = cursor.u16()?;
-    // Four bytes, not one: see the module note on `version_serde`.
-    let version = cursor.i32()?;
-    let headers = cursor.headers()?;
-    let body = cursor.byte_string()?;
-    let tags = cursor.optional_tags()?;
-    let expires_at_ms = cursor.u64()?;
-    let stale_until_ms = cursor.u64()?;
-    cursor.finish()?;
-
-    Ok(CacheRead {
-        entry: CacheEntry {
-            status: status_from_u16(status)?,
-            version: legacy_entry_version(version),
-            headers,
-            body: Bytes::from(body),
-            tags,
         },
         expires_at: Some(unix_ms_to_system_time(expires_at_ms)),
         stale_until: Some(unix_ms_to_system_time(stale_until_ms)),

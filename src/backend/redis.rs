@@ -5,7 +5,7 @@ use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 
 use super::{CacheBackend, CacheEntry, CacheRead};
-use crate::codec::envelope::{self, LegacyShape};
+use crate::codec::envelope;
 use crate::codec::{CacheCodec, PostcardCodec};
 use crate::error::CacheError;
 
@@ -103,7 +103,7 @@ where
         let data: Option<Vec<u8>> = conn.get(self.make_key(key)).await?;
 
         match data {
-            Some(bytes) => envelope::read_stored(&bytes, &self.codec, LegacyShape::RedisOuter),
+            Some(bytes) => envelope::read_stored(&bytes, &self.codec),
             None => Ok(None),
         }
     }
@@ -148,8 +148,7 @@ where
     /// tag -> keys cannot be answered. Reporting it is deliberate: inheriting
     /// the trait default would answer `Ok(vec![])`, and the caller could not
     /// tell that from "nothing carried that tag". A Redis-native index is
-    /// planned for 0.7.0; memcached has no set type and will keep reporting
-    /// this.
+    /// planned for 0.7.0.
     async fn get_keys_by_tag(&self, _tag: &str) -> Result<Vec<String>, CacheError> {
         Err(unsupported_tags())
     }
@@ -161,8 +160,7 @@ where
     /// tag -> keys cannot be answered. Reporting it is deliberate: inheriting
     /// the trait default would answer `Ok(vec![])`, and the caller could not
     /// tell that from "nothing carried that tag". A Redis-native index is
-    /// planned for 0.7.0; memcached has no set type and will keep reporting
-    /// this.
+    /// planned for 0.7.0.
     async fn list_tags(&self) -> Result<Vec<String>, CacheError> {
         Err(unsupported_tags())
     }

@@ -5,14 +5,10 @@
 //! - [`memory::InMemoryBackend`] — a fast, process-local cache backed by [`moka`].
 //! - `redis::RedisBackend` *(optional)* — a distributed cache when the
 //!   `redis-backend` crate feature is enabled.
-//! - `memcached::MemcachedBackend` *(optional)* — a distributed cache when the
-//!   `memcached-backend` crate feature is enabled.
 //!
 //! Backends are responsible for answering cache lookups, storing entries,
 //! and enforcing per-entry stale windows.
 
-#[cfg(feature = "memcached-backend")]
-pub mod memcached;
 #[cfg(feature = "in-memory")]
 pub mod memory;
 pub mod multi_tier;

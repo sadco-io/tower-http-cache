@@ -9,8 +9,6 @@
 //!     .build();
 //! ```
 
-#[cfg(feature = "memcached-backend")]
-pub use crate::backend::memcached::{MemcachedBackend, MemcachedBackendBuilder, PoolState};
 #[cfg(feature = "in-memory")]
 pub use crate::backend::memory::InMemoryBackend;
 pub use crate::backend::multi_tier::MultiTierBackend;

@@ -1,8 +1,7 @@
 //! Wire-format tests: the 0.6.0 envelope, and cross-version compatibility with
 //! entries written by 0.5.x.
 //!
-//! These operate on byte slices only, so no Redis or memcached server is
-//! needed.
+//! These operate on byte slices only, so no Redis server is needed.
 
 use bytes::Bytes;
 use http::{StatusCode, Version};
@@ -10,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tower_http_cache::backend::CacheEntry;
-use tower_http_cache::codec::envelope::{self, LegacyShape};
+use tower_http_cache::codec::envelope;
 use tower_http_cache::codec::{CacheCodec, PostcardCodec};
 use tower_http_cache::error::CacheError;
 
@@ -91,21 +90,19 @@ fn v2_round_trip() {
 
     for body in bodies {
         for tags in &tagsets {
-            for shape in [LegacyShape::RedisOuter, LegacyShape::MemcachedOuter] {
-                let entry = sample(body.clone(), tags.clone());
-                let payload = codec.encode(&entry).unwrap();
-                let bytes = envelope::wrap(PostcardCodec::CODEC_ID, 111, 222, &payload);
+            let entry = sample(body.clone(), tags.clone());
+            let payload = codec.encode(&entry).unwrap();
+            let bytes = envelope::wrap(PostcardCodec::CODEC_ID, 111, 222, &payload);
 
-                let read = envelope::read_stored(&bytes, &codec, shape)
-                    .unwrap()
-                    .expect("v2 entry must decode");
-                assert_entry_eq(&read.entry, &entry);
-                assert_eq!(read.expires_at, Some(envelope::unix_ms_to_system_time(111)));
-                assert_eq!(
-                    read.stale_until,
-                    Some(envelope::unix_ms_to_system_time(222))
-                );
-            }
+            let read = envelope::read_stored(&bytes, &codec)
+                .unwrap()
+                .expect("v2 entry must decode");
+            assert_entry_eq(&read.entry, &entry);
+            assert_eq!(read.expires_at, Some(envelope::unix_ms_to_system_time(111)));
+            assert_eq!(
+                read.stale_until,
+                Some(envelope::unix_ms_to_system_time(222))
+            );
         }
     }
 }
@@ -192,15 +189,13 @@ fn custom_codec_is_invoked_and_its_id_is_recorded() {
     let bytes = envelope::wrap(CountingCodec::CODEC_ID, 1, 2, &payload);
     assert_eq!(bytes[4], 0x90);
 
-    for shape in [LegacyShape::RedisOuter, LegacyShape::MemcachedOuter] {
-        let read = envelope::read_stored(&bytes, &codec, shape)
-            .unwrap()
-            .expect("custom-codec entry must decode");
-        assert_entry_eq(&read.entry, &entry);
-    }
+    let read = envelope::read_stored(&bytes, &codec)
+        .unwrap()
+        .expect("custom-codec entry must decode");
+    assert_entry_eq(&read.entry, &entry);
 
     assert_eq!(codec.encodes.load(Ordering::SeqCst), 1);
-    assert_eq!(codec.decodes.load(Ordering::SeqCst), 2);
+    assert_eq!(codec.decodes.load(Ordering::SeqCst), 1);
 }
 
 /// Entries written by one codec must not be handed to another: report a miss,
@@ -212,10 +207,8 @@ fn unknown_codec_id_is_a_miss() {
 
     for id in [0x7E_u8, 0x02, 0x90, 0xFF] {
         let bytes = envelope::wrap(id, 1, 2, &payload);
-        for shape in [LegacyShape::RedisOuter, LegacyShape::MemcachedOuter] {
-            let read = envelope::read_stored(&bytes, &PostcardCodec, shape).unwrap();
-            assert!(read.is_none(), "codec id {id:#04x} must read as a miss");
-        }
+        let read = envelope::read_stored(&bytes, &PostcardCodec).unwrap();
+        assert!(read.is_none(), "codec id {id:#04x} must read as a miss");
     }
 }
 
@@ -226,13 +219,11 @@ fn unknown_format_version_is_a_miss() {
     let mut bytes = envelope::wrap(PostcardCodec::CODEC_ID, 1, 2, &payload);
     bytes[3] = 0x02;
 
-    for shape in [LegacyShape::RedisOuter, LegacyShape::MemcachedOuter] {
-        assert!(
-            envelope::read_stored(&bytes, &PostcardCodec, shape)
-                .unwrap()
-                .is_none()
-        );
-    }
+    assert!(
+        envelope::read_stored(&bytes, &PostcardCodec)
+            .unwrap()
+            .is_none()
+    );
 }
 
 // --------------------------------------------------------------------------
@@ -262,15 +253,6 @@ fn rollback_bytes_are_rejected_by_0_5_x_readers() {
     assert!(
         declared as usize > v2.len(),
         "0.5.x redis reader must hit EOF, not read a short payload"
-    );
-
-    // 0.5.x MemcachedBackend::get: bincode1(MemcachedRecord { entry, u64, u64 }),
-    // whose first field is CacheEntry.status as a u16 LE, validated by
-    // StatusCode::from_u16.
-    let status = u16::from_le_bytes([v2[0], v2[1]]);
-    assert!(
-        StatusCode::from_u16(status).is_err(),
-        "0.5.x memcached reader must reject the magic as a status code"
     );
 }
 
@@ -351,11 +333,10 @@ fn fx_times(i: usize) -> (u64, u64) {
     (expires, expires + 60_000)
 }
 
-fn fixture_bytes(prefix: &str, name: &str) -> Vec<u8> {
+fn fixture_bytes(name: &str) -> Vec<u8> {
     let path = format!(
-        "{}/tests/fixtures/v0_5_1/{}_{}.bin",
+        "{}/tests/fixtures/v0_5_1/redis_{}.bin",
         env!("CARGO_MANIFEST_DIR"),
-        prefix,
         name
     );
     std::fs::read(&path).unwrap_or_else(|e| panic!("missing fixture {path}: {e}"))
@@ -409,42 +390,6 @@ mod bincode1 {
         out.extend_from_slice(&stale_until_ms.to_le_bytes());
         out
     }
-
-    /// 0.5.x `backend::memcached::MemcachedRecord` -- `CacheEntry` inlined,
-    /// tags included.
-    ///
-    /// `version` goes out as four bytes here, not one: 0.5.x's `version_serde`
-    /// helper let its match arms default to `i32`. The Redis shape above uses
-    /// an explicit `u8`. This is confirmed by the committed fixtures.
-    #[allow(clippy::too_many_arguments)]
-    pub fn memcached_record(
-        status: u16,
-        version: u8,
-        headers: &[(String, Vec<u8>)],
-        body: &[u8],
-        tags: Option<&[String]>,
-        expires_at_ms: u64,
-        stale_until_ms: u64,
-    ) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(&status.to_le_bytes());
-        out.extend_from_slice(&(version as i32).to_le_bytes());
-        push_headers(&mut out, headers);
-        push_bytes(&mut out, body);
-        match tags {
-            None => out.push(0),
-            Some(t) => {
-                out.push(1);
-                push_len(&mut out, t.len());
-                for tag in t {
-                    push_bytes(&mut out, tag.as_bytes());
-                }
-            }
-        }
-        out.extend_from_slice(&expires_at_ms.to_le_bytes());
-        out.extend_from_slice(&stale_until_ms.to_le_bytes());
-        out
-    }
 }
 
 fn synthetic_legacy_redis(
@@ -464,7 +409,7 @@ fn synthetic_legacy_redis(
 /// anything.
 #[test]
 fn synthetic_writer_reproduces_real_fixtures() {
-    for (i, (name, status, ver, hk, bk, blen, tk)) in FIXTURE_CASES.iter().enumerate() {
+    for (i, (name, status, ver, hk, bk, blen, _tk)) in FIXTURE_CASES.iter().enumerate() {
         let headers = fx_headers(*hk);
         let body = fx_body(*bk, *blen);
         let (expires, stale) = fx_times(i);
@@ -472,24 +417,8 @@ fn synthetic_writer_reproduces_real_fixtures() {
         let redis = synthetic_legacy_redis(*status, *ver, &headers, &body, expires, stale);
         assert_eq!(
             redis,
-            fixture_bytes("redis", name),
+            fixture_bytes(name),
             "synthetic redis bytes differ from the real 0.5.1 fixture for {name}"
-        );
-
-        let tags = fx_tags(*tk);
-        let memcached = bincode1::memcached_record(
-            *status,
-            *ver,
-            &headers,
-            &body,
-            tags.as_deref(),
-            expires,
-            stale,
-        );
-        assert_eq!(
-            memcached,
-            fixture_bytes("memcached", name),
-            "synthetic memcached bytes differ from the real 0.5.1 fixture for {name}"
         );
     }
 }
@@ -497,7 +426,7 @@ fn synthetic_writer_reproduces_real_fixtures() {
 #[cfg(feature = "legacy-bincode1-read")]
 mod legacy_reader {
     use super::*;
-    use tower_http_cache::codec::legacy::{decode_legacy_memcached, decode_legacy_redis};
+    use tower_http_cache::codec::legacy::decode_legacy_redis;
 
     /// Every real 0.5.1 Redis fixture decodes field by field. `tags` must be
     /// `None`: 0.5.x's Redis codec genuinely dropped them, and asserting that
@@ -505,8 +434,8 @@ mod legacy_reader {
     #[test]
     fn legacy_redis_entries_decode() {
         for (i, (name, status, ver, hk, bk, blen, _tk)) in FIXTURE_CASES.iter().enumerate() {
-            let read = decode_legacy_redis(&fixture_bytes("redis", name))
-                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let read =
+                decode_legacy_redis(&fixture_bytes(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
 
             assert_eq!(read.entry.status.as_u16(), *status, "{name} status");
             assert_eq!(read.entry.version, fx_version(*ver), "{name} version");
@@ -535,44 +464,11 @@ mod legacy_reader {
         }
     }
 
-    /// 0.5.x memcached serialized `CacheEntry` whole, so tags *are* on the
-    /// wire and must survive.
+    /// The reader must reject bytes it did not fully consume.
     #[test]
-    fn legacy_memcached_entries_decode() {
-        for (i, (name, status, ver, hk, bk, blen, tk)) in FIXTURE_CASES.iter().enumerate() {
-            let read = decode_legacy_memcached(&fixture_bytes("memcached", name))
-                .unwrap_or_else(|e| panic!("{name}: {e}"));
-
-            assert_eq!(read.entry.status.as_u16(), *status, "{name} status");
-            assert_eq!(read.entry.version, fx_version(*ver), "{name} version");
-            assert_eq!(read.entry.headers, fx_headers(*hk), "{name} headers");
-            assert_eq!(
-                read.entry.body,
-                Bytes::from(fx_body(*bk, *blen)),
-                "{name} body"
-            );
-            assert_eq!(read.entry.tags, fx_tags(*tk), "{name} tags");
-
-            let (expires, stale) = fx_times(i);
-            assert_eq!(
-                read.expires_at,
-                Some(envelope::unix_ms_to_system_time(expires)),
-                "{name} expires_at"
-            );
-            assert_eq!(
-                read.stale_until,
-                Some(envelope::unix_ms_to_system_time(stale)),
-                "{name} stale_until"
-            );
-        }
-    }
-
-    /// The reader must reject bytes it did not fully consume, and must reject
-    /// the other shape's layout rather than half-decoding it.
-    #[test]
-    fn legacy_readers_reject_the_wrong_shape_and_trailing_bytes() {
+    fn legacy_reader_rejects_trailing_bytes_and_truncation() {
         for (name, ..) in FIXTURE_CASES.iter() {
-            let redis = fixture_bytes("redis", name);
+            let redis = fixture_bytes(name);
             let mut extended = redis.clone();
             extended.push(0);
             assert!(
@@ -596,13 +492,11 @@ mod legacy_reader {
 #[test]
 fn magic_never_matches_legacy_fixtures() {
     for (name, ..) in FIXTURE_CASES.iter() {
-        for prefix in ["redis", "memcached"] {
-            let bytes = fixture_bytes(prefix, name);
-            assert!(
-                !envelope::looks_like_v2(&bytes),
-                "{prefix} {name} was misread as an envelope"
-            );
-        }
+        let bytes = fixture_bytes(name);
+        assert!(
+            !envelope::looks_like_v2(&bytes),
+            "{name} was misread as an envelope"
+        );
     }
 }
 
@@ -610,24 +504,12 @@ fn magic_never_matches_legacy_fixtures() {
 /// configurations, none of which may look like an envelope.
 #[test]
 fn magic_never_matches_legacy_property() {
-    let headers = fx_headers(1);
     for n in 0..3000usize {
+        let headers = fx_headers((n % 3) as u8);
         let body = fx_body((n % 2) as u8, n);
-        let tags = fx_tags((n % 4) as u8);
 
         let redis = synthetic_legacy_redis(200, 2, &headers, &body, n as u64, n as u64);
         assert!(!envelope::looks_like_v2(&redis), "redis body={n}");
-
-        let memcached = bincode1::memcached_record(
-            200,
-            2,
-            &headers,
-            &body,
-            tags.as_deref(),
-            n as u64,
-            n as u64,
-        );
-        assert!(!envelope::looks_like_v2(&memcached), "memcached body={n}");
     }
 }
 
@@ -666,7 +548,7 @@ fn twenty_one_megabyte_legacy_redis_buffer_carries_the_magic_and_still_decodes()
         "the exact length identity must still identify it as legacy"
     );
 
-    let read = envelope::read_stored(&bytes, &PostcardCodec, LegacyShape::RedisOuter).unwrap();
+    let read = envelope::read_stored(&bytes, &PostcardCodec).unwrap();
     if cfg!(feature = "legacy-bincode1-read") {
         let read = read.expect("must decode as a legacy entry, not as an envelope");
         assert_eq!(read.entry.status, StatusCode::OK);
@@ -709,32 +591,23 @@ fn is_legacy_redis_is_exact() {
 /// clean miss -- never an error, never a panic.
 #[test]
 fn legacy_fixtures_through_read_stored() {
-    for (name, status, ver, hk, bk, blen, tk) in FIXTURE_CASES.iter() {
-        for (prefix, shape) in [
-            ("redis", LegacyShape::RedisOuter),
-            ("memcached", LegacyShape::MemcachedOuter),
-        ] {
-            let bytes = fixture_bytes(prefix, name);
-            let read = envelope::read_stored(&bytes, &PostcardCodec, shape).unwrap();
+    for (name, status, ver, hk, bk, blen, _tk) in FIXTURE_CASES.iter() {
+        let bytes = fixture_bytes(name);
+        let read = envelope::read_stored(&bytes, &PostcardCodec).unwrap();
 
-            if cfg!(feature = "legacy-bincode1-read") {
-                let read = read.unwrap_or_else(|| panic!("{prefix} {name} must be a hit"));
-                assert_eq!(read.entry.status.as_u16(), *status);
-                assert_eq!(read.entry.version, fx_version(*ver));
-                assert_eq!(read.entry.headers, fx_headers(*hk));
-                assert_eq!(read.entry.body, Bytes::from(fx_body(*bk, *blen)));
-                let expected_tags = if prefix == "redis" {
-                    None
-                } else {
-                    fx_tags(*tk)
-                };
-                assert_eq!(read.entry.tags, expected_tags);
-            } else {
-                assert!(
-                    read.is_none(),
-                    "{prefix} {name} must be a miss without legacy-bincode1-read"
-                );
-            }
+        if cfg!(feature = "legacy-bincode1-read") {
+            let read = read.unwrap_or_else(|| panic!("{name} must be a hit"));
+            assert_eq!(read.entry.status.as_u16(), *status);
+            assert_eq!(read.entry.version, fx_version(*ver));
+            assert_eq!(read.entry.headers, fx_headers(*hk));
+            assert_eq!(read.entry.body, Bytes::from(fx_body(*bk, *blen)));
+            // 0.5.x's Redis codec dropped tags, so they must not reappear.
+            assert_eq!(read.entry.tags, None);
+        } else {
+            assert!(
+                read.is_none(),
+                "{name} must be a miss without legacy-bincode1-read"
+            );
         }
     }
 }
@@ -776,17 +649,15 @@ fn hostile_inputs() -> Vec<Vec<u8>> {
         },
     ];
 
-    // Truncations and single-byte flips of a real fixture, both shapes.
-    for prefix in ["redis", "memcached"] {
-        let bytes = fixture_bytes(prefix, "s200_v11_h8_b256_nonutf8");
-        for cut in [0, 1, 7, 8, 9, 20, 21, 40, bytes.len() / 2, bytes.len() - 1] {
-            cases.push(bytes[..cut].to_vec());
-        }
-        for pos in (0..bytes.len()).step_by(7) {
-            let mut flipped = bytes.clone();
-            flipped[pos] ^= 0xff;
-            cases.push(flipped);
-        }
+    // Truncations and single-byte flips of a real fixture.
+    let bytes = fixture_bytes("s200_v11_h8_b256_nonutf8");
+    for cut in [0, 1, 7, 8, 9, 20, 21, 40, bytes.len() / 2, bytes.len() - 1] {
+        cases.push(bytes[..cut].to_vec());
+    }
+    for pos in (0..bytes.len()).step_by(7) {
+        let mut flipped = bytes.clone();
+        flipped[pos] ^= 0xff;
+        cases.push(flipped);
     }
 
     // Deterministic pseudo-random noise.
@@ -812,13 +683,10 @@ fn hostile_inputs() -> Vec<Vec<u8>> {
 #[test]
 fn corrupt_input_never_panics() {
     for (i, case) in hostile_inputs().into_iter().enumerate() {
-        for shape in [LegacyShape::RedisOuter, LegacyShape::MemcachedOuter] {
-            let result =
-                std::panic::catch_unwind(|| envelope::read_stored(&case, &PostcardCodec, shape));
-            assert!(result.is_ok(), "panic on hostile input #{i} ({shape:?})");
-            // A miss is fine; a hit is fine only if it decoded consistently.
-            // What is never acceptable is a panic or an unbounded allocation.
-            let _ = result.unwrap();
-        }
+        let result = std::panic::catch_unwind(|| envelope::read_stored(&case, &PostcardCodec));
+        assert!(result.is_ok(), "panic on hostile input #{i}");
+        // A miss is fine; a hit is fine only if it decoded consistently. What
+        // is never acceptable is a panic or an unbounded allocation.
+        let _ = result.unwrap();
     }
 }
