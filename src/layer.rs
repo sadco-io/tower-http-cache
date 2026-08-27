@@ -803,6 +803,27 @@ where
                         }
                     }
                 }
+
+                // Double-checked read. The lookup above and this acquisition
+                // are not one atomic step: another caller can take the lock,
+                // fetch, store and release inside that window, so winning the
+                // lock does not mean the key still needs fetching. Without
+                // this, two requests in flight at the same time each hit the
+                // origin -- the stampede the lock exists to prevent. The
+                // waiting branch above re-reads for the same reason. Only a
+                // fresh entry short-circuits; stale or expired still owes the
+                // origin a request.
+                if primary_guard.is_some() {
+                    if let Ok(Some(hit)) = backend.get(key_ref).await {
+                        if let HitState::Fresh(entry) =
+                            classify_hit(hit, stale_window, refresh_before)
+                        {
+                            #[cfg(feature = "metrics")]
+                            counter!("tower_http_cache.hit_after_lock").increment(1);
+                            return Ok(entry.into_response());
+                        }
+                    }
+                }
             }
 
             #[cfg(feature = "metrics")]

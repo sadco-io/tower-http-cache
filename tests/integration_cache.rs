@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -9,10 +9,13 @@ use http_body::Frame;
 use http_body_util::StreamBody;
 use http_body_util::{BodyExt, Full};
 use std::convert::Infallible;
+use tokio::sync::Notify;
 use tokio::time::sleep;
 use tower::service_fn;
 use tower::{Layer, Service, ServiceExt};
+use tower_http_cache::backend::CacheRead;
 use tower_http_cache::backend::memory::InMemoryBackend;
+use tower_http_cache::error::CacheError;
 use tower_http_cache::prelude::*;
 
 #[tokio::test]
@@ -297,6 +300,162 @@ async fn concurrent_requests_share_refresh_work() {
         counter.load(Ordering::SeqCst),
         2,
         "concurrent requests must share one refresh, not trigger one each"
+    );
+}
+
+/// The hole that made `concurrent_requests_share_refresh_work` flaky, forced
+/// rather than raced for -- on a cold miss, so no clock is involved.
+///
+/// A caller's cache lookup and its stampede-lock acquisition are two separate
+/// steps. This test parks the second caller between them, for exactly as long
+/// as it takes the first caller to reach the origin, store the response and
+/// release the lock. The second caller therefore wakes holding a lookup that
+/// predates a store that has already happened, and finds the lock free. Before
+/// the double-checked read in `CacheService::call` it went on to call the
+/// origin itself; the origin counter is the assertion that it no longer does.
+///
+/// Nothing here depends on timing: every step waits for the previous one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn late_lock_acquisition_does_not_refetch() {
+    /// One-shot rendezvous. Arm it, and the next party to reach it announces
+    /// its arrival and blocks until released. Disarms on first use, so a
+    /// caller that passes the same point twice is only caught once.
+    #[derive(Default)]
+    struct Gate {
+        armed: AtomicBool,
+        arrived: Notify,
+        release: Notify,
+    }
+
+    impl Gate {
+        fn arm(&self) {
+            self.armed.store(true, Ordering::SeqCst);
+        }
+
+        async fn pass(&self) {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                self.arrived.notify_one();
+                self.release.notified().await;
+            }
+        }
+
+        async fn wait_for_arrival(&self) {
+            self.arrived.notified().await;
+        }
+
+        fn release(&self) {
+            self.release.notify_one();
+        }
+    }
+
+    /// Passes through to an `InMemoryBackend`, with a gate sitting between a
+    /// lookup returning and its caller acting on the result.
+    #[derive(Clone)]
+    struct GatedBackend {
+        inner: InMemoryBackend,
+        after_get: Arc<Gate>,
+    }
+
+    impl CacheBackend for GatedBackend {
+        async fn get(&self, key: &str) -> Result<Option<CacheRead>, CacheError> {
+            let read = self.inner.get(key).await;
+            self.after_get.pass().await;
+            read
+        }
+
+        async fn set(
+            &self,
+            key: String,
+            entry: CacheEntry,
+            ttl: Duration,
+            stale_for: Duration,
+        ) -> Result<(), CacheError> {
+            self.inner.set(key, entry, ttl, stale_for).await
+        }
+
+        async fn invalidate(&self, key: &str) -> Result<(), CacheError> {
+            self.inner.invalidate(key).await
+        }
+    }
+
+    let after_get = Arc::new(Gate::default());
+    let in_origin = Arc::new(Gate::default());
+
+    let layer = CacheLayer::builder(GatedBackend {
+        inner: InMemoryBackend::new(128),
+        after_get: after_get.clone(),
+    })
+    .ttl(Duration::from_secs(300))
+    .build();
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let handler = service_fn({
+        let counter = counter.clone();
+        let in_origin = in_origin.clone();
+        move |_req: Request<()>| {
+            let counter = counter.clone();
+            let in_origin = in_origin.clone();
+            async move {
+                let value = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                in_origin.pass().await;
+                Ok::<_, Infallible>(http::Response::new(Full::from(value.to_string())))
+            }
+        }
+    });
+
+    // First caller: misses, takes the lock, parks inside the origin call.
+    in_origin.arm();
+    let layer_first = layer.clone();
+    let handler_first = handler.clone();
+    let first = tokio::spawn(async move {
+        let mut svc = layer_first.layer(handler_first);
+        svc.ready().await.expect("service ready");
+        svc.call(Request::new(()))
+            .await
+            .expect("call succeeds")
+            .into_body()
+            .collect()
+            .await
+            .expect("body collected")
+            .to_bytes()
+    });
+    in_origin.wait_for_arrival().await;
+
+    // Second caller: misses too -- the first caller has stored nothing yet --
+    // and parks between that lookup and the lock.
+    after_get.arm();
+    let second = tokio::spawn(async move {
+        let mut svc = layer.layer(handler);
+        svc.ready().await.expect("service ready");
+        svc.call(Request::new(()))
+            .await
+            .expect("call succeeds")
+            .into_body()
+            .collect()
+            .await
+            .expect("body collected")
+            .to_bytes()
+    });
+    after_get.wait_for_arrival().await;
+
+    // Let the first caller run to completion: store, release the lock, return.
+    in_origin.release();
+    let first_body = first.await.expect("first task joined");
+    assert_eq!(first_body.as_ref(), b"1");
+
+    // Only now does the second caller go for the lock, which is free.
+    after_get.release();
+    let second_body = second.await.expect("second task joined");
+
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "second caller re-fetched a key that was populated while it waited"
+    );
+    assert_eq!(
+        second_body.as_ref(),
+        b"1",
+        "second caller served a body the cache never held"
     );
 }
 

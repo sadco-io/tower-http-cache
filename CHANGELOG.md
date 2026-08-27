@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Stampede protection no longer lets a second origin request through.** A
+  caller's cache lookup and its acquisition of the per-key stampede lock were
+  two separate steps. A caller that looked up a key, then acquired the lock
+  after another caller had already fetched, stored and released it, went on to
+  call the origin again -- so two requests in flight at the same time for the
+  same key produced two origin calls instead of one. The primary path now
+  re-reads the key after taking the lock and serves the entry if it is fresh,
+  matching the re-read the waiting path already did. Costs one backend read per
+  origin fetch.
+
 ## [0.6.0] - 2026-08-27
 
 ### Changed
