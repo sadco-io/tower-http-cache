@@ -22,6 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   envelope header buys: without it, an old reader would have silently accepted
   the new bytes and ignored the trailing remainder.)
 
+  **Upgrading is safe and does not cold-start your cache.** 0.6.0 reads
+  0.5.x-written entries transparently via the `legacy-bincode1-read` feature,
+  which is **on by default**. Entries are rewritten in the new format as they
+  are refreshed. The legacy reader is removed in 0.7.0; by then every 0.5.x
+  entry will long since have aged past its TTL.
+
   The envelope is documented in `tower_http_cache::codec::envelope`, and byte 4
   records which codec wrote the entry. Entries written by one codec are
   reported as a miss rather than handed to another.
@@ -48,7 +54,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   then encoded that vector into a second `Vec<u8>`; the envelope removes one
   full copy of the body on every `set`.
 
+### Added
+
+- **`legacy-bincode1-read` feature, on by default.** Reads cache entries
+  written by 0.5.x so an upgrade does not cold-start a production cache. The
+  reader is hand-written against the bincode 1 layout and pulls no dependency,
+  so leaving it enabled costs only dead code; it exists so 0.7.0 can delete one
+  module and one feature entry. Turning it off is safe at any time and only
+  costs a cold cache. Bytes no decoder recognises read as a miss, never an
+  error and never a panic, and are never deleted.
+
+  Backed by golden fixtures under `tests/fixtures/v0_5_1/`: real bytes produced
+  by the published 0.5.1 code path, decoded field by field.
+
 ### Fixed
+
+- **0.5.x's memcached backend could not read back what it had written.**
+  `CacheEntry`'s `version_serde` helper wrote its discriminant as `i32` —
+  the match arms had no type annotation, so the literals defaulted to `i32` —
+  while the matching `deserialize` read a `u8`. Under `bincode` that is four
+  bytes written against one byte read, so `bincode::deserialize::<MemcachedRecord>`
+  failed on every value the backend itself had stored, and the cache layer
+  served the failure as a miss. `MemcachedBackend` was, in effect, a no-op
+  cache for its entire existence.
+
+  The helper is fixed (`let v: u8 = ...`), so `CacheEntry`'s derived
+  `Serialize`/`Deserialize` now round-trip under non-self-describing formats,
+  and both shared backends route through the codec and envelope rather than
+  serializing `CacheEntry` directly. The legacy reader decodes the four-byte
+  form, so entries 0.5.x wrote to memcached become readable for the first time.
 
 - **Cache tags were silently dropped by the Redis codec.** `BincodeCodec::encode`
   serialized a private struct with no `tags` field, and `decode` rebuilt the entry

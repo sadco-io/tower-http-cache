@@ -13,6 +13,8 @@
 //! [`CacheCodec`]; the envelope is applied by the backend.
 
 pub mod envelope;
+#[cfg(feature = "legacy-bincode1-read")]
+pub mod legacy;
 
 use bytes::Bytes;
 use http::{StatusCode, Version};

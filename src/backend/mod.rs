@@ -72,7 +72,11 @@ mod version_serde {
     where
         S: Serializer,
     {
-        let v = match *version {
+        // The `u8` annotation is load-bearing. Without it the literals default
+        // to `i32`, so this wrote four bytes while `deserialize` below read
+        // one -- which made `CacheEntry`'s derived impls unusable with any
+        // non-self-describing format. See CHANGELOG 0.6.0.
+        let v: u8 = match *version {
             Version::HTTP_09 => 0,
             Version::HTTP_10 => 1,
             Version::HTTP_11 => 2,

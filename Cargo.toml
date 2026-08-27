@@ -52,7 +52,7 @@ hex = "0.4"
 axum = { version = "0.8.9", optional = true }
 
 [features]
-default = ["in-memory", "serde"]
+default = ["in-memory", "serde", "legacy-bincode1-read"]
 in-memory = ["moka"]
 redis-backend = ["redis", "tokio-util", "serde"]
 memcached-backend = ["async-memcached", "dep:bb8", "serde"]
@@ -61,6 +61,14 @@ metrics = ["dep:metrics"]
 tracing = ["dep:tracing"]
 compression = ["dep:flate2"]
 admin-api = ["dep:axum", "serde"]
+# Reads cache entries written by tower-http-cache 0.5.x. On by default in 0.6.0
+# so upgrades do not cold-start production caches. The reader is hand-written
+# against the bincode 1 layout and pulls no dependency, so leaving it on costs
+# only dead code. Deprecated: this feature and the module behind it are removed
+# in 0.7.0. Entries are self-expiring, so once every 0.5.x-written entry has
+# aged past its TTL plus its stale window you can turn it off. Disabling it is
+# safe at any time; it only costs a cold cache.
+legacy-bincode1-read = []
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["full"] }
@@ -76,6 +84,9 @@ tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 criterion = { version = "0.8", features = ["html_reports"] }
 # No-op recorder for the `metrics` bench in cache_benchmarks.rs.
 metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
+# `tests/wire_compat.rs` exercises `CacheEntry`'s derived serde impls under a
+# non-self-describing format directly, without going through the codec.
+postcard = { version = "1.1.3", default-features = false, features = ["use-std"] }
 
 # Every integration test and example is built on a concrete backend, so each
 # declares the feature that provides it. Without these, `cargo test` on a

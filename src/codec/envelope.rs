@@ -182,8 +182,24 @@ pub fn read_stored<C: CacheCodec>(
     Ok(None)
 }
 
-// Replaced by the real legacy reader when the `legacy-bincode1-read` feature
-// is compiled in.
+#[cfg(feature = "legacy-bincode1-read")]
+fn try_legacy(bytes: &[u8], shape: LegacyShape) -> Option<CacheRead> {
+    let decoded = match shape {
+        LegacyShape::RedisOuter => super::legacy::decode_legacy_redis(bytes),
+        LegacyShape::MemcachedOuter => super::legacy::decode_legacy_memcached(bytes),
+    };
+    match decoded {
+        Ok(read) => Some(read),
+        Err(err) => {
+            observe_decode_error("legacy-bincode1", &err);
+            None
+        }
+    }
+}
+
+/// Without the `legacy-bincode1-read` feature, 0.5.x entries simply read as a
+/// miss and are overwritten on the next store.
+#[cfg(not(feature = "legacy-bincode1-read"))]
 fn try_legacy(_bytes: &[u8], _shape: LegacyShape) -> Option<CacheRead> {
     None
 }
