@@ -30,13 +30,13 @@ Tower middleware for HTTP response caching with pluggable storage backends (in-m
 
 ```toml
 [dependencies]
-tower-http-cache = "0.5"
+tower-http-cache = "0.6"
 
 # Enable Redis support if required
-tower-http-cache = { version = "0.5", features = ["redis-backend"] }
+tower-http-cache = { version = "0.6", features = ["redis-backend"] }
 
 # With admin API support
-tower-http-cache = { version = "0.5", features = ["admin-api"] }
+tower-http-cache = { version = "0.6", features = ["admin-api"] }
 ```
 
 ---
@@ -101,11 +101,25 @@ See `examples/chunk_cache_demo.rs` for a complete working example.
 
 ```rust
 use std::time::Duration;
+use redis::aio::ConnectionManagerConfig;
 use tower_http_cache::prelude::*;
 
 async fn build_redis_layer(redis_url: &str) -> CacheLayer<RedisBackend> {
     let client = redis::Client::open(redis_url).expect("valid Redis URL");
-    let manager = client.get_tokio_connection_manager().await.expect("connect");
+
+    // redis 1.x defaults to a 500 ms response timeout and a 1 s connection
+    // timeout. A response cache holds whole response bodies, so a large entry
+    // over a loaded or cross-AZ Redis can exceed 500 ms, and every such
+    // operation then fails instead of succeeding slowly. Choose the bound
+    // against your own body sizes; `None` restores the 0.5.x behaviour of no
+    // timeout at all.
+    let config = ConnectionManagerConfig::new()
+        .set_response_timeout(Some(Duration::from_secs(10)))
+        .set_connection_timeout(Some(Duration::from_secs(5)));
+    let manager = client
+        .get_connection_manager_with_config(config)
+        .await
+        .expect("connect");
 
     CacheLayer::builder(RedisBackend::new(manager))
         .ttl(Duration::from_secs(30))
@@ -162,6 +176,14 @@ let cache_layer = CacheLayer::builder(backend)
 backend.invalidate_by_tag("user:123").await?;
 backend.invalidate_by_tags(&["user:123", "posts"]).await?;
 ```
+
+Tag-based invalidation works on `InMemoryBackend`, and on `MultiTierBackend`
+over one. `RedisBackend` keeps no reverse tag index, so `get_keys_by_tag`,
+`list_tags` and `invalidate_by_tag` return `CacheError::Unsupported` rather
+than a silent `Ok(0)`. Tags themselves do cross the Redis wire as of 0.6.0, so
+a `CacheRead` from Redis carries the tags its entry was stored with. `TagIndex`
+is also process-local, so invalidating a tag clears only the calling process's
+index.
 
 ### Multi-Tier Caching
 
@@ -295,7 +317,15 @@ Benchmarks are powered by Criterion and can be reproduced with:
 cargo bench --bench cache_benchmarks
 ```
 
-Latest results (macOS / M3 Pro / Rust 1.85, `redis-backend` disabled unless noted):
+**Run benchmarks locally only. Never add `cargo bench` to CI** — Criterion
+executes the whole suite, which takes minutes and produces timings that are
+meaningless on shared runners. CI compiles the benches instead, via
+`cargo test --no-run --benches`.
+
+Latest results (macOS / M3 Pro / Rust 1.85, `redis-backend` disabled unless noted).
+The `codec/*` rows were measured against 0.5.x's bincode codec; 0.6.0 replaced it
+with postcard and renamed those benches to `codec/postcard_*`. They have not been
+re-measured.
 
 | Group | Benchmark | Median | Notes |
 | ----- | --------- | ------ | ----- |
@@ -314,7 +344,7 @@ Latest results (macOS / M3 Pro / Rust 1.85, `redis-backend` disabled unless note
 | | `no_cache` | 5.76 ms | Same workload without layer |
 | `stale_while_revalidate` | `stale_hit_latency` | 33.6 ms | Serve-stale branch |
 | | `strict_refresh_latency` | 33.7 ms | Force refresh branch |
-| `codec/bincode` | `encode_small` | 362 ns | 1 KiB payload |
+| `codec/bincode` (0.5.x) | `encode_small` | 362 ns | 1 KiB payload |
 | | `decode_small` | 381 ns | 1 KiB payload |
 | | `encode_large` | 146 µs | 128 KiB payload |
 | | `decode_large` | 174 µs | 128 KiB payload |
@@ -360,13 +390,104 @@ cargo run --example v0_3_features --features admin-api
 | `compression` | Adds optional gzip compression for cached payloads | ✗ |
 | `metrics` | Emits `metrics` counters (hit/miss/store/etc.) | ✗ |
 | `tracing` | Adds tracing spans around cache operations | ✗ |
+| `legacy-bincode1-read` | Reads cache entries written by 0.5.x (see below) | ✓ |
+
+---
+
+## Upgrading from 0.5.x
+
+### The on-the-wire cache format changed
+
+Entries in Redis are now written as a 21-byte versioned envelope — `"THC"` magic,
+a format byte, a codec byte, and the expiry and stale timestamps as
+little-endian `u64` — followed by a `postcard`-encoded payload. 0.5.x wrote a
+bare `bincode 1` record. Tags are part of the payload now; they never crossed the
+Redis wire before.
+
+**Upgrading does not cold-start your cache.** 0.6.0 reads 0.5.x entries through
+the `legacy-bincode1-read` feature, which is on by default. Entries are rewritten
+in the new format as they are refreshed.
+
+**Rolling back to 0.5.x is also safe.** A 0.5.x binary reading a 0.6.0 entry gets
+a clean decode error, which the cache layer already treats as a miss. The cost is
+a cold cache, not corrupted responses — that is what the envelope header buys.
+Without it, the old reader would have silently accepted the new bytes and ignored
+the trailing remainder.
+
+`BincodeCodec` is renamed `PostcardCodec`. A deprecated alias keeps the old name
+working through 0.6.x.
+
+### Turning `legacy-bincode1-read` off
+
+The reader is hand-written against the bincode 1 layout and pulls no dependency,
+so leaving it on costs only dead code. It exists so 0.7.0 can delete it cleanly,
+not to dodge an advisory.
+
+Turning it off is safe at any time and **cannot lose data**: an entry it would
+have read becomes a miss, the response is recomputed, and the entry is rewritten
+in the new format. The only cost is a colder cache while 0.5.x-written entries
+are re-populated. Since entries are self-expiring, once every 0.5.x entry has
+aged past its TTL plus its stale window the feature is doing nothing anyway.
+
+```toml
+tower-http-cache = { version = "0.6", default-features = false, features = ["in-memory", "serde"] }
+```
+
+The feature and the module behind it are removed in 0.7.0.
+
+### `CacheBackend` no longer uses `#[async_trait]`
+
+The trait uses native `async fn` in traits (RPITIT). Every method is declared as
+`fn name(..) -> impl Future<Output = ..> + Send`; the `+ Send` is required
+because the cache layer boxes backend futures into a `Send` future.
+
+If you implement `CacheBackend` yourself, the migration is one line per impl —
+delete the attribute. Method bodies are unchanged:
+
+```diff
+-#[async_trait]
+ impl CacheBackend for MyBackend {
+     async fn get(&self, key: &str) -> Result<Option<CacheRead>, CacheError> {
+         // unchanged
+     }
+ }
+```
+
+Leaving `#[async_trait]` in place produces `error[E0195]: lifetime parameters or
+bounds on method 'get' do not match the trait declaration`. The same one-line
+change applies to any overridden default method (`get_keys_by_tag`,
+`invalidate_by_tag`, `invalidate_by_tags`, `list_tags`).
+
+`CacheBackend` was already non-dyn-compatible because of its `Clone` supertrait,
+so no working code used it as a trait object. MSRV is unchanged — RPITIT
+stabilised in Rust 1.75, well below this crate's floor.
+
+### Also breaking
+
+- `CacheError` is `#[non_exhaustive]` and gained an `Unsupported` variant.
+  Exhaustive matches need a `_` arm; `CacheError::is_unsupported()` avoids
+  matching at all.
+- `RedisBackend::get_keys_by_tag` and `list_tags` return `Unsupported` instead of
+  `Ok(vec![])`, so the defaulted `invalidate_by_tag` propagates an error where it
+  previously returned `Ok(0)`.
+- The `memcached-backend` feature and `MemcachedBackend` are removed.
+- redis `0.32` -> `1.6` changed `ConnectionManagerConfig`'s defaults from no
+  timeouts to a 500 ms response timeout and a 1 s connection timeout. See the
+  Redis backend example above.
+
+See [CHANGELOG.md](CHANGELOG.md) for the full list.
 
 ---
 
 ## Minimum Supported Rust Version
 
-MSRV: **1.75.0** (matching the crate's `rust-version` field).
-The MSRV will only increase with a minor version bump and will be documented in release notes.
+MSRV: **1.85** for the default feature set, matching the crate's `rust-version`
+field. **`redis-backend` requires 1.88** — redis 1.6 declares it, and the feature
+also reaches `url` -> `idna` -> `icu_*`, which require the same. Both floors are
+enforced by separate CI jobs.
+
+The MSRV will only increase with a minor version bump and will be documented in
+release notes.
 
 ---
 
@@ -398,6 +519,6 @@ You may choose either license to suit your needs. Unless explicitly stated other
    cargo test
    python3 scripts/redis_smoke.py
    ```
-4. Open a pull request with a succinct summary, test evidence, and (when applicable) benchmark output via `cargo bench`.
+4. Open a pull request with a succinct summary, test evidence, and (when applicable) benchmark output via `cargo bench`. Run benchmarks locally and paste the output; do not add a bench step to CI.
 
 Bug reports and feature requests are welcome in the issue tracker. For larger design changes, please start a discussion thread to align on API shape before submitting code.
