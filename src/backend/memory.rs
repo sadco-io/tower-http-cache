@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use moka::future::Cache;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -36,7 +35,6 @@ impl InMemoryBackend {
     }
 }
 
-#[async_trait]
 impl CacheBackend for InMemoryBackend {
     async fn get(&self, key: &str) -> Result<Option<CacheRead>, CacheError> {
         if let Some(stored) = self.cache.get(key).await {

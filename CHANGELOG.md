@@ -111,6 +111,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carries this note, and both Redis examples and the Redis integration tests
   now set the timeouts explicitly rather than inheriting them.
 
+- **BREAKING: `CacheBackend` uses native `async fn` in traits (RPITIT) and no
+  longer depends on `async-trait`.** Every method is now declared as
+  `fn name(..) -> impl Future<Output = ..> + Send`. The `+ Send` is required
+  because the cache layer boxes backend futures into a `Send` future.
+
+  **If you implement `CacheBackend` yourself, the migration is one line per
+  impl:** delete the `#[async_trait]` attribute. Your method bodies stay exactly
+  as they are — `async fn` in an impl block is still `async fn`.
+
+  ```diff
+  -#[async_trait]
+   impl CacheBackend for MyBackend {
+       async fn get(&self, key: &str) -> Result<Option<CacheRead>, CacheError> {
+           // unchanged
+       }
+   }
+  ```
+
+  Leaving `#[async_trait]` in place produces `error[E0195]: lifetime parameters
+  or bounds on method 'get' do not match the trait declaration`, once per
+  method. Verified both directions against a real downstream crate: the stale
+  impl fails with exactly that, and deleting the attribute — changing nothing
+  else — compiles. The same one-line change applies if you override the
+  defaulted methods (`get_keys_by_tag`, `invalidate_by_tag`,
+  `invalidate_by_tags`, `list_tags`).
+
+  There are **no known downstream implementors**: `tower-http-cache` has zero
+  reverse dependencies on crates.io.
+
+  This removes a boxed allocation per backend call. `CacheBackend` was already
+  non-dyn-compatible because of its `Clone` supertrait, so no working code used
+  it as a trait object; if you somehow held one, you will need a concrete type
+  or your own boxing wrapper.
+
+  MSRV is unchanged — RPITIT stabilised in Rust 1.75, well below this crate's
+  1.85 floor.
+
 ### Added
 
 - **`legacy-bincode1-read` feature, on by default.** Reads cache entries
@@ -165,6 +202,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reachable from public API bought nothing. `LegacyShape` disappears with it and
   `codec::envelope::read_stored` now takes two arguments. **The Redis legacy
   path is untouched.**
+
+- **`async-trait` is no longer a dependency.** See the `CacheBackend` RPITIT
+  entry under *Changed*. It was the last blocker: `bb8` was the only other user
+  of it in this crate, and `bb8` left with the memcached backend.
+  `cargo tree -i async-trait` finds no match under any feature combination.
 
 - **`bincode` is no longer a dependency.** RUSTSEC-2025-0141 marked it
   permanently unmaintained in December 2025 with no patched release.

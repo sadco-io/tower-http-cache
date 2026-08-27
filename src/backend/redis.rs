@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-use async_trait::async_trait;
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 
@@ -93,7 +92,6 @@ impl<C> RedisBackend<C> {
     }
 }
 
-#[async_trait]
 impl<C> CacheBackend for RedisBackend<C>
 where
     C: CacheCodec,

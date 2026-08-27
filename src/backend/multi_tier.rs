@@ -4,7 +4,6 @@
 //! accessed entries are automatically promoted from a slower L2 cache to
 //! a faster L1 cache based on configurable promotion strategies.
 
-use async_trait::async_trait;
 use dashmap::DashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -184,7 +183,6 @@ where
     }
 }
 
-#[async_trait]
 impl<L1, L2> CacheBackend for MultiTierBackend<L1, L2>
 where
     L1: CacheBackend,
