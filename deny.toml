@@ -19,24 +19,20 @@ wildcards = "deny"
 skip = []
 
 [licenses]
+# Every entry here is a licence actually present in the resolved graph. When a
+# new dependency introduces one that is not listed, `cargo deny` fails and the
+# licence gets reviewed before it is added -- that gate is the point of the
+# list, so entries are not kept "just in case".
 allow = [
     "MIT",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
-    "BSD-2-Clause",
     "BSD-3-Clause",
-    "ISC",
     "Unicode-3.0",
-    # notify (CC0-1.0) and tiny-keccak via ahash/const-random. CC0-1.0 is a
-    # public-domain dedication: permissive, no obligations, FSF Free/Libre.
-    "CC0-1.0",
-    # webpki-roots ships the Mozilla CA bundle under CDLA-Permissive-2.0.
-    "CDLA-Permissive-2.0",
     "Zlib",
-    # redis 1.6 depends on xxhash-rust, which is BSL-1.0 (Boost Software
-    # License 1.0) -- OSI approved, FSF Free/Libre, permissive, and compatible
-    # with this crate's MIT OR Apache-2.0. Arrived with the redis 0.32 -> 1.x
-    # upgrade; redis 0.32.7 had no xxhash-rust dependency.
+    # xxhash-rust, via redis 1.6. Boost Software License 1.0 -- OSI approved,
+    # FSF Free/Libre, permissive, compatible with this crate's MIT OR
+    # Apache-2.0. redis 0.32.7 had no xxhash-rust dependency.
     "BSL-1.0",
 ]
 
