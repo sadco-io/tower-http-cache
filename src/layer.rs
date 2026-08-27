@@ -523,6 +523,11 @@ where
             #[cfg(feature = "tracing")]
             tracing::debug!(key = %key, uri = %metadata.uri, "Auto-refresh triggered");
 
+            // Captured before `try_into_request` consumes the metadata: the
+            // tag extractor keys off the request, not the response.
+            let request_method = metadata.method.clone();
+            let request_uri = metadata.uri.clone();
+
             // Reconstruct the request
             let request = match metadata.try_into_request() {
                 Some(req) => req,
@@ -584,6 +589,12 @@ where
                         headers_to_cache,
                         compressed_bytes,
                     );
+                    let tags = policy.extract_tags(&request_method, &request_uri);
+                    let entry = if tags.is_empty() {
+                        entry
+                    } else {
+                        entry.with_tags(tags)
+                    };
 
                     if let Err(_err) = backend.set(key.clone(), entry, ttl, stale_for).await {
                         #[cfg(feature = "tracing")]
@@ -999,6 +1010,16 @@ where
                                 headers_to_cache.unwrap(),
                                 compressed_bytes,
                             );
+                            // `extract_tags` returns an empty vector unless
+                            // `TagPolicy::enabled` is set, which defaults to
+                            // false -- so this is inert for anyone who has not
+                            // opted in.
+                            let tags = policy.extract_tags(&method, &uri);
+                            let entry = if tags.is_empty() {
+                                entry
+                            } else {
+                                entry.with_tags(tags)
+                            };
                             if backend
                                 .set(key_ref.clone(), entry, ttl, stale_for)
                                 .await

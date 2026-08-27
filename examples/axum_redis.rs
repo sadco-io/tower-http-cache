@@ -22,7 +22,7 @@ use axum::{Router, routing::get};
 #[cfg(feature = "redis-backend")]
 use redis::Client;
 #[cfg(feature = "redis-backend")]
-use redis::aio::ConnectionManager;
+use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 #[cfg(feature = "redis-backend")]
 use tower_http_cache::prelude::*;
 #[cfg(feature = "redis-backend")]
@@ -33,7 +33,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".into());
     let client = Client::open(redis_url)?;
-    let manager: ConnectionManager = client.get_connection_manager().await?;
+
+    // redis 1.x defaults to a 500 ms response timeout and a 1 s connection
+    // timeout. A response cache holds whole response bodies, so a large entry
+    // over a loaded or cross-AZ Redis can exceed 500 ms -- and every such
+    // operation would then fail instead of succeeding slowly. Choose the bound
+    // against your own body sizes; this example lifts it rather than inheriting
+    // a default meant for small values.
+    let config = ConnectionManagerConfig::new()
+        .set_response_timeout(Some(Duration::from_secs(10)))
+        .set_connection_timeout(Some(Duration::from_secs(5)));
+    let manager: ConnectionManager = client.get_connection_manager_with_config(config).await?;
 
     let backend = RedisBackend::new(manager);
 

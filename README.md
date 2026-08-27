@@ -19,7 +19,7 @@ Tower middleware for HTTP response caching with pluggable storage backends (in-m
 - 🎯 **Multi-Tier**: hybrid L1/L2 caching for optimal performance and capacity.
 - 📊 **Admin API**: REST endpoints for cache introspection and management.
 - 🤖 **ML-Ready Logging**: structured logs with request correlation for ML training.
-- 📦 **Pluggable storage**: in-memory (Moka), Redis, and Memcached backends with connection pooling.
+- 📦 **Pluggable storage**: in-memory (Moka) and Redis backends.
 - 📏 **Policy guards**: min/max body size, cache-control respect/override, custom method/status filters.
 - 🧰 **Custom keys**: built-in extractors (path, path+query) plus custom closures.
 - 📉 **Observability hooks**: optional metrics counters and tracing spans.

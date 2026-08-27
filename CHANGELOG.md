@@ -7,6 +7,290 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The on-the-wire cache format changed, and `tags` are now part of it.**
+  Entries stored in Redis are now written as a 21-byte versioned envelope
+  (`"THC"` magic, format byte, codec byte, and the expiry/stale timestamps as
+  little-endian `u64`) followed by a `postcard`-encoded payload. Previously the
+  Redis and memcached backends used two *different* undocumented `bincode 1`
+  layouts.
+
+  **Rolling back to 0.5.x is safe.** A 0.5.x binary encountering a 0.6.0 entry
+  gets a clean decode error, which the cache layer already treats as a miss.
+  You get a cold cache, not corrupted responses. (This is exactly what the
+  envelope header buys: without it, an old reader would have silently accepted
+  the new bytes and ignored the trailing remainder.)
+
+  **Upgrading is safe and does not cold-start your cache.** 0.6.0 reads
+  0.5.x-written entries transparently via the `legacy-bincode1-read` feature,
+  which is **on by default**. Entries are rewritten in the new format as they
+  are refreshed. The legacy reader is removed in 0.7.0; by then every 0.5.x
+  entry will long since have aged past its TTL.
+
+  The envelope is documented in `tower_http_cache::codec::envelope`, and byte 4
+  records which codec wrote the entry. Entries written by one codec are
+  reported as a miss rather than handed to another.
+
+- **`BincodeCodec` is renamed `PostcardCodec`.** A deprecated type alias keeps
+  `BincodeCodec` working through 0.6.x; it is removed in 0.7.0. Because
+  `RedisBackend<C = PostcardCodec>` resolves through the alias, most downstream
+  code is untouched.
+
+- **`CacheCodec` gained a defaulted `CODEC_ID` associated constant.** It names
+  the codec in the envelope header. The default is `0x80`, the start of the
+  range reserved for codecs implemented outside this crate, so existing
+  downstream `impl CacheCodec` blocks keep compiling unchanged.
+
+- Redis no longer double-encodes. 0.5.x encoded the entry into a `Vec<u8>`,
+  then encoded that vector into a second `Vec<u8>`; the envelope removes one
+  full copy of the body on every `set`.
+
+- **BREAKING: `RedisBackend` now reports that it has no tag index.**
+  `get_keys_by_tag` and `list_tags` return `Err(CacheError::Unsupported(..))`,
+  and the trait's defaulted `invalidate_by_tag` propagates it. Previously all
+  three inherited the trait defaults and answered `Ok(vec![])` / `Ok(0)`, so a
+  caller could not tell "nothing carried that tag" from "this backend cannot do
+  tags at all" — which is precisely the population being silently failed today.
+  If you call `invalidate_by_tag` on Redis and ignore the count, you now get an
+  error; handle it, or check `CacheError::is_unsupported`.
+
+  `MultiTierBackend` deliberately tolerates this: a tier that reports
+  `Unsupported` contributes nothing rather than failing the call, so the usual
+  `InMemoryBackend` over `RedisBackend` arrangement keeps working off the L1
+  index. Only if *neither* tier has an index does the error propagate.
+
+- **BREAKING: `CacheError` is `#[non_exhaustive]` and gained an `Unsupported`
+  variant.** Exhaustive matches on it need a `_` arm. Both changes are breaking
+  and are made together, in the release that is breaking anyway, so future
+  variants are additive. `CacheError::is_unsupported()` is provided so callers
+  do not have to match at all.
+
+- **`redis` `0.32.7` -> `1.6.0`.** No source changes were needed in this crate:
+  the `ConnectionManager` path and construction, `AsyncCommands::{get, set_ex,
+  del}`, `set_ex`'s `u64` TTL, `Option<Vec<u8>>` via `FromRedisValue`,
+  `#[from] redis::RedisError`, and the `aio` / `tokio-comp` /
+  `connection-manager` features are all unchanged. The documented 1.0 breaks
+  miss this crate: it never iterates, implements no `FromRedisValue`, and uses
+  `tokio-comp` rather than `async-std`.
+
+  The `redis-backend` MSRV floor is **unchanged at 1.88**. It moved from being
+  transitive (`url` -> `idna` -> `icu_*`) to being declared outright — redis
+  1.6.0 sets `rust-version = "1.88"` — but the number and the split CI jobs are
+  the same.
+
+  **One behavioural change to be aware of, and it is the reason this is under
+  Changed rather than a dependency-bump footnote.** redis 1.x changed
+  `ConnectionManagerConfig`'s defaults from *no timeouts* to a **500 ms
+  response timeout and a 1 s connection timeout**, and
+  `Client::get_connection_manager()` uses those defaults. Verified in both
+  crates' sources: 0.32.7 had `DEFAULT_RESPONSE_TIMEOUT = None` and
+  `DEFAULT_CONNECTION_TIMEOUT = None`; 1.6.0 has `Some(500ms)` and `Some(1s)`.
+
+  For an HTTP response cache the values are whole response bodies, so a large
+  entry over a loaded or cross-AZ Redis can exceed 500 ms — and every such
+  `get` or `set` then fails with `CacheError::Redis` instead of succeeding
+  slowly. A slow cache silently becomes a broken one.
+
+  `RedisBackend::new` takes an already-constructed `ConnectionManager`, so this
+  crate cannot choose for you. Choose explicitly at construction:
+
+  ```rust
+  use redis::aio::ConnectionManagerConfig;
+
+  let config = ConnectionManagerConfig::new()
+      .set_response_timeout(Some(Duration::from_secs(10)))
+      .set_connection_timeout(Some(Duration::from_secs(5)));
+  let manager = client.get_connection_manager_with_config(config).await?;
+  let backend = RedisBackend::new(manager);
+  ```
+
+  Pass `None` to restore the 0.5.x behaviour of no timeout at all. A generous
+  bound is usually the better answer; pick it against your body sizes, not
+  against the client library's default. `RedisBackend::new`'s documentation
+  carries this note, and both Redis examples and the Redis integration tests
+  now set the timeouts explicitly rather than inheriting them.
+
+- **BREAKING: `CacheBackend` uses native `async fn` in traits (RPITIT) and no
+  longer depends on `async-trait`.** Every method is now declared as
+  `fn name(..) -> impl Future<Output = ..> + Send`. The `+ Send` is required
+  because the cache layer boxes backend futures into a `Send` future.
+
+  **If you implement `CacheBackend` yourself, the migration is one line per
+  impl:** delete the `#[async_trait]` attribute. Your method bodies stay exactly
+  as they are — `async fn` in an impl block is still `async fn`.
+
+  ```diff
+  -#[async_trait]
+   impl CacheBackend for MyBackend {
+       async fn get(&self, key: &str) -> Result<Option<CacheRead>, CacheError> {
+           // unchanged
+       }
+   }
+  ```
+
+  Leaving `#[async_trait]` in place produces `error[E0195]: lifetime parameters
+  or bounds on method 'get' do not match the trait declaration`, once per
+  method. Verified both directions against a real downstream crate: the stale
+  impl fails with exactly that, and deleting the attribute — changing nothing
+  else — compiles. The same one-line change applies if you override the
+  defaulted methods (`get_keys_by_tag`, `invalidate_by_tag`,
+  `invalidate_by_tags`, `list_tags`).
+
+  There are **no known downstream implementors**: `tower-http-cache` has zero
+  reverse dependencies on crates.io.
+
+  This removes a boxed allocation per backend call. `CacheBackend` was already
+  non-dyn-compatible because of its `Clone` supertrait, so no working code used
+  it as a trait object; if you somehow held one, you will need a concrete type
+  or your own boxing wrapper.
+
+  MSRV is unchanged — RPITIT stabilised in Rust 1.75, well below this crate's
+  1.85 floor.
+
+### Added
+
+- **`legacy-bincode1-read` feature, on by default.** Reads cache entries
+  written by 0.5.x so an upgrade does not cold-start a production cache. The
+  reader is hand-written against the bincode 1 layout and pulls no dependency,
+  so leaving it enabled costs only dead code; it exists so 0.7.0 can delete one
+  module and one feature entry. Turning it off is safe at any time and only
+  costs a cold cache. Bytes no decoder recognises read as a miss, never an
+  error and never a panic, and are never deleted.
+
+  Backed by golden fixtures under `tests/fixtures/v0_5_1/`: real bytes produced
+  by the published 0.5.1 code path, decoded field by field.
+
+### Removed
+
+- **BREAKING: the `memcached-backend` feature and `MemcachedBackend` are
+  removed.** Along with them go `MemcachedBackendBuilder`, `PoolState`,
+  `MemcachedConnectionManager`, the `memcached_production` example, and the
+  `async-memcached` and `bb8` dependencies.
+
+  **This is breaking on paper and cannot break a working deployment, because
+  there were none.** The backend never returned a cache hit in its entire
+  existence. `MemcachedRecord` serialized `CacheEntry` whole, and
+  `CacheEntry`'s `version_serde` helper wrote the version as a four-byte `i32`
+  while its `deserialize` read a one-byte `u8`. Every
+  `bincode::deserialize::<MemcachedRecord>` therefore failed on data the
+  backend itself had just written, and the cache layer — which already treats a
+  backend `Err` as a miss — served every single `get` as a miss. A deployment
+  using it had a write-only cache with a 100% miss rate that looked like it was
+  working. Confirmed by round-tripping a `MemcachedRecord` through the real
+  published 0.5.1 crate against `bincode 1.3.3`, and reproduced independently.
+
+  It is *removed*, not deprecated. There is no migration path to write, because
+  there is no working behaviour to migrate: use `RedisBackend` or
+  `InMemoryBackend`.
+
+  Removing it takes a large advisory-bearing subtree with it. `async-memcached`
+  declares `toxiproxy_rust` — a test fixture — as a normal dependency, which
+  dragged in `reqwest 0.11` -> `hyper 0.14` -> `h2 0.3`, plus `native-tls` ->
+  `openssl-sys`. Gone from the graph: `async-memcached`, `bb8`,
+  `toxiproxy_rust`, `reqwest`, `h2`, `fxhash`, `rustls-pemfile`, `openssl-sys`.
+  Building this crate no longer needs `libssl-dev` or `pkg-config`, and CI no
+  longer installs them.
+
+  With this and the `bincode` removal, all four suppressed advisories
+  (RUSTSEC-2025-0141, RUSTSEC-2026-0258, RUSTSEC-2025-0057, RUSTSEC-2025-0134)
+  now report `advisory-not-detected`. The `deny.toml` entries are deleted in a
+  later pass.
+
+  The legacy reader's memcached decoder is removed too: with the backend gone
+  nothing can produce those bytes, so keeping a hand-rolled byte parser
+  reachable from public API bought nothing. `LegacyShape` disappears with it and
+  `codec::envelope::read_stored` now takes two arguments. **The Redis legacy
+  path is untouched.**
+
+- **`async-trait` is no longer a dependency.** See the `CacheBackend` RPITIT
+  entry under *Changed*. It was the last blocker: `bb8` was the only other user
+  of it in this crate, and `bb8` left with the memcached backend.
+  `cargo tree -i async-trait` finds no match under any feature combination.
+
+- **`bincode` is no longer a dependency.** RUSTSEC-2025-0141 marked it
+  permanently unmaintained in December 2025 with no patched release.
+
+  To be precise about what this is and is not: RUSTSEC-2025-0141 is
+  `informational = "unmaintained"`, **not a vulnerability**. There is no known
+  exploit in `bincode 1.3.3`. The reason to move is that a permanently-ignored
+  advisory trains people to ignore advisories.
+
+  The reader for 0.5.x-format entries is hand-written against the (fixed,
+  simple) bincode 1 layout rather than calling `bincode`, which is what allowed
+  the dependency to be dropped in the same release that keeps backward
+  compatibility. `cargo tree -i bincode` finds no match under any feature
+  combination, including `--all-features`.
+
+- **Note for anyone tracking dependabot: do not merge a `bincode 3.0` bump.**
+  `bincode` 3.0.0 is a tombstone release. Its entire `src/lib.rs` is
+  `compile_error!("https://xkcd.com/2347/");` — it was published only to signal
+  the crate's status, since crates.io has no way to archive a crate. It has no
+  features and no dependencies, and bumping to it does not compile. The last
+  functional release is 2.0.1, which is covered by the same advisory (it has no
+  version bound), so it was not a useful destination either.
+
+### Fixed
+
+- **`RedisBackend` serialized every cache operation through a single mutex.**
+  The connection was held as `Arc<Mutex<ConnectionManager>>`, but
+  `ConnectionManager` is `pub struct ConnectionManager(Arc<Internals>)` with
+  `#[derive(Clone)]` and multiplexes internally — the mutex defeated the
+  multiplexing it was wrapping, turning a pool into a queue. It is now cloned
+  per operation, which is what the type is designed for.
+
+  This is a pre-existing bug, not a consequence of the redis upgrade: the
+  definition is identical in 0.32.7 and 1.6.0, so 0.5.x was affected too. The
+  field is private and `RedisBackend::new` still takes a `ConnectionManager`,
+  so there is no public API change, and `RedisBackend` remains
+  `Send + Sync + Clone + 'static` (pinned by a test).
+
+- **`CacheEntry`'s derived `Serialize`/`Deserialize` could not round-trip under
+  a non-self-describing format.** `version_serde::serialize` wrote its
+  discriminant as an `i32` — the match arms had no type annotation, so the
+  literals defaulted to `i32` — while `version_serde::deserialize` read a `u8`.
+  Four bytes written against one byte read. Fixed with `let v: u8 = ...`,
+  pinned by a test that fails without it.
+
+  This is the defect that made the memcached backend a no-op; see *Removed*.
+
+- **`CachePolicy::with_tag_extractor` did nothing.** `CachePolicy::extract_tags`
+  had no callers anywhere in the crate: both places where the layer builds a
+  `CacheEntry` used `CacheEntry::new(..)` and never attached tags. Tags
+  configured through the middleware — the mechanism the README documents —
+  never reached any backend, including the in-memory one. The layer now calls
+  `extract_tags` on both the store and the refresh path and attaches the
+  result.
+
+  This is inert unless you opted in: `TagPolicy::enabled` defaults to `false`,
+  and `extract_tags` returns an empty vector when it is. There is a test for
+  that inertness as well as for the fix.
+
+- **Cache tags were silently dropped by the Redis codec.** `BincodeCodec::encode`
+  serialized a private struct with no `tags` field, and `decode` rebuilt the entry
+  through `CacheEntry::new`, which always sets `tags: None`. Tags never crossed the
+  Redis wire. They now do.
+
+- The `cache_benchmarks` bench now declares `serde` in its `required-features`.
+  It uses the codec, which lives behind that feature, so
+  `cargo bench --no-default-features --features in-memory` did not build.
+
+### Known issues
+
+- **Tag-based invalidation works only on `InMemoryBackend` (and
+  `MultiTierBackend` over one).** `RedisBackend` implements `get`, `set` and
+  `invalidate` only; it keeps no reverse tag index, so `invalidate_by_tag` has
+  nothing to iterate. 0.6.0 puts tags *on the wire*, which is a prerequisite
+  for fixing this and means a `CacheRead` from Redis now carries the tags the
+  entry was stored with — but it does not add a distributed tag index.
+  `TagIndex` also remains process-local (`Arc<DashMap<..>>`), so even on the
+  in-memory backend, invalidating a tag clears only the calling process's
+  index.
+
+  As of 0.6.0 `RedisBackend` reports this explicitly rather than returning a
+  silent `Ok(0)`. A Redis-native tag index (Redis sets, opt-in, with TTL-based
+  garbage collection of stale members) is planned for 0.7.0.
+
 ## [0.5.2] - 2026-08-26
 
 A dependency-reduction and edition release. No wire-format change, no public
@@ -569,3 +853,26 @@ All v0.3.0 features are opt-in and backward compatible:
 [0.1.2]: https://github.com/sadco-io/tower-http-cache/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/sadco-io/tower-http-cache/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/sadco-io/tower-http-cache/releases/tag/v0.1.0
+
+- **Cache tags were silently dropped by the Redis codec.** `BincodeCodec::encode`
+  serialized a private struct with no `tags` field, and `decode` rebuilt the entry
+  through `CacheEntry::new`, which always sets `tags: None`. Tags never crossed the
+  Redis wire. They now do.
+
+### Known issues
+
+- **Tag-based invalidation works only on `InMemoryBackend` (and
+  `MultiTierBackend` over one).** `RedisBackend` and `MemcachedBackend`
+  implement `get`, `set` and `invalidate` only; they keep no reverse tag index,
+  so `invalidate_by_tag` has nothing to iterate. 0.6.0 puts tags *on the wire*,
+  which is a prerequisite for fixing this and means a `CacheRead` from a shared
+  backend now carries the tags the entry was stored with — but it does not add
+  a distributed tag index. `TagIndex` also remains process-local
+  (`Arc<DashMap<..>>`), so even on the in-memory backend, invalidating a tag
+  clears only the calling process's index.
+
+  As of 0.6.0 the shared backends report this explicitly rather than returning
+  a silent `Ok(0)`. A Redis-native tag index (Redis sets, opt-in, with
+  TTL-based garbage collection of stale members) is planned for 0.7.0.
+  Memcached has no set type and will continue to report tags as unsupported.
+

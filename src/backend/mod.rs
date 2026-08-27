@@ -5,23 +5,19 @@
 //! - [`memory::InMemoryBackend`] — a fast, process-local cache backed by [`moka`].
 //! - `redis::RedisBackend` *(optional)* — a distributed cache when the
 //!   `redis-backend` crate feature is enabled.
-//! - `memcached::MemcachedBackend` *(optional)* — a distributed cache when the
-//!   `memcached-backend` crate feature is enabled.
 //!
 //! Backends are responsible for answering cache lookups, storing entries,
 //! and enforcing per-entry stale windows.
 
-#[cfg(feature = "memcached-backend")]
-pub mod memcached;
 #[cfg(feature = "in-memory")]
 pub mod memory;
 pub mod multi_tier;
 #[cfg(feature = "redis-backend")]
 pub mod redis;
 
-use async_trait::async_trait;
 use bytes::Bytes;
 use http::{HeaderName, HeaderValue, Response, StatusCode, Version};
+use std::future::Future;
 use std::time::{Duration, SystemTime};
 
 use crate::error::CacheError;
@@ -72,7 +68,11 @@ mod version_serde {
     where
         S: Serializer,
     {
-        let v = match *version {
+        // The `u8` annotation is load-bearing. Without it the literals default
+        // to `i32`, so this wrote four bytes while `deserialize` below read
+        // one -- which made `CacheEntry`'s derived impls unusable with any
+        // non-self-describing format. See CHANGELOG 0.6.0.
+        let v: u8 = match *version {
             Version::HTTP_09 => 0,
             Version::HTTP_10 => 1,
             Version::HTTP_11 => 2,
@@ -182,60 +182,107 @@ pub struct CacheRead {
     pub stale_until: Option<SystemTime>,
 }
 
-#[async_trait]
+/// Storage a [`CacheLayer`](crate::layer::CacheLayer) can read and write.
+///
+/// Every method returns `impl Future<..> + Send` rather than being an
+/// `async fn`. The `+ Send` is required because the cache layer boxes backend
+/// futures into a `Send` future; a bare `async fn` in a trait does not
+/// guarantee it at the bound site.
+///
+/// **Implementing this trait is unaffected by that.** Write plain `async fn`
+/// in your impl block, with no `#[async_trait]` attribute:
+///
+/// ```
+/// # use std::time::Duration;
+/// # use tower_http_cache::backend::{CacheBackend, CacheEntry, CacheRead};
+/// # use tower_http_cache::error::CacheError;
+/// #[derive(Clone)]
+/// struct MyBackend;
+///
+/// impl CacheBackend for MyBackend {
+///     async fn get(&self, _key: &str) -> Result<Option<CacheRead>, CacheError> {
+///         Ok(None)
+///     }
+///     async fn set(
+///         &self,
+///         _key: String,
+///         _entry: CacheEntry,
+///         _ttl: Duration,
+///         _stale_for: Duration,
+///     ) -> Result<(), CacheError> {
+///         Ok(())
+///     }
+///     async fn invalidate(&self, _key: &str) -> Result<(), CacheError> {
+///         Ok(())
+///     }
+/// }
+/// ```
 pub trait CacheBackend: Send + Sync + Clone + 'static {
     /// Fetches a cached entry by key.
     ///
     /// Returns `Ok(None)` when the backend does not have a value or the
     /// entry has expired.
-    async fn get(&self, key: &str) -> Result<Option<CacheRead>, CacheError>;
+    fn get(&self, key: &str) -> impl Future<Output = Result<Option<CacheRead>, CacheError>> + Send;
 
     /// Stores an entry with a time-to-live and additional stale window.
-    async fn set(
+    fn set(
         &self,
         key: String,
         entry: CacheEntry,
         ttl: Duration,
         stale_for: Duration,
-    ) -> Result<(), CacheError>;
+    ) -> impl Future<Output = Result<(), CacheError>> + Send;
 
     /// Invalidates the cache entry for `key`, if present.
-    async fn invalidate(&self, key: &str) -> Result<(), CacheError>;
+    fn invalidate(&self, key: &str) -> impl Future<Output = Result<(), CacheError>> + Send;
 
     /// Retrieves all cache keys associated with a tag.
     ///
     /// Returns an empty vector if tags are not supported by this backend.
-    async fn get_keys_by_tag(&self, _tag: &str) -> Result<Vec<String>, CacheError> {
-        Ok(Vec::new())
+    fn get_keys_by_tag(
+        &self,
+        _tag: &str,
+    ) -> impl Future<Output = Result<Vec<String>, CacheError>> + Send {
+        async { Ok(Vec::new()) }
     }
 
     /// Invalidates all cache entries associated with a tag.
     ///
     /// Returns the number of entries invalidated.
-    async fn invalidate_by_tag(&self, tag: &str) -> Result<usize, CacheError> {
-        let keys = self.get_keys_by_tag(tag).await?;
-        let count = keys.len();
-        for key in keys {
-            let _ = self.invalidate(&key).await;
+    fn invalidate_by_tag(
+        &self,
+        tag: &str,
+    ) -> impl Future<Output = Result<usize, CacheError>> + Send {
+        async move {
+            let keys = self.get_keys_by_tag(tag).await?;
+            let count = keys.len();
+            for key in keys {
+                let _ = self.invalidate(&key).await;
+            }
+            Ok(count)
         }
-        Ok(count)
     }
 
     /// Invalidates all cache entries associated with multiple tags.
     ///
     /// Returns the total number of entries invalidated (may include duplicates).
-    async fn invalidate_by_tags(&self, tags: &[String]) -> Result<usize, CacheError> {
-        let mut total = 0;
-        for tag in tags {
-            total += self.invalidate_by_tag(tag).await?;
+    fn invalidate_by_tags(
+        &self,
+        tags: &[String],
+    ) -> impl Future<Output = Result<usize, CacheError>> + Send {
+        async move {
+            let mut total = 0;
+            for tag in tags {
+                total += self.invalidate_by_tag(tag).await?;
+            }
+            Ok(total)
         }
-        Ok(total)
     }
 
     /// Lists all currently indexed tags.
     ///
     /// Returns an empty vector if tags are not supported by this backend.
-    async fn list_tags(&self) -> Result<Vec<String>, CacheError> {
-        Ok(Vec::new())
+    fn list_tags(&self) -> impl Future<Output = Result<Vec<String>, CacheError>> + Send {
+        async { Ok(Vec::new()) }
     }
 }
