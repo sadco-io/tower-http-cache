@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-27
+
 ### Changed
 
 - **The on-the-wire cache format changed, and `tags` are now part of it.**
@@ -840,7 +842,8 @@ All v0.3.0 features are opt-in and backward compatible:
 - Benchmark suite with Criterion
 - Examples for Axum and Redis integration
 
-[Unreleased]: https://github.com/sadco-io/tower-http-cache/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/sadco-io/tower-http-cache/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/sadco-io/tower-http-cache/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/sadco-io/tower-http-cache/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/sadco-io/tower-http-cache/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/sadco-io/tower-http-cache/compare/v0.4.3...v0.5.0
@@ -853,26 +856,3 @@ All v0.3.0 features are opt-in and backward compatible:
 [0.1.2]: https://github.com/sadco-io/tower-http-cache/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/sadco-io/tower-http-cache/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/sadco-io/tower-http-cache/releases/tag/v0.1.0
-
-- **Cache tags were silently dropped by the Redis codec.** `BincodeCodec::encode`
-  serialized a private struct with no `tags` field, and `decode` rebuilt the entry
-  through `CacheEntry::new`, which always sets `tags: None`. Tags never crossed the
-  Redis wire. They now do.
-
-### Known issues
-
-- **Tag-based invalidation works only on `InMemoryBackend` (and
-  `MultiTierBackend` over one).** `RedisBackend` and `MemcachedBackend`
-  implement `get`, `set` and `invalidate` only; they keep no reverse tag index,
-  so `invalidate_by_tag` has nothing to iterate. 0.6.0 puts tags *on the wire*,
-  which is a prerequisite for fixing this and means a `CacheRead` from a shared
-  backend now carries the tags the entry was stored with — but it does not add
-  a distributed tag index. `TagIndex` also remains process-local
-  (`Arc<DashMap<..>>`), so even on the in-memory backend, invalidating a tag
-  clears only the calling process's index.
-
-  As of 0.6.0 the shared backends report this explicitly rather than returning
-  a silent `Ok(0)`. A Redis-native tag index (Redis sets, opt-in, with
-  TTL-based garbage collection of stale members) is planned for 0.7.0.
-  Memcached has no set type and will continue to report tags as unsupported.
-

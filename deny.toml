@@ -5,40 +5,18 @@ all-features = true
 
 [advisories]
 yanked = "deny"
-ignore = [
-    # RUSTSEC-2025-0141: bincode 1.3.3 is unmaintained (the team ceased
-    # development permanently in Dec 2025). There is no patched release.
-    # bincode is reachable from the default feature set via `serde`, and it
-    # defines the on-disk / on-wire encoding for the Redis and Memcached
-    # backends -- migrating to bincode 3 or postcard invalidates every live
-    # cache entry, so it is scheduled for 0.6.0 rather than a patch.
-    # See CHANGELOG 0.5.1 "Known issues".
-    "RUSTSEC-2025-0141",
-
-    # The two below are reachable ONLY through the opt-in `memcached-backend`
-    # feature, and only because `async-memcached` declares `toxiproxy_rust` -- a
-    # test fixture -- as a normal dependency, dragging in reqwest 0.11 ->
-    # hyper 0.14 -> h2. One test fixture, three advisories. Still present in
-    # async-memcached 0.7.0, so the planned 0.5 -> 0.7 bump does not fix it.
-    #
-    # RUSTSEC-2026-0258 is a real denial-of-service vulnerability, not an
-    # unmaintained notice. `memcached-backend` is documented as not recommended
-    # for production until this is resolved upstream. Delete both entries the
-    # moment async-memcached moves toxiproxy_rust to [dev-dependencies].
-    "RUSTSEC-2026-0258",  # h2: unbounded empty DATA frames (DoS)
-    "RUSTSEC-2025-0057",  # fxhash: unmaintained
-    "RUSTSEC-2025-0134",  # rustls-pemfile: unmaintained
-]
+# Empty. The four suppressions carried through 0.5.x are gone: RUSTSEC-2025-0141
+# with `bincode` (0.6.0 replaced it with postcard and a hand-written legacy
+# reader), and RUSTSEC-2026-0258, RUSTSEC-2025-0057 and RUSTSEC-2025-0134 with
+# the memcached backend, which took `async-memcached` -> `toxiproxy_rust` ->
+# `reqwest 0.11` out of the graph. Keep it empty: a permanently-ignored advisory
+# trains people to ignore advisories.
+ignore = []
 
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
-skip = [
-    # `memcached-backend` pulls async-memcached, which depends on
-    # toxiproxy_rust unconditionally, which drags in reqwest 0.11 and its
-    # hyper 0.14 / native-tls / openssl subtree. Duplicated against the
-    # modern http stack. Tracked upstream; see CHANGELOG 0.5.1.
-]
+skip = []
 
 [licenses]
 allow = [
