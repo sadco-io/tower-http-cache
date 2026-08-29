@@ -16,8 +16,13 @@ jobs:
     timeout-minutes: 25
     strategy:
       fail-fast: false
+      # The PR run already tested this exact tree -- strict status checks
+      # require the branch to be current with the default branch before it can
+      # merge -- so the post-merge run re-verifies content that just passed.
+      # It still runs, to keep the CI badge and a real smoke signal on the
+      # default branch, but the matrix collapses to one representative leg.
       matrix:
-        rust: [stable, beta]
+        rust: ${{ (github.event_name == 'push' && fromJSON('["stable"]')) || fromJSON('["stable","beta"]') }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
