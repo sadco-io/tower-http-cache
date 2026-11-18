@@ -42,7 +42,6 @@ serde = { version = "1.0.229", features = ["derive"], optional = true }
 serde_json = { version = "1.0.154", optional = true }
 moka = { version = "0.12.16", optional = true, features = ["future"] }
 redis = { version = "1.8.2", features = ["aio", "tokio-comp", "connection-manager"], optional = true }
-tokio-util = { version = "0.7.20", optional = true }
 metrics = { version = "0.24.6", optional = true }
 thiserror = "2.0.21"
 dashmap = "6.2"
@@ -58,7 +57,7 @@ hex = "0.4"
 [features]
 default = ["in-memory", "serde"]
 in-memory = ["moka"]
-redis-backend = ["redis", "tokio-util", "serde"]
+redis-backend = ["redis", "serde"]
 serde = ["dep:serde", "dep:serde_json", "dep:postcard"]
 metrics = ["dep:metrics"]
 tracing = ["dep:tracing"]

@@ -44,7 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`MultiTierBackend` improvements**: `MultiTierBackend::stats(&self)` returns a live `TierStats` snapshot by value (with a new `writes` field), counters are updated across `get`/`set`/promotion, `PromotionStrategy::HitRate` enforces a real 60-second sliding hit window, stale or expiry-less (`expires_at: None`) L2 entries are never promoted to L1, and `invalidate_by_tag` drives deduplicated key invalidation across both tiers without double-counting or leaking tagless L2 copies.
 - **`InMemoryBackend` tag index hygiene**: `set` removes stale prior tags on overwrite, `get` removes tags when a stale window expires, and `get_keys_by_tag` / `list_tags` prune expired or Moka-evicted keys.
 - **Added `#[non_exhaustive]` to public enums**: `StreamingDecision`, `CacheEventType`, `CompressionStrategy`, `PromotionStrategy`, `RangeHandling`, and `CookiePolicy`.
-- **Dependency bumps**: `redis 1.8.2`, `bytes 1.12.2`, `serde 1.0.229`, `serde_json 1.0.154`, `tokio 1.53.3`, `tokio-util 0.7.20`, `metrics 0.24.6`, `thiserror 2.0.21`, `tracing 0.1.44`, `flate2 1.1.11`, and updated `[dev-dependencies]`.
+- **Dependency bumps**: `redis 1.8.2`, `bytes 1.12.2`, `serde 1.0.229`, `serde_json 1.0.154`, `tokio 1.53.3`, `metrics 0.24.6`, `thiserror 2.0.21`, `tracing 0.1.44`, `flate2 1.1.11`, and updated `[dev-dependencies]`.
 
 ### Fixed
 
@@ -55,6 +55,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- **Unused optional `tokio-util` dependency**: removed `tokio-util` from `[dependencies]` and `redis-backend` (dropping the implicit `tokio-util` feature).
 - **0.5.x Redis legacy migration surface**: removed `legacy-bincode1-read` feature flag, `src/codec/legacy.rs`, deprecated `BincodeCodec` alias, `0.5.x` binary fixture files, and legacy envelope fallback branches.
 
 ## [0.6.1] - 2026-08-27
