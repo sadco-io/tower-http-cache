@@ -92,6 +92,7 @@ impl MLLoggingConfig {
 
 /// Types of cache events that can be logged.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum CacheEventType {
@@ -111,6 +112,8 @@ pub enum CacheEventType {
     TierPromote,
     /// Admin API access
     AdminAccess,
+    /// Request bypassed caching
+    Bypass,
 }
 
 /// Structured cache event for ML training.
@@ -281,6 +284,7 @@ impl CacheEvent {
         let log_data = json!({
             "timestamp": crate::time_fmt::format_iso8601_millis(self.timestamp),
             "level": "info",
+            "target": config.target,
             "event": format!("{:?}", self.event_type).to_lowercase(),
             "request_id": self.request_id.as_str(),
             "key": key,
@@ -300,7 +304,7 @@ impl CacheEvent {
 
         #[cfg(feature = "tracing")]
         {
-            // Use fixed target for tracing, but include the configured target in the log data
+            // tracing::info! requires a static target literal; config.target is emitted inside `event`.
             tracing::info!(
                 target: "tower_http_cache::ml",
                 event = %log_data
@@ -309,8 +313,7 @@ impl CacheEvent {
 
         #[cfg(not(feature = "tracing"))]
         {
-            // Fallback to println for non-tracing builds
-            let _ = config; // suppress warning
+            // When the `tracing` feature is disabled, emit structured JSON to stdout.
             println!("{}", log_data);
         }
     }

@@ -43,6 +43,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use http::{StatusCode, Version};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 /// Chunk-based cache entry for large files.
 ///
@@ -59,6 +60,9 @@ pub struct ChunkedEntry {
 
     /// Chunk size in bytes (default: 1MB)
     pub chunk_size: usize,
+
+    /// Optional expiration instant for TTL enforcement.
+    expires_at: Option<SystemTime>,
 }
 
 /// Metadata for a chunked cache entry.
@@ -117,11 +121,25 @@ impl ChunkedEntry {
     /// assert_eq!(entry.chunk_size, 1024 * 1024);
     /// ```
     pub fn new(metadata: ChunkMetadata, chunk_size: usize) -> Self {
+        Self::new_with_expiry(metadata, chunk_size, None)
+    }
+
+    fn new_with_expiry(
+        metadata: ChunkMetadata,
+        chunk_size: usize,
+        expires_at: Option<SystemTime>,
+    ) -> Self {
         Self {
             metadata,
             chunks: Arc::new(DashMap::new()),
             chunk_size,
+            expires_at,
         }
+    }
+
+    /// Returns `true` if this entry has a TTL and has expired.
+    pub fn is_expired(&self) -> bool {
+        self.expires_at.is_some_and(|exp| SystemTime::now() >= exp)
     }
 
     /// Adds a chunk to the entry.
@@ -385,10 +403,41 @@ impl ChunkCache {
     /// let entry = cache.get_or_create("video.mp4".to_string(), metadata);
     /// ```
     pub fn get_or_create(&self, key: String, metadata: ChunkMetadata) -> Arc<ChunkedEntry> {
-        self.entries
-            .entry(key)
-            .or_insert_with(|| Arc::new(ChunkedEntry::new(metadata, self.default_chunk_size)))
-            .clone()
+        self.get_or_create_with_ttl(key, metadata, None)
+    }
+
+    /// Gets or creates an entry with an optional TTL, replacing any expired entry.
+    pub fn get_or_create_with_ttl(
+        &self,
+        key: String,
+        metadata: ChunkMetadata,
+        ttl: Option<Duration>,
+    ) -> Arc<ChunkedEntry> {
+        let expires_at = ttl.map(|d| SystemTime::now() + d);
+        match self.entries.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+                if occupied.get().is_expired() {
+                    let fresh = Arc::new(ChunkedEntry::new_with_expiry(
+                        metadata,
+                        self.default_chunk_size,
+                        expires_at,
+                    ));
+                    occupied.insert(fresh.clone());
+                    fresh
+                } else {
+                    occupied.get().clone()
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                let entry = Arc::new(ChunkedEntry::new_with_expiry(
+                    metadata,
+                    self.default_chunk_size,
+                    expires_at,
+                ));
+                vacant.insert(entry.clone());
+                entry
+            }
+        }
     }
 
     /// Gets an entry if it exists.
@@ -419,7 +468,13 @@ impl ChunkCache {
     /// assert!(cache.get("exists").is_some());
     /// ```
     pub fn get(&self, key: &str) -> Option<Arc<ChunkedEntry>> {
-        self.entries.get(key).map(|r| r.value().clone())
+        let entry = self.entries.get(key).map(|r| r.value().clone())?;
+        if entry.is_expired() {
+            // Remove only if still expired to avoid clobbering a concurrent refresh.
+            self.entries.remove_if(key, |_, v| v.is_expired());
+            return None;
+        }
+        Some(entry)
     }
 
     /// Removes an entry from the cache.
@@ -486,10 +541,16 @@ impl ChunkCache {
         let mut total_chunks = 0;
         let mut total_bytes = 0u64;
         let mut complete_entries = 0;
+        let mut expired_keys = Vec::new();
 
         for entry in self.entries.iter() {
-            total_entries += 1;
             let chunk_entry = entry.value();
+            if chunk_entry.is_expired() {
+                expired_keys.push(entry.key().clone());
+                continue;
+            }
+
+            total_entries += 1;
             let chunk_count = chunk_entry.chunks.len();
             total_chunks += chunk_count;
 
@@ -500,6 +561,10 @@ impl ChunkCache {
             if chunk_entry.is_complete() {
                 complete_entries += 1;
             }
+        }
+
+        for key in expired_keys {
+            self.entries.remove_if(&key, |_, v| v.is_expired());
         }
 
         ChunkCacheStats {
@@ -738,5 +803,34 @@ mod tests {
         assert_eq!(stats.complete_entries, 1); // Only entry1 is complete
         assert_eq!(stats.total_chunks, 3);
         assert_eq!(stats.total_bytes, 3072);
+    }
+
+    #[test]
+    fn test_chunk_cache_ttl_expiry_and_pruning() {
+        let cache = ChunkCache::new(1024);
+        let entry = cache.get_or_create_with_ttl(
+            "short-lived".to_string(),
+            test_metadata(1024),
+            Some(Duration::from_millis(15)),
+        );
+        entry.add_chunk(0, Bytes::from(vec![7u8; 1024]));
+        assert!(cache.get("short-lived").is_some());
+
+        std::thread::sleep(Duration::from_millis(30));
+
+        // Stats and get should prune the expired entry cleanly.
+        let stats = cache.stats();
+        assert_eq!(stats.total_entries, 0);
+        assert_eq!(stats.total_bytes, 0);
+        assert!(cache.get("short-lived").is_none());
+
+        // Creating again with TTL replaces expired entry with fresh metadata.
+        let renewed = cache.get_or_create_with_ttl(
+            "short-lived".to_string(),
+            test_metadata(2048),
+            Some(Duration::from_secs(60)),
+        );
+        assert_eq!(renewed.metadata.total_size, 2048);
+        assert!(cache.get("short-lived").is_some());
     }
 }

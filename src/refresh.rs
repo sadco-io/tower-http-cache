@@ -20,8 +20,8 @@
 
 use dashmap::DashMap;
 use http::{Method, Request, Uri};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{RwLock, Semaphore};
 use tokio::task::JoinHandle;
@@ -152,17 +152,21 @@ impl RefreshMetadata {
     }
 }
 
-/// Lock-free access frequency tracker with time-decay.
+#[derive(Debug)]
+struct WindowState {
+    start_ms: u64,
+    hits: u64,
+}
+
+/// Access frequency tracker with synchronized sliding window reset.
 #[derive(Debug)]
 struct AccessStats {
     /// Total hit count
     hits: AtomicU64,
     /// Last access timestamp (milliseconds since UNIX_EPOCH)
     last_access_ms: AtomicU64,
-    /// First access timestamp in current window (milliseconds since UNIX_EPOCH)
-    window_start_ms: AtomicU64,
-    /// Hits in current window
-    window_hits: AtomicU64,
+    /// Synchronized `(window_start_ms, window_hits)` so window reset is atomic
+    window: Mutex<WindowState>,
 }
 
 impl AccessStats {
@@ -175,8 +179,10 @@ impl AccessStats {
         Self {
             hits: AtomicU64::new(0),
             last_access_ms: AtomicU64::new(now_ms),
-            window_start_ms: AtomicU64::new(now_ms),
-            window_hits: AtomicU64::new(0),
+            window: Mutex::new(WindowState {
+                start_ms: now_ms,
+                hits: 0,
+            }),
         }
     }
 
@@ -189,13 +195,13 @@ impl AccessStats {
         self.hits.fetch_add(1, Ordering::Relaxed);
         self.last_access_ms.store(now_ms, Ordering::Relaxed);
 
-        let window_start = self.window_start_ms.load(Ordering::Relaxed);
-        if now_ms.saturating_sub(window_start) > window_duration_ms {
-            // Reset window
-            self.window_start_ms.store(now_ms, Ordering::Relaxed);
-            self.window_hits.store(1, Ordering::Relaxed);
+        let mut window = self.window.lock().unwrap_or_else(|e| e.into_inner());
+        if now_ms.saturating_sub(window.start_ms) > window_duration_ms {
+            // Reset window atomically with respect to hits_per_minute readers.
+            window.start_ms = now_ms;
+            window.hits = 1;
         } else {
-            self.window_hits.fetch_add(1, Ordering::Relaxed);
+            window.hits = window.hits.saturating_add(1);
         }
     }
 
@@ -205,24 +211,22 @@ impl AccessStats {
             .unwrap_or_default()
             .as_millis() as u64;
 
-        let window_start = self.window_start_ms.load(Ordering::Relaxed);
-        let window_hits = self.window_hits.load(Ordering::Relaxed);
+        let (window_start, window_hits) = {
+            let window = self.window.lock().unwrap_or_else(|e| e.into_inner());
+            (window.start_ms, window.hits)
+        };
 
-        let elapsed_ms = now_ms.saturating_sub(window_start);
-        if elapsed_ms == 0 {
+        if window_hits == 0 {
             return 0.0;
         }
 
-        // Check if window has expired
+        let elapsed_ms = now_ms.saturating_sub(window_start);
         if elapsed_ms > window_duration_ms {
             return 0.0;
         }
 
-        let elapsed_minutes = elapsed_ms as f64 / 60_000.0;
-        if elapsed_minutes == 0.0 {
-            return 0.0;
-        }
-
+        // Treat sub-millisecond bursts as at least 1 ms so burst traffic is measurable.
+        let elapsed_minutes = elapsed_ms.max(1) as f64 / 60_000.0;
         window_hits as f64 / elapsed_minutes
     }
 
@@ -529,6 +533,8 @@ async fn refresh_task<C>(
 
                                     #[cfg(feature = "tracing")]
                                     error!(key = %key_clone, error = %err, "Refresh failed");
+                                    #[cfg(not(feature = "tracing"))]
+                                    let _ = err;
                                 }
                             }
                         }
@@ -770,5 +776,30 @@ mod tests {
         if !candidates.is_empty() {
             assert_eq!(candidates[0].0, "key1");
         }
+    }
+
+    #[test]
+    fn access_stats_submillisecond_burst_and_window_rollover() {
+        let stats = AccessStats::new();
+        assert_eq!(stats.hits_per_minute(1_000), 0.0);
+
+        stats.record_hit(1_000);
+        stats.record_hit(1_000);
+        let rate = stats.hits_per_minute(1_000);
+        assert!(
+            rate > 0.0,
+            "burst traffic should produce non-zero rate, got {rate}"
+        );
+
+        // Force window expiration and verify rollover resets window count atomically.
+        {
+            let mut w = stats.window.lock().unwrap();
+            w.start_ms = w.start_ms.saturating_sub(500);
+        }
+        assert_eq!(stats.hits_per_minute(100), 0.0);
+
+        stats.record_hit(100);
+        let post_rollover = stats.window.lock().unwrap();
+        assert_eq!(post_rollover.hits, 1);
     }
 }

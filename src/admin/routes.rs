@@ -210,7 +210,7 @@ pub fn validate_auth(config: &AdminConfig, auth_header: Option<&str>) -> bool {
     config.validate_token(token)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "in-memory"))]
 mod tests {
     use super::*;
 

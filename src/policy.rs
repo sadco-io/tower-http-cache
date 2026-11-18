@@ -42,6 +42,7 @@ pub struct CachePolicy {
 
 /// Strategy for compressing cached payloads.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub enum CompressionStrategy {
     None,
     Gzip,

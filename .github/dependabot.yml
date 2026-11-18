@@ -24,3 +24,5 @@ updates:
       # The msrv job pins dtolnay/rust-toolchain to exact MSRV toolchains.
       # Bumping the ref rewrites the MSRV floor and makes the job meaningless.
       - dependency-name: "dtolnay/rust-toolchain"
+      # `@v2` / tool pseudo-tags already resolve past patch updates.
+      - dependency-name: "taiki-e/install-action"

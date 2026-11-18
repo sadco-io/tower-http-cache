@@ -127,15 +127,11 @@ async fn redis_backend_reports_tags_unsupported() -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-/// The end-to-end half of the cross-version claim: a value written by 0.5.1,
-/// planted in Redis verbatim, must be a hit for 0.6.0 through the real
-/// `GET` -> `Option<Vec<u8>>` path. The byte-level assertions live in
-/// `tests/wire_compat.rs`; this one exercises the transport.
-///
-/// The reverse direction is asserted too: what 0.6.0 writes must start with
-/// the envelope magic, so `redis-cli --no-raw GET` shows `THC`.
+/// Unrecognised bytes planted in Redis must read cleanly as a miss (`Ok(None)`),
+/// and what `RedisBackend` writes must start with the envelope magic so
+/// `redis-cli --no-raw GET` shows `THC`.
 #[tokio::test]
-async fn redis_reads_a_real_0_5_1_entry_and_writes_the_envelope()
+async fn redis_ignores_unrecognised_bytes_and_writes_the_envelope()
 -> Result<(), Box<dyn std::error::Error>> {
     let redis_url = match std::env::var("REDIS_URL") {
         Ok(url) => url,
@@ -155,28 +151,16 @@ async fn redis_reads_a_real_0_5_1_entry_and_writes_the_envelope()
     let namespace = "thc_xver_test";
     let backend = RedisBackend::new(manager).with_namespace(namespace);
 
-    // A real 0.5.1 Redis value, byte for byte. See tests/fixtures/v0_5_1/.
-    let fixture = std::fs::read(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/v0_5_1/redis_s404_v2_h8_b512_ascii.bin"
-    ))?;
     redis::cmd("SET")
-        .arg(format!("{namespace}:legacy"))
-        .arg(fixture.as_slice())
+        .arg(format!("{namespace}:foreign"))
+        .arg(b"not-a-valid-thc-envelope".as_slice())
         .query_async::<()>(&mut conn)
         .await?;
 
-    let read = backend
-        .get("legacy")
-        .await?
-        .expect("a 0.5.1 entry must still be a hit under 0.6.0");
-    assert_eq!(read.entry.status.as_u16(), 404);
-    assert_eq!(read.entry.version, http::Version::HTTP_2);
-    assert_eq!(read.entry.headers.len(), 8);
-    assert_eq!(read.entry.body.len(), 512);
-    assert_eq!(read.entry.tags, None, "0.5.x redis dropped tags");
+    let read = backend.get("foreign").await?;
+    assert!(read.is_none(), "unrecognised bytes must read as a miss");
 
-    // And what 0.6.0 writes carries the envelope.
+    // And what 0.7.0 writes carries the envelope.
     let entry = CacheEntry::new(
         http::StatusCode::OK,
         http::Version::HTTP_11,

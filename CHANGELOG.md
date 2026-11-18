@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-17
+
+### Added
+
+- **Live wiring for `GlobalStats`, `MLLoggingConfig`, and `ChunkCache` management.**
+  - `CacheLayer::stats()` and `CacheLayerBuilder::stats(...)` expose and share `GlobalStats` across `CacheService` (recording hits, misses, stale hits, stores, and invalidations) and `AdminState::with_stats(...)` under `admin-api`.
+  - `CacheLayer::chunk_cache()`, `CacheLayer::invalidate(...)`, and `CacheLayer::invalidate_by_tag(...)` coordinate backend + chunk-cache invalidation, `GlobalStats`, and structured logging.
+  - `MLLoggingConfig` + `RequestId` (`X-Request-ID` extraction or UUID v4 generation) are now wired into `CacheService::call` (under `serde`) and `CacheEventType::Bypass` was added.
+- **`examples/axum_redis.rs` now mounts `CacheLayer` directly on the Axum `Router`** using `tower::ServiceBuilder` and `axum::error_handling::HandleErrorLayer` (Issue #24).
+- **Suffix range support (`Range: bytes=-N`) and case-insensitive `bytes` unit parsing** in `range::parse_range_header` and `parse_content_range_header`, plus `RangeRequest::suffix(len)`.
+- **`ChunkCache::get_or_create_with_ttl` and `ChunkedEntry::is_expired`** with automatic expiry pruning in `ChunkCache::get` and `ChunkCache::stats`.
+- **`[package.metadata.docs.rs]`** configuration in `Cargo.toml`, an explicit `include` manifest whitelist, and tracked `Cargo.lock`.
+
+### Changed
+
+- **`admin-api` is now framework-agnostic** (`admin-api = ["serde"]`), dropping the unused optional `axum` dependency while keeping `axum` in `[dev-dependencies]` for examples and tests.
+- **Compressed cache entries set `Content-Encoding: gzip` and updated `Content-Length`**, and `CacheService` / auto-refresh skip compression when upstream responses already carry `Content-Encoding`.
+- **`ChunkCache` population now runs only after `should_store` and non-zero `ttl_for` checks succeed**, inherits response TTL, avoids `.unwrap()` panics on 206 construction, and preserves multi-value headers with `append`.
+- **`MultiTierBackend` improvements**: `MultiTierBackend::stats(&self)` returns a live `TierStats` snapshot by value (with a new `writes` field), counters are updated across `get`/`set`/promotion, and `PromotionStrategy::HitRate { threshold_per_minute }` enforces a real 60-second sliding hit window.
+- **`InMemoryBackend` tag index hygiene**: `set` removes stale prior tags on overwrite, `get` removes tags when a stale window expires, and `get_keys_by_tag` / `list_tags` prune expired or Moka-evicted keys.
+- **Added `#[non_exhaustive]` to public enums**: `StreamingDecision`, `CacheEventType`, `CompressionStrategy`, `PromotionStrategy`, and `RangeHandling`.
+- **Dependency bumps**: `redis 1.8.2`, `bytes 1.12.2`, `serde 1.0.229`, `serde_json 1.0.154`, `tokio 1.53.3`, `tokio-util 0.7.20`, `metrics 0.24.6`, `pin-project-lite 0.2.17`, `thiserror 2.0.21`, `tracing 0.1.44`, `flate2 1.1.11`, and updated `[dev-dependencies]`.
+
+### Fixed
+
+- **`AdminConfig` security & redaction**: custom `Debug` redacts `auth_token`, and `AdminConfig::validate_token` compares SHA-256 digests in constant time without accepting missing tokens when `require_auth` is enabled.
+- **`AccessStats` window rollover race & burst calculation** in `refresh.rs` (plus silencing unused `err` when `tracing` is disabled).
+- **`RangeRequest::len()`** now returns `Some(0)` when `end < start` so `is_empty()` reports `true`.
+- **`CacheEvent::log`** includes `"target": config.target` in its structured JSON payload.
+
+### Removed
+
+- **0.5.x Redis legacy migration surface**: removed `legacy-bincode1-read` feature flag, `src/codec/legacy.rs`, deprecated `BincodeCodec` alias, `0.5.x` binary fixture files, and legacy envelope fallback branches.
+
 ## [0.6.1] - 2026-08-27
 
 ### Fixed

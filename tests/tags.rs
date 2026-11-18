@@ -93,3 +93,100 @@ async fn default_tag_policy_leaves_the_index_empty() {
         "tags must stay off unless TagPolicy::enabled is set"
     );
 }
+
+#[tokio::test]
+async fn overwriting_key_removes_old_and_cleared_tags() {
+    let backend = InMemoryBackend::new(32);
+
+    let initial = tower_http_cache::backend::CacheEntry::new(
+        http::StatusCode::OK,
+        http::Version::HTTP_11,
+        Vec::new(),
+        bytes::Bytes::from_static(b"v1"),
+    )
+    .with_tags(vec!["old-tag".to_string(), "shared".to_string()]);
+
+    backend
+        .set(
+            "k1".to_string(),
+            initial,
+            Duration::from_secs(60),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+
+    // Overwrite with a different tag set.
+    let updated = tower_http_cache::backend::CacheEntry::new(
+        http::StatusCode::OK,
+        http::Version::HTTP_11,
+        Vec::new(),
+        bytes::Bytes::from_static(b"v2"),
+    )
+    .with_tags(vec!["new-tag".to_string()]);
+
+    backend
+        .set(
+            "k1".to_string(),
+            updated,
+            Duration::from_secs(60),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+
+    assert!(backend.get_keys_by_tag("old-tag").await.unwrap().is_empty());
+    assert!(backend.get_keys_by_tag("shared").await.unwrap().is_empty());
+    assert_eq!(
+        backend.get_keys_by_tag("new-tag").await.unwrap(),
+        vec!["k1"]
+    );
+    assert_eq!(backend.list_tags().await.unwrap(), vec!["new-tag"]);
+
+    // Overwrite with no tags at all.
+    let untagged = tower_http_cache::backend::CacheEntry::new(
+        http::StatusCode::OK,
+        http::Version::HTTP_11,
+        Vec::new(),
+        bytes::Bytes::from_static(b"v3"),
+    );
+    backend
+        .set(
+            "k1".to_string(),
+            untagged,
+            Duration::from_secs(60),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+
+    assert!(backend.get_keys_by_tag("new-tag").await.unwrap().is_empty());
+    assert!(backend.list_tags().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn expired_entries_are_pruned_from_tag_queries() {
+    let backend = InMemoryBackend::new(32);
+    let entry = tower_http_cache::backend::CacheEntry::new(
+        http::StatusCode::OK,
+        http::Version::HTTP_11,
+        Vec::new(),
+        bytes::Bytes::from_static(b"ephemeral"),
+    )
+    .with_tags(vec!["temp".to_string()]);
+
+    backend
+        .set(
+            "k-exp".to_string(),
+            entry,
+            Duration::from_millis(15),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(35)).await;
+
+    assert!(backend.get_keys_by_tag("temp").await.unwrap().is_empty());
+    assert!(backend.list_tags().await.unwrap().is_empty());
+}

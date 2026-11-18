@@ -5,15 +5,17 @@
 //! a faster L1 cache based on configurable promotion strategies.
 
 use dashmap::DashMap;
-use std::sync::Arc;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use super::{CacheBackend, CacheEntry, CacheRead};
 use crate::error::CacheError;
 
 /// Strategy for promoting entries from L2 to L1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PromotionStrategy {
     /// Promote after a fixed number of hits
     HitCount { threshold: u64 },
@@ -29,12 +31,34 @@ impl Default for PromotionStrategy {
 }
 
 /// Statistics for a cache tier.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TierStats {
     pub l1_hits: u64,
     pub l2_hits: u64,
     pub misses: u64,
     pub promotions: u64,
+    pub writes: u64,
+}
+
+#[derive(Default)]
+struct AtomicTierStats {
+    l1_hits: AtomicU64,
+    l2_hits: AtomicU64,
+    misses: AtomicU64,
+    promotions: AtomicU64,
+    writes: AtomicU64,
+}
+
+impl AtomicTierStats {
+    fn snapshot(&self) -> TierStats {
+        TierStats {
+            l1_hits: self.l1_hits.load(Ordering::Relaxed),
+            l2_hits: self.l2_hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            promotions: self.promotions.load(Ordering::Relaxed),
+            writes: self.writes.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// Configuration for multi-tier caching.
@@ -64,25 +88,53 @@ impl Default for MultiTierConfig {
 /// Per-key statistics for promotion tracking.
 struct KeyStats {
     l2_hits: AtomicU64,
+    recent_hits: Mutex<VecDeque<Instant>>,
 }
 
 impl KeyStats {
     fn new() -> Self {
         Self {
             l2_hits: AtomicU64::new(0),
+            recent_hits: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    fn prune_window(recent: &mut VecDeque<Instant>, now: Instant) {
+        let cutoff = now.checked_sub(Duration::from_secs(60));
+        while let Some(&front) = recent.front() {
+            if cutoff.is_some_and(|c| front < c) {
+                recent.pop_front();
+            } else {
+                break;
+            }
         }
     }
 
     fn record_hit(&self) -> u64 {
+        let now = Instant::now();
+        let mut recent = self.recent_hits.lock().unwrap_or_else(|e| e.into_inner());
+        Self::prune_window(&mut recent, now);
+        recent.push_back(now);
         self.l2_hits.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     fn reset(&self) {
         self.l2_hits.store(0, Ordering::Relaxed);
+        self.recent_hits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     fn hits(&self) -> u64 {
         self.l2_hits.load(Ordering::Relaxed)
+    }
+
+    fn hits_in_last_minute(&self) -> u64 {
+        let now = Instant::now();
+        let mut recent = self.recent_hits.lock().unwrap_or_else(|e| e.into_inner());
+        Self::prune_window(&mut recent, now);
+        recent.len() as u64
     }
 }
 
@@ -96,7 +148,7 @@ pub struct MultiTierBackend<L1, L2> {
     l2: L2,
     config: MultiTierConfig,
     key_stats: Arc<DashMap<String, Arc<KeyStats>>>,
-    tier_stats: Arc<TierStats>,
+    tier_stats: Arc<AtomicTierStats>,
 }
 
 impl<L1, L2> MultiTierBackend<L1, L2>
@@ -111,7 +163,7 @@ where
             l2,
             config: MultiTierConfig::default(),
             key_stats: Arc::new(DashMap::new()),
-            tier_stats: Arc::new(TierStats::default()),
+            tier_stats: Arc::new(AtomicTierStats::default()),
         }
     }
 
@@ -130,9 +182,9 @@ where
         &self.l2
     }
 
-    /// Returns a reference to the current tier statistics.
-    pub fn stats(&self) -> &TierStats {
-        &self.tier_stats
+    /// Returns a snapshot of the current tier statistics.
+    pub fn stats(&self) -> TierStats {
+        self.tier_stats.snapshot()
     }
 
     /// Checks if an entry should be promoted from L2 to L1.
@@ -145,12 +197,8 @@ where
         match self.config.promotion_strategy {
             PromotionStrategy::HitCount { threshold } => stats.hits() >= threshold,
             PromotionStrategy::HitRate {
-                threshold_per_minute: _,
-            } => {
-                // For simplicity, use hit count for now
-                // A full implementation would track timestamps
-                stats.hits() >= 3
-            }
+                threshold_per_minute,
+            } => stats.hits_in_last_minute() >= threshold_per_minute,
         }
     }
 
@@ -191,6 +239,7 @@ where
     async fn get(&self, key: &str) -> Result<Option<CacheRead>, CacheError> {
         // Try L1 first
         if let Some(entry) = self.l1.get(key).await? {
+            self.tier_stats.l1_hits.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "metrics")]
             metrics::counter!("tower_http_cache.tier.l1_hit").increment(1);
             return Ok(Some(entry));
@@ -198,6 +247,7 @@ where
 
         // Try L2
         if let Some(read) = self.l2.get(key).await? {
+            self.tier_stats.l2_hits.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "metrics")]
             metrics::counter!("tower_http_cache.tier.l2_hit").increment(1);
 
@@ -215,6 +265,7 @@ where
                 };
 
                 if should_promote_l1 {
+                    self.tier_stats.promotions.fetch_add(1, Ordering::Relaxed);
                     #[cfg(feature = "metrics")]
                     metrics::counter!("tower_http_cache.tier.promoted").increment(1);
 
@@ -264,6 +315,7 @@ where
             return Ok(Some(read));
         }
 
+        self.tier_stats.misses.fetch_add(1, Ordering::Relaxed);
         Ok(None)
     }
 
@@ -280,6 +332,7 @@ where
         self.l2
             .set(key.clone(), entry.clone(), ttl, stale_for)
             .await?;
+        self.tier_stats.writes.fetch_add(1, Ordering::Relaxed);
 
         // Optionally write to L1 if write-through is enabled and size is acceptable
         if self.config.write_through {
@@ -460,7 +513,7 @@ impl<L1, L2> MultiTierBuilder<L1, L2> {
             l2: self.l2.expect("L2 backend is required"),
             config: self.config,
             key_stats: Arc::new(DashMap::new()),
-            tier_stats: Arc::new(TierStats::default()),
+            tier_stats: Arc::new(AtomicTierStats::default()),
         }
     }
 }
@@ -640,6 +693,84 @@ mod tests {
 
         // Should be promoted to L1
         assert!(l1.get("key").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn tier_stats_tracks_hits_misses_writes_and_promotions() {
+        let l1 = InMemoryBackend::new(100);
+        let l2 = InMemoryBackend::new(1000);
+
+        let backend = MultiTierBackend::builder()
+            .l1(l1.clone())
+            .l2(l2.clone())
+            .write_through(false)
+            .promotion_threshold(2)
+            .build();
+
+        // Write goes only to L2 when write_through = false.
+        backend
+            .set(
+                "hot".to_string(),
+                test_entry(),
+                Duration::from_secs(60),
+                Duration::ZERO,
+            )
+            .await
+            .unwrap();
+
+        // 1 miss
+        assert!(backend.get("missing").await.unwrap().is_none());
+
+        // 2 L2 hits -> triggers promotion
+        assert!(backend.get("hot").await.unwrap().is_some());
+        assert!(backend.get("hot").await.unwrap().is_some());
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // 1 L1 hit
+        assert!(backend.get("hot").await.unwrap().is_some());
+
+        let stats = backend.stats();
+        assert_eq!(stats.writes, 1);
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.l2_hits, 2);
+        assert_eq!(stats.promotions, 1);
+        assert_eq!(stats.l1_hits, 1);
+    }
+
+    #[tokio::test]
+    async fn promotion_strategy_hit_rate_enforces_configured_threshold() {
+        let l1 = InMemoryBackend::new(100);
+        let l2 = InMemoryBackend::new(1000);
+
+        let backend = MultiTierBackend::builder()
+            .l1(l1.clone())
+            .l2(l2.clone())
+            .promotion_strategy(PromotionStrategy::HitRate {
+                threshold_per_minute: 5,
+            })
+            .build();
+
+        l2.set(
+            "rate-key".to_string(),
+            test_entry(),
+            Duration::from_secs(60),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+
+        // 4 hits within 60s must NOT promote yet (threshold is 5/min).
+        for _ in 0..4 {
+            assert!(backend.get("rate-key").await.unwrap().is_some());
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(l1.get("rate-key").await.unwrap().is_none());
+
+        // 5th hit within 60s triggers promotion.
+        assert!(backend.get("rate-key").await.unwrap().is_some());
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(l1.get("rate-key").await.unwrap().is_some());
     }
 }
 

@@ -13,8 +13,6 @@
 //! [`CacheCodec`]; the envelope is applied by the backend.
 
 pub mod envelope;
-#[cfg(feature = "legacy-bincode1-read")]
-pub mod legacy;
 
 use bytes::Bytes;
 use http::{StatusCode, Version};
@@ -50,13 +48,6 @@ pub trait CacheCodec: Send + Sync + Clone + 'static {
 /// `tags`, which the previous codec silently dropped.
 #[derive(Clone, Default)]
 pub struct PostcardCodec;
-
-/// Former name of [`PostcardCodec`].
-#[deprecated(
-    since = "0.6.0",
-    note = "renamed to PostcardCodec; the default wire format is now postcard inside a versioned envelope, not bare bincode"
-)]
-pub type BincodeCodec = PostcardCodec;
 
 #[derive(Serialize, Deserialize)]
 struct StoredEntry {

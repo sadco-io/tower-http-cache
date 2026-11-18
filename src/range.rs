@@ -26,23 +26,50 @@ use http::{HeaderMap, HeaderValue, StatusCode};
 /// typically from the HTTP Range header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RangeRequest {
-    /// Starting byte offset (inclusive)
+    /// Starting byte offset (inclusive). For unresolved suffix ranges, this is 0 until normalized.
     pub start: u64,
 
-    /// Ending byte offset (inclusive), or None for "to end of file"
+    /// Ending byte offset (inclusive), or None for "to end of file" (or unresolved suffix range).
     pub end: Option<u64>,
+
+    /// Optional suffix byte count from `Range: bytes=-N`.
+    suffix_len: Option<u64>,
 }
 
 impl RangeRequest {
     /// Creates a new range request.
     pub fn new(start: u64, end: Option<u64>) -> Self {
-        Self { start, end }
+        Self {
+            start,
+            end,
+            suffix_len: None,
+        }
     }
 
-    /// Returns the length of this range in bytes, if both start and end are known.
+    /// Creates a suffix range request representing `Range: bytes=-<len>`.
+    pub fn suffix(len: u64) -> Self {
+        Self {
+            start: 0,
+            end: None,
+            suffix_len: Some(len),
+        }
+    }
+
+    /// Returns the length of this range in bytes, if both start and end are known
+    /// (or if this is a suffix range).
+    ///
+    /// Returns `Some(0)` if `end < start`.
     pub fn len(&self) -> Option<u64> {
-        self.end
-            .map(|end| end.saturating_sub(self.start).saturating_add(1))
+        if let Some(suffix_len) = self.suffix_len {
+            return Some(suffix_len);
+        }
+        self.end.map(|end| {
+            if end < self.start {
+                0
+            } else {
+                end - self.start + 1
+            }
+        })
     }
 
     /// Returns true if this is an empty range.
@@ -54,6 +81,9 @@ impl RangeRequest {
     ///
     /// Returns true if the range is satisfiable (within bounds).
     pub fn is_satisfiable(&self, total_size: u64) -> bool {
+        if let Some(suffix_len) = self.suffix_len {
+            return suffix_len > 0 && total_size > 0;
+        }
         if self.start >= total_size {
             return false;
         }
@@ -67,10 +97,20 @@ impl RangeRequest {
         true
     }
 
-    /// Normalizes the range to have a definite end based on total size.
+    /// Normalizes the range to have concrete start and end bounds based on total size.
     pub fn normalize(&self, total_size: u64) -> Option<Self> {
         if !self.is_satisfiable(total_size) {
             return None;
+        }
+
+        if let Some(suffix_len) = self.suffix_len {
+            let start = total_size.saturating_sub(suffix_len);
+            let end = total_size.saturating_sub(1);
+            return Some(Self {
+                start,
+                end: Some(end),
+                suffix_len: None,
+            });
         }
 
         let end = self.end.unwrap_or(total_size.saturating_sub(1));
@@ -79,12 +119,14 @@ impl RangeRequest {
         Some(Self {
             start: self.start,
             end: Some(end),
+            suffix_len: None,
         })
     }
 }
 
 /// Policy for handling range requests in the cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum RangeHandling {
     /// Pass through range requests without caching (default, simplest)
     #[default]
@@ -129,34 +171,37 @@ pub fn parse_range_header(headers: &HeaderMap) -> Option<RangeRequest> {
     let range_header = headers.get(http::header::RANGE)?;
     let range_str = range_header.to_str().ok()?;
 
-    // Must start with "bytes="
-    if !range_str.starts_with("bytes=") {
+    // Must start with "bytes=" (case-insensitive unit per RFC 9110)
+    let (unit, range_spec) = range_str.trim().split_once('=')?;
+    if !unit.trim().eq_ignore_ascii_case("bytes") {
         return None;
     }
-
-    // Extract the range specification
-    let range_spec = &range_str[6..]; // Skip "bytes="
 
     // Split on comma to get first range (we only support single ranges for now)
     let first_range = range_spec.split(',').next()?;
 
-    // Parse "start-end" format
+    // Parse "start-end" or suffix "-len" format
     let parts: Vec<&str> = first_range.split('-').collect();
     if parts.len() != 2 {
         return None;
     }
 
-    // Parse start
-    let start = parts[0].trim().parse::<u64>().ok()?;
+    let start_str = parts[0].trim();
+    let end_str = parts[1].trim();
 
-    // Parse end (optional)
-    let end = if parts[1].trim().is_empty() {
+    if start_str.is_empty() {
+        let suffix_len = end_str.parse::<u64>().ok()?;
+        return Some(RangeRequest::suffix(suffix_len));
+    }
+
+    let start = start_str.parse::<u64>().ok()?;
+    let end = if end_str.is_empty() {
         None
     } else {
-        Some(parts[1].trim().parse::<u64>().ok()?)
+        Some(end_str.parse::<u64>().ok()?)
     };
 
-    Some(RangeRequest { start, end })
+    Some(RangeRequest::new(start, end))
 }
 
 /// Checks if a response status code indicates a partial content response.
@@ -190,12 +235,12 @@ pub fn parse_content_range_header(headers: &HeaderMap) -> Option<(u64, u64, u64)
     let content_range = headers.get(http::header::CONTENT_RANGE)?;
     let range_str = content_range.to_str().ok()?;
 
-    // Format: "bytes start-end/total"
-    if !range_str.starts_with("bytes ") {
+    // Format: "bytes start-end/total" (case-insensitive unit)
+    let (unit, range_spec) = range_str.trim().split_once(' ')?;
+    if !unit.eq_ignore_ascii_case("bytes") {
         return None;
     }
 
-    let range_spec = &range_str[6..]; // Skip "bytes "
     let parts: Vec<&str> = range_spec.split('/').collect();
     if parts.len() != 2 {
         return None;
@@ -332,14 +377,17 @@ mod tests {
 
     #[test]
     fn test_range_request_is_empty() {
-        let empty_range = RangeRequest::new(0, Some(0));
-        assert!(!empty_range.is_empty()); // 0-0 is actually 1 byte
+        let non_empty_range = RangeRequest::new(0, Some(0));
+        assert!(!non_empty_range.is_empty()); // 0-0 is 1 byte
 
-        let range = RangeRequest::new(100, Some(99)); // Invalid range
-        let len = range.len();
-        // This is actually an invalid range, len would be computed incorrectly
-        // In practice, is_satisfiable would catch this
-        assert!(len.is_some());
+        let inverted_range = RangeRequest::new(100, Some(99));
+        assert_eq!(inverted_range.len(), Some(0));
+        assert!(inverted_range.is_empty());
+
+        let zero_suffix = RangeRequest::suffix(0);
+        assert_eq!(zero_suffix.len(), Some(0));
+        assert!(zero_suffix.is_empty());
+        assert!(!zero_suffix.is_satisfiable(1024));
     }
 
     #[test]
@@ -366,5 +414,43 @@ mod tests {
         let range = parse_range_header(&headers).unwrap();
         assert_eq!(range.start, 0);
         assert_eq!(range.end, Some(1023));
+    }
+
+    #[test]
+    fn test_parse_range_case_insensitive_and_suffix() {
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::RANGE, "BYTES=-512".parse().unwrap());
+
+        let range = parse_range_header(&headers).unwrap();
+        assert_eq!(range.len(), Some(512));
+        assert!(range.is_satisfiable(1024));
+
+        let normalized = range.normalize(1024).unwrap();
+        assert_eq!(normalized.start, 512);
+        assert_eq!(normalized.end, Some(1023));
+        assert_eq!(normalized.len(), Some(512));
+
+        // Suffix longer than total resource clamps start to 0
+        let normalized_small = range.normalize(200).unwrap();
+        assert_eq!(normalized_small.start, 0);
+        assert_eq!(normalized_small.end, Some(199));
+
+        // bytes=-0 parses but is empty / unsatisfiable
+        let mut zero_headers = HeaderMap::new();
+        zero_headers.insert(http::header::RANGE, "Bytes=-0".parse().unwrap());
+        let zero = parse_range_header(&zero_headers).unwrap();
+        assert!(zero.is_empty());
+        assert!(!zero.is_satisfiable(1024));
+
+        // Case-insensitive Content-Range unit
+        let mut cr_headers = HeaderMap::new();
+        cr_headers.insert(
+            http::header::CONTENT_RANGE,
+            "Bytes 512-1023/1024".parse().unwrap(),
+        );
+        assert_eq!(
+            parse_content_range_header(&cr_headers),
+            Some((512, 1023, 1024))
+        );
     }
 }

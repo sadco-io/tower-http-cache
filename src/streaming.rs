@@ -11,17 +11,13 @@ use crate::range::RangeHandling;
 
 /// Decision on how to handle a response body based on size and content type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(clippy::manual_non_exhaustive)]
+#[non_exhaustive]
 pub enum StreamingDecision {
     /// Buffer the body and cache it (small enough, appropriate type)
     Buffer,
 
     /// Skip caching entirely (too large or excluded content type)
     SkipCache,
-
-    /// Stream the body without buffering (reserved for future use).
-    #[doc(hidden)]
-    StreamThrough,
 
     /// Try to stream if possible, fallback to buffer (unknown size)
     StreamIfPossible,

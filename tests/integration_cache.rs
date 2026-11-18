@@ -868,15 +868,32 @@ async fn compression_caches_gzip_payloads() {
     assert_eq!(first_text, payload);
 
     service.ready().await.expect("service ready");
-    let cached = service
+    let cached_response = service
         .call(Request::new(()))
         .await
-        .expect("cached call succeeds")
+        .expect("cached call succeeds");
+    assert_eq!(
+        cached_response
+            .headers()
+            .get(http::header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok()),
+        Some("gzip"),
+        "compressed cached response must set Content-Encoding: gzip"
+    );
+    let advertised_len: usize = cached_response
+        .headers()
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .expect("compressed cached response must update Content-Length");
+
+    let cached = cached_response
         .into_body()
         .collect()
         .await
         .expect("cached body collected")
         .to_bytes();
+    assert_eq!(advertised_len, cached.len());
     assert_ne!(
         cached,
         Bytes::copy_from_slice(payload.as_bytes()),
@@ -890,4 +907,300 @@ async fn compression_caches_gzip_payloads() {
         .expect("gzip decode succeeds");
     assert_eq!(decompressed, payload);
     assert_eq!(counter.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(feature = "compression")]
+#[tokio::test]
+async fn compression_skips_pre_encoded_upstream_responses() {
+    use tower_http_cache::policy::{CompressionConfig, CompressionStrategy};
+
+    let backend = InMemoryBackend::new(128);
+    let layer = CacheLayer::builder(backend)
+        .ttl(Duration::from_secs(10))
+        .compression(CompressionConfig {
+            strategy: CompressionStrategy::Gzip,
+            min_size: 0,
+        })
+        .build();
+
+    let pre_encoded = Bytes::from_static(b"synthetic-brotli-payload-bytes-1234567890");
+    let expected_len = pre_encoded.len();
+
+    let mut service = layer.layer(service_fn({
+        let pre_encoded = pre_encoded.clone();
+        move |_req: Request<()>| {
+            let body = pre_encoded.clone();
+            async move {
+                Ok::<_, Infallible>(
+                    http::Response::builder()
+                        .header(http::header::CONTENT_ENCODING, "br")
+                        .header(http::header::CONTENT_LENGTH, body.len().to_string())
+                        .body(Full::from(body))
+                        .expect("response builder"),
+                )
+            }
+        }
+    }));
+
+    service.ready().await.expect("service ready");
+    let _first = service
+        .call(Request::new(()))
+        .await
+        .expect("first call succeeds")
+        .into_body()
+        .collect()
+        .await
+        .expect("first body");
+
+    service.ready().await.expect("service ready");
+    let cached_response = service
+        .call(Request::new(()))
+        .await
+        .expect("cached call succeeds");
+    assert_eq!(
+        cached_response
+            .headers()
+            .get(http::header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok()),
+        Some("br"),
+        "pre-encoded response must keep its original Content-Encoding"
+    );
+    assert_eq!(
+        cached_response
+            .headers()
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<usize>().ok()),
+        Some(expected_len),
+    );
+    let cached_body = cached_response
+        .into_body()
+        .collect()
+        .await
+        .expect("cached body")
+        .to_bytes();
+    assert_eq!(cached_body, pre_encoded);
+}
+
+#[cfg(feature = "admin-api")]
+#[tokio::test]
+async fn admin_state_receives_live_layer_statistics_and_invalidations() {
+    use tower_http_cache::admin::routes::{
+        InvalidationRequest, handle_hot_keys, handle_invalidate, handle_stats,
+    };
+    use tower_http_cache::admin::{AdminConfig, AdminState};
+
+    let backend = InMemoryBackend::new(64);
+    let layer = CacheLayer::builder(backend.clone())
+        .ttl(Duration::from_secs(60))
+        .build();
+    let admin_state = AdminState::with_stats(backend, AdminConfig::new(), layer.stats());
+
+    let mut service = layer.layer(service_fn(|_req: Request<()>| async move {
+        Ok::<_, Infallible>(http::Response::new(Full::from("admin-observed")))
+    }));
+
+    // 1 miss + 1 store
+    let req1 = Request::builder().uri("/items/1").body(()).unwrap();
+    let _ = service
+        .ready()
+        .await
+        .unwrap()
+        .call(req1)
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap();
+
+    // 2 hits
+    for _ in 0..2 {
+        let req = Request::builder().uri("/items/1").body(()).unwrap();
+        let _ = service
+            .ready()
+            .await
+            .unwrap()
+            .call(req)
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap();
+    }
+
+    let stats_resp = handle_stats(&admin_state);
+    assert_eq!(stats_resp.cache.misses, 1);
+    assert_eq!(stats_resp.cache.stores, 1);
+    assert_eq!(stats_resp.cache.hits, 2);
+    assert_eq!(stats_resp.cache.total_requests, 3);
+
+    let hot = handle_hot_keys(&admin_state, Some(5));
+    assert_eq!(hot.hot_keys.len(), 1);
+    assert_eq!(hot.hot_keys[0].key, "/items/1");
+    assert_eq!(hot.hot_keys[0].hits, 2);
+
+    // Layer invalidation increments GlobalStats
+    layer.invalidate("/items/1").await.unwrap();
+    let after_layer_inv = handle_stats(&admin_state);
+    assert_eq!(after_layer_inv.cache.invalidations, 1);
+
+    // Admin handler invalidation also increments shared GlobalStats
+    let inv_resp = handle_invalidate(
+        &admin_state,
+        InvalidationRequest {
+            key: Some("/items/other".to_string()),
+            tag: None,
+            tags: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(inv_resp.success);
+    assert_eq!(handle_stats(&admin_state).cache.invalidations, 2);
+}
+
+#[cfg(feature = "serde")]
+#[tokio::test]
+async fn ml_logging_records_hit_miss_store_and_bypass_without_errors() {
+    use tower_http_cache::logging::MLLoggingConfig;
+    use tower_http_cache::policy::CachePolicy;
+
+    let backend = InMemoryBackend::new(64);
+    let policy = CachePolicy::default()
+        .with_ttl(Duration::from_secs(60))
+        .with_ml_logging(
+            MLLoggingConfig::new()
+                .with_enabled(true)
+                .with_sample_rate(1.0)
+                .with_hash_keys(false),
+        );
+
+    let layer = CacheLayer::builder(backend).policy(policy).build();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let mut service = layer.layer(service_fn({
+        let hits = hits.clone();
+        move |_req: Request<()>| {
+            let hits = hits.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, Infallible>(http::Response::new(Full::from("ml-logged")))
+            }
+        }
+    }));
+
+    // Miss + store with explicit X-Request-ID
+    let req1 = Request::builder()
+        .uri("/ml-test")
+        .header("x-request-id", "req-abc-123")
+        .body(())
+        .unwrap();
+    let _ = service
+        .ready()
+        .await
+        .unwrap()
+        .call(req1)
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap();
+
+    // Hit
+    let req2 = Request::builder().uri("/ml-test").body(()).unwrap();
+    let _ = service
+        .ready()
+        .await
+        .unwrap()
+        .call(req2)
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap();
+
+    // Bypass (POST)
+    let req3 = Request::builder()
+        .method(http::Method::POST)
+        .uri("/ml-test")
+        .body(())
+        .unwrap();
+    let _ = service
+        .ready()
+        .await
+        .unwrap()
+        .call(req3)
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap();
+
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn axum_router_caches_with_handle_error_layer() {
+    use axum::{Router, body::Body, error_handling::HandleErrorLayer, routing::get};
+    use tower::{ServiceBuilder, ServiceExt};
+    use tower_http_cache::layer::BoxError;
+
+    let backend = InMemoryBackend::new(64);
+    let cache_layer = CacheLayer::builder(backend)
+        .ttl(Duration::from_secs(60))
+        .build();
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route(
+            "/hello",
+            get({
+                let hits = hits.clone();
+                move || {
+                    let hits = hits.clone();
+                    async move {
+                        let count = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                        format!("hit-{count}")
+                    }
+                }
+            }),
+        )
+        .layer(
+            ServiceBuilder::new()
+                .layer(HandleErrorLayer::new(|err: BoxError| async move {
+                    (StatusCode::INTERNAL_SERVER_ERROR, format!("err: {err}"))
+                }))
+                .layer(cache_layer),
+        );
+
+    let r1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/hello")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let b1 = r1.into_body().collect().await.unwrap().to_bytes();
+
+    let r2 = app
+        .oneshot(
+            Request::builder()
+                .uri("/hello")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let b2 = r2.into_body().collect().await.unwrap().to_bytes();
+
+    assert_eq!(&b1[..], b"hit-1");
+    assert_eq!(&b2[..], b"hit-1");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
 }

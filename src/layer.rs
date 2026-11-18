@@ -11,7 +11,7 @@ use dashmap::mapref::entry::Entry;
 use http::header::{CACHE_CONTROL, PRAGMA};
 use http::{HeaderMap, Method, Request, Response, Uri};
 use http_body::Body;
-use http_body_util::combinators::BoxBody;
+use http_body_util::combinators::{BoxBody, UnsyncBoxBody};
 use http_body_util::{BodyExt, Full};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tower::{Layer, Service, ServiceExt};
@@ -19,15 +19,21 @@ use tower::{Layer, Service, ServiceExt};
 #[cfg(feature = "metrics")]
 use metrics::{counter, histogram};
 
+#[cfg(feature = "admin-api")]
+use crate::admin::stats::GlobalStats;
 #[cfg(feature = "in-memory")]
 use crate::backend::memory::InMemoryBackend;
 use crate::backend::{CacheBackend, CacheEntry, CacheRead};
-use crate::chunks::{ChunkCache, ChunkMetadata};
+use crate::chunks::{ChunkCache, ChunkMetadata, ChunkedEntry};
+#[cfg(feature = "serde")]
+use crate::logging::{CacheEvent, CacheEventType, MLLoggingConfig};
 #[cfg(feature = "compression")]
 use crate::policy::CompressionStrategy;
 use crate::policy::{CachePolicy, CompressionConfig};
 use crate::range::{RangeHandling, is_partial_content, parse_range_header};
 use crate::refresh::{AutoRefreshConfig, RefreshCallback, RefreshManager, RefreshMetadata};
+#[cfg(feature = "serde")]
+use crate::request_id::RequestId;
 #[cfg(feature = "tracing")]
 use crate::streaming::extract_size_info;
 use crate::streaming::{StreamingDecision, should_stream};
@@ -42,27 +48,30 @@ pub type BoxError = Box<dyn StdError + Send + Sync>;
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
 pin_project_lite::pin_project! {
-    /// Response body type that implements Sync for Axum compatibility.
-    ///
-    /// This wraps BoxBody and manually implements Sync using the same pattern as Axum.
-    /// See the `unsafe impl Sync` below for the safety justification.
+    /// Response body type that implements [`Sync`] for Axum and Tower compatibility,
+    /// including when wrapping `!Sync` upstream response bodies such as `axum::body::Body`.
     pub struct SyncBoxBody {
-        #[pin]
-        inner: BoxBody<Bytes, BoxError>,
+        inner: std::sync::Mutex<UnsyncBoxBody<Bytes, BoxError>>,
     }
 }
 
 impl SyncBoxBody {
-    /// Creates a new SyncBoxBody by wrapping a BoxBody.
+    /// Creates a new [`SyncBoxBody`] by wrapping a [`BoxBody`].
     pub fn new(inner: BoxBody<Bytes, BoxError>) -> Self {
-        Self { inner }
+        Self::from_body(inner)
+    }
+
+    /// Wraps any `Send + 'static` HTTP body (including `!Sync` bodies) in a [`Sync`] wrapper.
+    pub fn from_body<B>(body: B) -> Self
+    where
+        B: Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<BoxError>,
+    {
+        Self {
+            inner: std::sync::Mutex::new(body.map_err(Into::into).boxed_unsync()),
+        }
     }
 }
-
-// SAFETY: The inner BoxBody is Send + 'static. Access to the body is exclusively through
-// poll_frame which requires Pin<&mut Self>, preventing concurrent access without external
-// synchronization. This is the same pattern used by Axum's own Body type.
-unsafe impl Sync for SyncBoxBody {}
 
 impl Body for SyncBoxBody {
     type Data = Bytes;
@@ -72,15 +81,26 @@ impl Body for SyncBoxBody {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        self.project().inner.poll_frame(cx)
+        let mut inner = self
+            .get_mut()
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        Pin::new(&mut *inner).poll_frame(cx)
     }
 
     fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_end_stream()
     }
 
     fn size_hint(&self) -> http_body::SizeHint {
-        self.inner.size_hint()
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .size_hint()
     }
 }
 
@@ -103,6 +123,8 @@ pub struct CacheLayer<B> {
     locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
     refresh_manager: Option<Arc<RefreshManager>>,
     chunk_cache: Option<Arc<ChunkCache>>,
+    #[cfg(feature = "admin-api")]
+    stats: Arc<GlobalStats>,
 }
 
 /// Strategy used to turn requests into cache keys.
@@ -175,6 +197,8 @@ pub struct CacheLayerBuilder<B> {
     policy: CachePolicy,
     key_extractor: KeyExtractor,
     auto_refresh_config: Option<AutoRefreshConfig>,
+    #[cfg(feature = "admin-api")]
+    stats: Option<Arc<GlobalStats>>,
 }
 
 impl<B> CacheLayerBuilder<B>
@@ -187,6 +211,8 @@ where
             policy: CachePolicy::default(),
             key_extractor: KeyExtractor::default(),
             auto_refresh_config: None,
+            #[cfg(feature = "admin-api")]
+            stats: None,
         }
     }
 
@@ -279,6 +305,14 @@ where
         self
     }
 
+    /// Attaches a shared [`GlobalStats`] tracker so cache hits, misses,
+    /// stores, and invalidations are surfaced through the admin API.
+    #[cfg(feature = "admin-api")]
+    pub fn stats(mut self, stats: Arc<GlobalStats>) -> Self {
+        self.stats = Some(stats);
+        self
+    }
+
     pub fn build(self) -> CacheLayer<B> {
         let refresh_manager = self
             .auto_refresh_config
@@ -301,6 +335,8 @@ where
             locks: Arc::new(DashMap::new()),
             refresh_manager,
             chunk_cache,
+            #[cfg(feature = "admin-api")]
+            stats: self.stats.unwrap_or_else(|| Arc::new(GlobalStats::new())),
         }
     }
 }
@@ -404,6 +440,69 @@ where
         self
     }
 
+    /// Returns the shared [`ChunkCache`] instance if chunk caching is enabled.
+    pub fn chunk_cache(&self) -> Option<&Arc<ChunkCache>> {
+        self.chunk_cache.as_ref()
+    }
+
+    /// Returns the shared [`GlobalStats`] tracker wired into services produced by this layer.
+    #[cfg(feature = "admin-api")]
+    pub fn stats(&self) -> Arc<GlobalStats> {
+        Arc::clone(&self.stats)
+    }
+
+    /// Invalidates a single key across both the configured backend and the in-memory chunk cache.
+    pub async fn invalidate(&self, key: &str) -> Result<(), crate::error::CacheError> {
+        if let Some(ref chunk_cache) = self.chunk_cache {
+            chunk_cache.remove(key);
+        }
+        self.backend.invalidate(key).await?;
+        #[cfg(feature = "admin-api")]
+        self.stats.record_invalidation();
+        #[cfg(feature = "serde")]
+        {
+            let ml_config = self.policy.ml_logging();
+            if ml_config.enabled {
+                CacheEvent::new(
+                    CacheEventType::Invalidate,
+                    RequestId::new(),
+                    key.to_string(),
+                )
+                .log(ml_config);
+            }
+        }
+        Ok(())
+    }
+
+    /// Invalidates all entries associated with `tag` across the backend and chunk cache.
+    pub async fn invalidate_by_tag(&self, tag: &str) -> Result<usize, crate::error::CacheError> {
+        if let Some(ref chunk_cache) = self.chunk_cache {
+            if let Ok(keys) = self.backend.get_keys_by_tag(tag).await {
+                for key in keys {
+                    chunk_cache.remove(&key);
+                }
+            }
+        }
+        let count = self.backend.invalidate_by_tag(tag).await?;
+        #[cfg(feature = "admin-api")]
+        for _ in 0..count {
+            self.stats.record_invalidation();
+        }
+        #[cfg(feature = "serde")]
+        {
+            let ml_config = self.policy.ml_logging();
+            if ml_config.enabled {
+                CacheEvent::new(
+                    CacheEventType::TagInvalidate,
+                    RequestId::new(),
+                    tag.to_string(),
+                )
+                .log(ml_config);
+            }
+        }
+        Ok(count)
+    }
+
     /// Manually initialize the auto-refresh manager with a service instance.
     ///
     /// This should be called after constructing the service to start the background
@@ -456,6 +555,8 @@ where
             locks: self.locks.clone(),
             refresh_manager: self.refresh_manager.clone(),
             chunk_cache: self.chunk_cache.clone(),
+            #[cfg(feature = "admin-api")]
+            stats: self.stats.clone(),
         }
     }
 }
@@ -486,6 +587,8 @@ pub struct CacheService<S, B> {
     locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
     refresh_manager: Option<Arc<RefreshManager>>,
     chunk_cache: Option<Arc<ChunkCache>>,
+    #[cfg(feature = "admin-api")]
+    stats: Arc<GlobalStats>,
 }
 
 /// Implementation of RefreshCallback for CacheService.
@@ -579,9 +682,8 @@ where
             if let Some(ttl) = policy.ttl_for(parts.status) {
                 if !ttl.is_zero() {
                     let stale_for = policy.stale_while_revalidate();
-                    let headers_to_cache = policy.headers_to_cache(&parts.headers);
-                    let (compressed_bytes, _compressed) =
-                        maybe_compress(cache_bytes, policy.compression());
+                    let (compressed_bytes, headers_to_cache, _compressed) =
+                        prepare_cached_payload_and_headers(&parts.headers, &policy, cache_bytes);
 
                     let entry = CacheEntry::new(
                         parts.status,
@@ -620,7 +722,7 @@ where
     S::Future: Send + 'static,
     S::Error: Into<BoxError> + Send,
     ReqBody: Send + 'static,
-    ResBody: Body<Data = Bytes> + Send + Sync + 'static,
+    ResBody: Body<Data = Bytes> + Send + 'static,
     ResBody::Error: Into<BoxError> + Send,
     B: CacheBackend,
 {
@@ -652,6 +754,12 @@ where
         let refresh_before = policy.refresh_before();
         let refresh_manager = self.refresh_manager.clone();
         let chunk_cache = self.chunk_cache.clone();
+        #[cfg(feature = "admin-api")]
+        let stats = self.stats.clone();
+        #[cfg(feature = "serde")]
+        let ml_ctx = MlLogContext::from_request(policy.ml_logging(), &req);
+        #[cfg(feature = "serde")]
+        let call_start = ml_ctx.as_ref().map(|_| std::time::Instant::now());
 
         // Check for range request early
         let range_request = parse_range_header(req.headers());
@@ -667,6 +775,14 @@ where
             #[cfg(feature = "tracing")]
             tracing::debug!(method = %method, uri = %uri, "cache_call");
 
+            #[cfg(feature = "serde")]
+            if key.is_none() {
+                if let Some(ref ml) = ml_ctx {
+                    ml.event(CacheEventType::Bypass, uri.to_string())
+                        .log(&ml.config);
+                }
+            }
+
             // Try to serve from chunk cache if this is a range request
             if let (Some(range_req), Some(chunk_cache), Some(key_ref)) =
                 (range_request.as_ref(), &chunk_cache, &key)
@@ -674,12 +790,17 @@ where
                 if let Some(entry) = chunk_cache.get(key_ref) {
                     // Check if range is satisfiable and normalize it
                     if let Some(normalized) = range_req.normalize(entry.metadata.total_size) {
-                        let end = normalized.end.unwrap_or(entry.metadata.total_size - 1);
+                        let end = normalized
+                            .end
+                            .unwrap_or_else(|| entry.metadata.total_size.saturating_sub(1));
 
                         // Try to get range from chunks
                         if let Some(range_data) = entry.get_range(normalized.start, end) {
+                            let range_len = range_data.len();
                             #[cfg(feature = "metrics")]
                             counter!("tower_http_cache.chunk_cache_hit").increment(1);
+                            #[cfg(feature = "admin-api")]
+                            stats.record_hit(key_ref);
 
                             #[cfg(feature = "tracing")]
                             tracing::debug!(
@@ -689,41 +810,25 @@ where
                                 "chunk_cache_hit"
                             );
 
-                            // Build 206 Partial Content response
-                            let mut response = Response::builder()
-                                .status(http::StatusCode::PARTIAL_CONTENT)
-                                .body(SyncBoxBody::new(
-                                    Full::from(range_data).map_err(Into::into).boxed(),
-                                ))
-                                .unwrap();
+                            let response = build_chunk_hit_response(
+                                &entry,
+                                range_data,
+                                normalized.start,
+                                end,
+                            )?;
 
-                            // Copy headers from metadata
-                            for (name, value) in &entry.metadata.headers {
-                                if let (Ok(header_name), Ok(header_value)) = (
-                                    http::header::HeaderName::from_bytes(name.as_bytes()),
-                                    http::header::HeaderValue::from_bytes(value),
-                                ) {
-                                    response.headers_mut().insert(header_name, header_value);
-                                }
+                            #[cfg(feature = "serde")]
+                            if let (Some(ml), Some(t0)) = (&ml_ctx, call_start) {
+                                ml.event(CacheEventType::Hit, key_ref.as_str())
+                                    .with_hit(true)
+                                    .with_status(response.status())
+                                    .with_version(response.version())
+                                    .with_size(range_len)
+                                    .with_latency(t0.elapsed())
+                                    .log(&ml.config);
                             }
 
-                            // Add Content-Range header
-                            let content_range = format!(
-                                "bytes {}-{}/{}",
-                                normalized.start, end, entry.metadata.total_size
-                            );
-                            response.headers_mut().insert(
-                                http::header::CONTENT_RANGE,
-                                http::header::HeaderValue::from_str(&content_range).unwrap(),
-                            );
-
-                            // Add Content-Length
-                            let content_length = (end - normalized.start + 1).to_string();
-                            response.headers_mut().insert(
-                                http::header::CONTENT_LENGTH,
-                                http::header::HeaderValue::from_str(&content_length).unwrap(),
-                            );
-
+                            let _ = range_len;
                             return Ok(response);
                         }
                     }
@@ -740,10 +845,23 @@ where
                         HitState::Fresh(entry) => {
                             #[cfg(feature = "metrics")]
                             counter!("tower_http_cache.hit").increment(1);
+                            #[cfg(feature = "admin-api")]
+                            stats.record_hit(key_ref);
 
                             // Record hit for auto-refresh tracking
                             if let Some(ref manager) = refresh_manager {
                                 manager.tracker().record_hit(key_ref);
+                            }
+
+                            #[cfg(feature = "serde")]
+                            if let (Some(ml), Some(t0)) = (&ml_ctx, call_start) {
+                                ml.event(CacheEventType::Hit, key_ref.as_str())
+                                    .with_hit(true)
+                                    .with_status(entry.status)
+                                    .with_version(entry.version)
+                                    .with_size(entry.body.len())
+                                    .with_latency(t0.elapsed())
+                                    .log(&ml.config);
                             }
 
                             return Ok(entry.into_response());
@@ -774,6 +892,18 @@ where
                         if let Some(entry) = stale_entry.clone() {
                             #[cfg(feature = "metrics")]
                             counter!("tower_http_cache.stale_served").increment(1);
+                            #[cfg(feature = "admin-api")]
+                            stats.record_stale_hit(key_ref);
+                            #[cfg(feature = "serde")]
+                            if let (Some(ml), Some(t0)) = (&ml_ctx, call_start) {
+                                ml.event(CacheEventType::StaleHit, key_ref.as_str())
+                                    .with_hit(true)
+                                    .with_status(entry.status)
+                                    .with_version(entry.version)
+                                    .with_size(entry.body.len())
+                                    .with_latency(t0.elapsed())
+                                    .log(&ml.config);
+                            }
                             return Ok(entry.into_response());
                         }
 
@@ -785,11 +915,35 @@ where
                                 HitState::Fresh(entry) => {
                                     #[cfg(feature = "metrics")]
                                     counter!("tower_http_cache.hit_after_wait").increment(1);
+                                    #[cfg(feature = "admin-api")]
+                                    stats.record_hit(key_ref);
+                                    #[cfg(feature = "serde")]
+                                    if let (Some(ml), Some(t0)) = (&ml_ctx, call_start) {
+                                        ml.event(CacheEventType::Hit, key_ref.as_str())
+                                            .with_hit(true)
+                                            .with_status(entry.status)
+                                            .with_version(entry.version)
+                                            .with_size(entry.body.len())
+                                            .with_latency(t0.elapsed())
+                                            .log(&ml.config);
+                                    }
                                     return Ok(entry.into_response());
                                 }
                                 HitState::Stale(entry) => {
                                     #[cfg(feature = "metrics")]
                                     counter!("tower_http_cache.stale_served").increment(1);
+                                    #[cfg(feature = "admin-api")]
+                                    stats.record_stale_hit(key_ref);
+                                    #[cfg(feature = "serde")]
+                                    if let (Some(ml), Some(t0)) = (&ml_ctx, call_start) {
+                                        ml.event(CacheEventType::StaleHit, key_ref.as_str())
+                                            .with_hit(true)
+                                            .with_status(entry.status)
+                                            .with_version(entry.version)
+                                            .with_size(entry.body.len())
+                                            .with_latency(t0.elapsed())
+                                            .log(&ml.config);
+                                    }
                                     return Ok(entry.into_response());
                                 }
                                 HitState::Expired => {}
@@ -820,6 +974,18 @@ where
                         {
                             #[cfg(feature = "metrics")]
                             counter!("tower_http_cache.hit_after_lock").increment(1);
+                            #[cfg(feature = "admin-api")]
+                            stats.record_hit(key_ref);
+                            #[cfg(feature = "serde")]
+                            if let (Some(ml), Some(t0)) = (&ml_ctx, call_start) {
+                                ml.event(CacheEventType::Hit, key_ref.as_str())
+                                    .with_hit(true)
+                                    .with_status(entry.status)
+                                    .with_version(entry.version)
+                                    .with_size(entry.body.len())
+                                    .with_latency(t0.elapsed())
+                                    .log(&ml.config);
+                            }
                             return Ok(entry.into_response());
                         }
                     }
@@ -828,6 +994,10 @@ where
 
             #[cfg(feature = "metrics")]
             counter!("tower_http_cache.miss").increment(1);
+            #[cfg(feature = "admin-api")]
+            if let Some(ref key_ref) = key {
+                stats.record_miss(key_ref);
+            }
 
             #[cfg(feature = "metrics")]
             let start = std::time::Instant::now();
@@ -837,6 +1007,17 @@ where
             histogram!("tower_http_cache.backend_latency").record(start.elapsed().as_secs_f64());
 
             let (parts, body) = response.into_parts();
+
+            #[cfg(feature = "serde")]
+            if let (Some(ml), Some(t0)) = (&ml_ctx, call_start) {
+                let miss_key = key.clone().unwrap_or_else(|| uri.to_string());
+                ml.event(CacheEventType::Miss, miss_key)
+                    .with_hit(false)
+                    .with_status(parts.status)
+                    .with_version(parts.version)
+                    .with_latency(t0.elapsed())
+                    .log(&ml.config);
+            }
 
             // NEW: Early streaming decision
             let content_type = parts
@@ -881,34 +1062,31 @@ where
                 );
 
                 // Stream through without buffering for range requests
-                let boxed_body = SyncBoxBody::new(body.map_err(Into::into).boxed());
+                let boxed_body = SyncBoxBody::from_body(body);
                 drop(primary_guard);
                 return Ok(Response::from_parts(parts, boxed_body));
             }
 
             // Check if we should skip caching and pass through
-            match streaming_decision {
-                StreamingDecision::SkipCache | StreamingDecision::StreamThrough => {
-                    // TRUE STREAMING: Pass through without buffering!
-                    #[cfg(feature = "metrics")]
-                    counter!("tower_http_cache.streaming_passthrough").increment(1);
+            if matches!(streaming_decision, StreamingDecision::SkipCache) {
+                // TRUE STREAMING: Pass through without buffering!
+                #[cfg(feature = "metrics")]
+                counter!("tower_http_cache.streaming_passthrough").increment(1);
 
-                    #[cfg(feature = "tracing")]
-                    tracing::debug!(
-                        method = %method,
-                        uri = %uri,
-                        decision = ?streaming_decision,
-                        content_type = ?content_type,
-                        size = ?extract_size_info(&size_hint, content_length),
-                        "streaming_passthrough"
-                    );
+                #[cfg(feature = "tracing")]
+                tracing::debug!(
+                    method = %method,
+                    uri = %uri,
+                    decision = ?streaming_decision,
+                    content_type = ?content_type,
+                    size = ?extract_size_info(&size_hint, content_length),
+                    "streaming_passthrough"
+                );
 
-                    // Box the body and stream it through without collecting
-                    let boxed_body = SyncBoxBody::new(body.map_err(Into::into).boxed());
-                    drop(primary_guard);
-                    return Ok(Response::from_parts(parts, boxed_body));
-                }
-                _ => {}
+                // Box the body and stream it through without collecting
+                let boxed_body = SyncBoxBody::from_body(body);
+                drop(primary_guard);
+                return Ok(Response::from_parts(parts, boxed_body));
             }
 
             let streaming = body.size_hint().upper().is_none();
@@ -920,75 +1098,6 @@ where
             let collected = BodyExt::collect(body).await.map_err(|err| err.into())?;
             let cache_bytes = collected.to_bytes();
             let response_bytes = cache_bytes.clone();
-
-            // Populate chunk cache for large files if enabled
-            if let (Some(chunk_cache), Some(key_ref)) = (&chunk_cache, &key) {
-                let streaming_policy = policy.streaming_policy();
-
-                if streaming_policy.enable_chunk_cache
-                    && cache_bytes.len() as u64 >= streaming_policy.min_chunk_file_size
-                    && parts.status.is_success()
-                {
-                    #[cfg(feature = "tracing")]
-                    tracing::debug!(
-                        key = %key_ref,
-                        size = cache_bytes.len(),
-                        chunk_size = streaming_policy.chunk_size,
-                        "populating_chunk_cache"
-                    );
-
-                    // Create chunk metadata
-                    let metadata = ChunkMetadata {
-                        total_size: cache_bytes.len() as u64,
-                        content_type: parts
-                            .headers
-                            .get(http::header::CONTENT_TYPE)
-                            .and_then(|v| v.to_str().ok())
-                            .unwrap_or("application/octet-stream")
-                            .to_string(),
-                        etag: parts
-                            .headers
-                            .get(http::header::ETAG)
-                            .and_then(|v| v.to_str().ok())
-                            .map(|s| s.to_string()),
-                        last_modified: parts
-                            .headers
-                            .get(http::header::LAST_MODIFIED)
-                            .and_then(|v| v.to_str().ok())
-                            .map(|s| s.to_string()),
-                        status: parts.status,
-                        version: parts.version,
-                        headers: policy.headers_to_cache(&parts.headers),
-                    };
-
-                    // Get or create chunked entry
-                    let entry = chunk_cache.get_or_create(key_ref.clone(), metadata);
-
-                    // Split into chunks and store
-                    let chunk_size = streaming_policy.chunk_size;
-                    let mut offset = 0;
-                    let mut chunk_index = 0;
-
-                    while offset < cache_bytes.len() {
-                        let end = std::cmp::min(offset + chunk_size, cache_bytes.len());
-                        let chunk = cache_bytes.slice(offset..end);
-                        entry.add_chunk(chunk_index, chunk);
-
-                        offset = end;
-                        chunk_index += 1;
-                    }
-
-                    #[cfg(feature = "metrics")]
-                    counter!("tower_http_cache.chunk_cache_stored").increment(1);
-
-                    #[cfg(feature = "tracing")]
-                    tracing::debug!(
-                        key = %key_ref,
-                        chunks = chunk_index,
-                        "chunk_cache_populated"
-                    );
-                }
-            }
 
             let cache_control_block =
                 policy.respect_cache_control() && cache_control_disallows(&parts.headers);
@@ -1005,12 +1114,6 @@ where
                 && !body_too_small
                 && (policy.allow_streaming_bodies() || !streaming);
 
-            let headers_to_cache = if should_store {
-                Some(policy.headers_to_cache(&parts.headers))
-            } else {
-                None
-            };
-
             let version = parts.version;
             let status = parts.status;
 
@@ -1018,9 +1121,25 @@ where
                 if let Some(key_ref) = &key {
                     if let Some(ttl) = policy.ttl_for(status) {
                         if !ttl.is_zero() {
+                            if let Some(ref chunk_cache) = chunk_cache {
+                                populate_chunk_cache(
+                                    chunk_cache,
+                                    key_ref,
+                                    &parts,
+                                    &policy,
+                                    &cache_bytes,
+                                    ttl,
+                                );
+                            }
+
                             let stale_for = policy.stale_while_revalidate();
-                            let (compressed_bytes, compressed) =
-                                maybe_compress(cache_bytes.clone(), policy.compression());
+                            let (compressed_bytes, headers_to_cache, compressed) =
+                                prepare_cached_payload_and_headers(
+                                    &parts.headers,
+                                    &policy,
+                                    cache_bytes,
+                                );
+                            let stored_size = compressed_bytes.len();
                             if compressed {
                                 #[cfg(feature = "metrics")]
                                 counter!("tower_http_cache.compressed").increment(1);
@@ -1028,7 +1147,7 @@ where
                             let entry = CacheEntry::new(
                                 status,
                                 version,
-                                headers_to_cache.unwrap(),
+                                headers_to_cache,
                                 compressed_bytes,
                             );
                             // `extract_tags` returns an empty vector unless
@@ -1039,7 +1158,7 @@ where
                             let entry = if tags.is_empty() {
                                 entry
                             } else {
-                                entry.with_tags(tags)
+                                entry.with_tags(tags.clone())
                             };
                             if backend
                                 .set(key_ref.clone(), entry, ttl, stale_for)
@@ -1051,6 +1170,23 @@ where
                             } else {
                                 #[cfg(feature = "metrics")]
                                 counter!("tower_http_cache.store").increment(1);
+                                #[cfg(feature = "admin-api")]
+                                stats.record_store(key_ref);
+
+                                #[cfg(feature = "serde")]
+                                if let Some(ref ml) = ml_ctx {
+                                    let mut event = ml
+                                        .event(CacheEventType::Store, key_ref.as_str())
+                                        .with_status(status)
+                                        .with_version(version)
+                                        .with_size(stored_size)
+                                        .with_ttl(ttl);
+                                    if !tags.is_empty() {
+                                        event = event.with_tags(tags);
+                                    }
+                                    event.log(&ml.config);
+                                }
+                                let _ = stored_size;
 
                                 // Store refresh metadata if auto-refresh is enabled
                                 if let (Some(manager), Some(metadata)) =
@@ -1189,6 +1325,167 @@ fn cache_control_disallows(headers: &HeaderMap) -> bool {
             .and_then(|value| value.to_str().ok())
             .map(|value| value.to_ascii_lowercase().contains("no-cache"))
             .unwrap_or(false)
+}
+
+#[cfg(feature = "serde")]
+struct MlLogContext {
+    config: MLLoggingConfig,
+    request_id: RequestId,
+    method: Method,
+    uri: Uri,
+}
+
+#[cfg(feature = "serde")]
+impl MlLogContext {
+    fn from_request<ReqBody>(config: &MLLoggingConfig, req: &Request<ReqBody>) -> Option<Self> {
+        if !config.enabled {
+            return None;
+        }
+        Some(Self {
+            config: config.clone(),
+            request_id: RequestId::from_request(req),
+            method: req.method().clone(),
+            uri: req.uri().clone(),
+        })
+    }
+
+    fn event(&self, event_type: CacheEventType, key: impl Into<String>) -> CacheEvent {
+        CacheEvent::new(event_type, self.request_id.clone(), key.into())
+            .with_method(self.method.clone())
+            .with_uri(self.uri.clone())
+    }
+}
+
+fn build_chunk_hit_response(
+    entry: &ChunkedEntry,
+    range_data: Bytes,
+    start: u64,
+    end: u64,
+) -> Result<Response<SyncBoxBody>, BoxError> {
+    let mut response = Response::new(SyncBoxBody::new(
+        Full::from(range_data).map_err(Into::into).boxed(),
+    ));
+    *response.status_mut() = http::StatusCode::PARTIAL_CONTENT;
+    *response.version_mut() = entry.metadata.version;
+
+    for (name, value) in &entry.metadata.headers {
+        if let (Ok(header_name), Ok(header_value)) = (
+            http::header::HeaderName::from_bytes(name.as_bytes()),
+            http::header::HeaderValue::from_bytes(value),
+        ) {
+            response.headers_mut().append(header_name, header_value);
+        }
+    }
+
+    let content_range = format!("bytes {}-{}/{}", start, end, entry.metadata.total_size);
+    let content_range_val =
+        http::header::HeaderValue::from_str(&content_range).map_err(BoxError::from)?;
+    response
+        .headers_mut()
+        .insert(http::header::CONTENT_RANGE, content_range_val);
+
+    let content_length = (end - start + 1).to_string();
+    let content_length_val =
+        http::header::HeaderValue::from_str(&content_length).map_err(BoxError::from)?;
+    response
+        .headers_mut()
+        .insert(http::header::CONTENT_LENGTH, content_length_val);
+
+    Ok(response)
+}
+
+fn populate_chunk_cache(
+    chunk_cache: &ChunkCache,
+    key: &str,
+    parts: &http::response::Parts,
+    policy: &CachePolicy,
+    cache_bytes: &Bytes,
+    ttl: Duration,
+) {
+    let streaming_policy = policy.streaming_policy();
+    if !streaming_policy.enable_chunk_cache
+        || (cache_bytes.len() as u64) < streaming_policy.min_chunk_file_size
+        || !parts.status.is_success()
+    {
+        return;
+    }
+
+    #[cfg(feature = "tracing")]
+    tracing::debug!(
+        key = %key,
+        size = cache_bytes.len(),
+        chunk_size = streaming_policy.chunk_size,
+        "populating_chunk_cache"
+    );
+
+    let metadata = ChunkMetadata {
+        total_size: cache_bytes.len() as u64,
+        content_type: parts
+            .headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_string(),
+        etag: parts
+            .headers
+            .get(http::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string()),
+        last_modified: parts
+            .headers
+            .get(http::header::LAST_MODIFIED)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string()),
+        status: parts.status,
+        version: parts.version,
+        headers: policy.headers_to_cache(&parts.headers),
+    };
+
+    let entry = chunk_cache.get_or_create_with_ttl(key.to_string(), metadata, Some(ttl));
+    let chunk_size = streaming_policy.chunk_size;
+    let mut offset = 0;
+    let mut chunk_index = 0;
+
+    while offset < cache_bytes.len() {
+        let end = std::cmp::min(offset + chunk_size, cache_bytes.len());
+        entry.add_chunk(chunk_index, cache_bytes.slice(offset..end));
+        offset = end;
+        chunk_index += 1;
+    }
+
+    #[cfg(feature = "metrics")]
+    counter!("tower_http_cache.chunk_cache_stored").increment(1);
+
+    #[cfg(feature = "tracing")]
+    tracing::debug!(key = %key, chunks = chunk_index, "chunk_cache_populated");
+}
+
+fn prepare_cached_payload_and_headers(
+    headers: &HeaderMap,
+    policy: &CachePolicy,
+    raw_bytes: Bytes,
+) -> (Bytes, Vec<(String, Vec<u8>)>, bool) {
+    let mut cached_headers = policy.headers_to_cache(headers);
+
+    // Never double-compress upstream payloads that already carry Content-Encoding.
+    if headers.contains_key(http::header::CONTENT_ENCODING) {
+        return (raw_bytes, cached_headers, false);
+    }
+
+    let (stored_bytes, compressed) = maybe_compress(raw_bytes, policy.compression());
+    if compressed {
+        cached_headers.retain(|(name, _)| {
+            !name.eq_ignore_ascii_case("content-encoding")
+                && !name.eq_ignore_ascii_case("content-length")
+        });
+        cached_headers.push(("content-encoding".to_string(), b"gzip".to_vec()));
+        cached_headers.push((
+            "content-length".to_string(),
+            stored_bytes.len().to_string().into_bytes(),
+        ));
+    }
+
+    (stored_bytes, cached_headers, compressed)
 }
 
 #[cfg(feature = "compression")]

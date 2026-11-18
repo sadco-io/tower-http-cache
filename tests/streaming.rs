@@ -708,3 +708,207 @@ async fn test_octet_stream_excluded() {
         "application/octet-stream should not be cached"
     );
 }
+
+#[tokio::test]
+async fn test_chunk_cache_skips_no_store_and_serves_suffix_ranges_with_multi_headers() {
+    use http_body_util::BodyExt;
+    use tower_http_cache::range::RangeHandling;
+    use tower_http_cache::tags::TagPolicy;
+
+    let streaming_policy = StreamingPolicy {
+        enabled: true,
+        enable_chunk_cache: true,
+        min_chunk_file_size: 1024,
+        chunk_size: 512,
+        range_handling: RangeHandling::CacheFullServeRanges,
+        ..Default::default()
+    };
+
+    let backend = InMemoryBackend::new(100);
+    let policy = CachePolicy::default()
+        .with_ttl(Duration::from_secs(60))
+        .with_streaming_policy(streaming_policy)
+        .with_tag_policy(TagPolicy::new().with_enabled(true))
+        .with_tag_extractor(|_m, uri| vec![format!("path:{}", uri.path())]);
+
+    let layer = CacheLayer::builder(backend.clone()).policy(policy).build();
+    let payload: Vec<u8> = (0..2048u32).map(|i| (i % 251) as u8).collect();
+
+    let service = tower::service_fn({
+        let payload = payload.clone();
+        move |req: Request<()>| {
+            let data = payload.clone();
+            let path = req.uri().path().to_string();
+            async move {
+                let mut builder = Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/plain")
+                    .header("x-multi", "one")
+                    .header("x-multi", "two");
+                if path == "/private" {
+                    builder = builder.header("cache-control", "no-store");
+                }
+                Ok::<_, Infallible>(builder.body(Full::from(data)).unwrap())
+            }
+        }
+    });
+
+    let mut svc = layer.layer(service);
+
+    // 1. `Cache-Control: no-store` must NOT populate the chunk cache.
+    let no_store_req = Request::builder()
+        .method(Method::GET)
+        .uri("/private")
+        .body(())
+        .unwrap();
+    let _ = svc
+        .ready()
+        .await
+        .unwrap()
+        .call(no_store_req)
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap();
+    assert!(
+        layer
+            .chunk_cache()
+            .and_then(|cc| cc.get("/private"))
+            .is_none(),
+        "no-store response must not be populated in ChunkCache"
+    );
+
+    // 2. Cacheable response populates ChunkCache and serves suffix range with multi-value headers.
+    let ok_req = Request::builder()
+        .method(Method::GET)
+        .uri("/asset.txt")
+        .body(())
+        .unwrap();
+    let _ = svc
+        .ready()
+        .await
+        .unwrap()
+        .call(ok_req)
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap();
+
+    let range_req = Request::builder()
+        .method(Method::GET)
+        .uri("/asset.txt")
+        .header("range", "bytes=-512")
+        .body(())
+        .unwrap();
+    let range_resp = svc.ready().await.unwrap().call(range_req).await.unwrap();
+    assert_eq!(range_resp.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        range_resp
+            .headers()
+            .get(http::header::CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok()),
+        Some("bytes 1536-2047/2048")
+    );
+    assert_eq!(
+        range_resp
+            .headers()
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()),
+        Some("512")
+    );
+    let multi_vals: Vec<&str> = range_resp
+        .headers()
+        .get_all("x-multi")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    assert_eq!(multi_vals, vec!["one", "two"]);
+    let range_body = range_resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&range_body[..], &payload[1536..2048]);
+
+    // 3. Tag invalidation clears both backend and ChunkCache.
+    let removed = layer.invalidate_by_tag("path:/asset.txt").await.unwrap();
+    assert_eq!(removed, 1);
+    assert!(backend.get("/asset.txt").await.unwrap().is_none());
+    assert!(
+        layer
+            .chunk_cache()
+            .and_then(|cc| cc.get("/asset.txt"))
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn test_chunk_cache_entry_expires_with_policy_ttl() {
+    use http_body_util::BodyExt;
+
+    let streaming_policy = StreamingPolicy {
+        enabled: true,
+        enable_chunk_cache: true,
+        min_chunk_file_size: 1024,
+        chunk_size: 512,
+        ..Default::default()
+    };
+
+    let backend = InMemoryBackend::new(100);
+    let layer = CacheLayer::builder(backend)
+        .policy(
+            CachePolicy::default()
+                .with_ttl(Duration::from_millis(25))
+                .with_streaming_policy(streaming_policy),
+        )
+        .build();
+
+    let payload = vec![5u8; 1024];
+    let service = tower::service_fn(move |_req: Request<()>| {
+        let data = payload.clone();
+        async move {
+            Ok::<_, Infallible>(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/plain")
+                    .body(Full::from(data))
+                    .unwrap(),
+            )
+        }
+    });
+
+    let mut svc = layer.layer(service);
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/ttl-chunks")
+        .body(())
+        .unwrap();
+    let _ = svc
+        .ready()
+        .await
+        .unwrap()
+        .call(req)
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap();
+
+    assert!(
+        layer
+            .chunk_cache()
+            .and_then(|cc| cc.get("/ttl-chunks"))
+            .is_some()
+    );
+
+    tokio::time::sleep(Duration::from_millis(45)).await;
+
+    assert!(
+        layer
+            .chunk_cache()
+            .and_then(|cc| cc.get("/ttl-chunks"))
+            .is_none(),
+        "chunk cache entry must expire after response TTL elapses"
+    );
+}

@@ -33,6 +33,13 @@ impl InMemoryBackend {
             tag_index: Arc::new(TagIndex::new()),
         }
     }
+
+    async fn is_key_live(&self, key: &str) -> bool {
+        let Some(stored) = self.cache.get(key).await else {
+            return false;
+        };
+        SystemTime::now() <= stored.stale_until
+    }
 }
 
 impl CacheBackend for InMemoryBackend {
@@ -41,6 +48,7 @@ impl CacheBackend for InMemoryBackend {
             let now = SystemTime::now();
             if now > stored.stale_until {
                 self.cache.invalidate(key).await;
+                self.tag_index.remove(key);
                 return Ok(None);
             }
 
@@ -69,6 +77,10 @@ impl CacheBackend for InMemoryBackend {
         let expires_at = now + ttl;
         let stale_until = expires_at + stale_for;
 
+        // Clear any prior tag associations so overwriting with new or empty tags
+        // never leaves orphaned entries in the tag index.
+        self.tag_index.remove(&key);
+
         // Index tags if present
         if let Some(ref tags) = entry.tags {
             if !tags.is_empty() {
@@ -92,11 +104,27 @@ impl CacheBackend for InMemoryBackend {
     }
 
     async fn get_keys_by_tag(&self, tag: &str) -> Result<Vec<String>, CacheError> {
-        Ok(self.tag_index.get_keys_by_tag(tag))
+        let candidates = self.tag_index.get_keys_by_tag(tag);
+        let mut live = Vec::with_capacity(candidates.len());
+        for key in candidates {
+            if self.is_key_live(&key).await {
+                live.push(key);
+            } else {
+                self.cache.invalidate(&key).await;
+                self.tag_index.remove(&key);
+            }
+        }
+        Ok(live)
     }
 
     async fn list_tags(&self) -> Result<Vec<String>, CacheError> {
-        Ok(self.tag_index.list_tags())
+        let mut active = Vec::new();
+        for tag in self.tag_index.list_tags() {
+            if !self.get_keys_by_tag(&tag).await?.is_empty() {
+                active.push(tag);
+            }
+        }
+        Ok(active)
     }
 }
 
@@ -161,5 +189,41 @@ mod tests {
         sleep(Duration::from_millis(40)).await;
         let read = backend.get("key").await.expect("get succeeds");
         assert!(read.is_none(), "entry removed after stale window");
+    }
+
+    #[tokio::test]
+    async fn capacity_eviction_prunes_stale_tag_index_entries() {
+        let backend = InMemoryBackend::new(1);
+
+        let entry_a = entry_with_body(b"a").with_tags(vec!["tag:a".to_string()]);
+        backend
+            .set(
+                "k1".into(),
+                entry_a,
+                Duration::from_secs(60),
+                Duration::ZERO,
+            )
+            .await
+            .unwrap();
+
+        let entry_b = entry_with_body(b"b").with_tags(vec!["tag:b".to_string()]);
+        backend
+            .set(
+                "k2".into(),
+                entry_b,
+                Duration::from_secs(60),
+                Duration::ZERO,
+            )
+            .await
+            .unwrap();
+
+        // Force Moka maintenance so max_capacity=1 evicts one of the entries.
+        backend.cache.run_pending_tasks().await;
+
+        let keys_a = backend.get_keys_by_tag("tag:a").await.unwrap();
+        let keys_b = backend.get_keys_by_tag("tag:b").await.unwrap();
+        let live_total = keys_a.len() + keys_b.len();
+        assert_eq!(live_total, 1, "evicted key must be pruned from tag index");
+        assert_eq!(backend.list_tags().await.unwrap().len(), 1);
     }
 }

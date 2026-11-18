@@ -1,0 +1,55 @@
+# Advisories land against unchanged code, so a push-triggered check is not
+# enough. This runs the same supply-chain checks weekly.
+name: audit
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      # audit-check opens an issue when a new advisory lands, which is the
+      # point of running this on a schedule rather than only on a push.
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # Overlaps cargo-deny's advisories check below -- both read the RustSec
+      # database. It is kept because it is the half that files an issue, so a
+      # new advisory is visible without anyone reading a cron log.
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  machete:
+    name: unused dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-machete
+      - run: cargo machete
