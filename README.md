@@ -30,13 +30,13 @@ Tower middleware for HTTP response caching with pluggable storage backends (in-m
 
 ```toml
 [dependencies]
-tower-http-cache = "0.6"
+tower-http-cache = "0.7"
 
 # Enable Redis support if required
-tower-http-cache = { version = "0.6", features = ["redis-backend"] }
+tower-http-cache = { version = "0.7", features = ["redis-backend"] }
 
-# With admin API support
-tower-http-cache = { version = "0.6", features = ["admin-api"] }
+# With framework-agnostic admin API support
+tower-http-cache = { version = "0.7", features = ["admin-api"] }
 ```
 
 ---
@@ -65,34 +65,69 @@ let svc = ServiceBuilder::new()
     }));
 ```
 
+### Axum Integration (`HandleErrorLayer`)
+
+Axum `Router::layer` requires middleware services to have `Error = Infallible`, whereas `CacheLayer` returns `BoxError`. Wrap `CacheLayer` with `axum::error_handling::HandleErrorLayer`:
+
+```rust,no_run
+use axum::{Router, error_handling::HandleErrorLayer, http::StatusCode, routing::get};
+use std::time::Duration;
+use tower::ServiceBuilder;
+use tower_http_cache::layer::BoxError;
+use tower_http_cache::prelude::*;
+
+let cache_layer = CacheLayer::builder(InMemoryBackend::new(10_000))
+    .ttl(Duration::from_secs(60))
+    .build();
+
+let app = Router::new()
+    .route("/", get(|| async { "hello world" }))
+    .layer(
+        ServiceBuilder::new()
+            .layer(HandleErrorLayer::new(|err: BoxError| async move {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Cache error: {err}"),
+                )
+            }))
+            .layer(cache_layer),
+    );
+```
+
+See [`examples/axum_redis.rs`](examples/axum_redis.rs) for a complete Redis + Axum server example.
+
 ### Chunk Caching for Large Files
 
-Efficiently cache and serve large files with byte-range support - perfect for video streaming:
+Cache large responses once and serve `206 Partial Content` byte-range requests directly from in-memory chunks. Note that `StreamingPolicy::default()` skips `video/*`, `audio/*`, `application/octet-stream`, `application/pdf`, `application/zip`, `application/gzip`, `application/x-rar`, `application/x-tar`, and `application/x-7z-compressed` unless `excluded_content_types` is cleared:
 
 ```rust
+use std::collections::HashSet;
+use std::time::Duration;
 use tower_http_cache::prelude::*;
 use tower_http_cache::streaming::StreamingPolicy;
-use std::time::Duration;
 
 let cache_layer = CacheLayer::builder(InMemoryBackend::new(500))
     .policy(
         CachePolicy::default()
             .with_ttl(Duration::from_secs(3600))
             .with_streaming_policy(StreamingPolicy {
+                enabled: true,
                 enable_chunk_cache: true,
-                chunk_size: 1024 * 1024,         // 1MB chunks
-                min_chunk_file_size: 5 * 1024 * 1024, // Only chunk files >= 5MB
+                chunk_size: 1024 * 1024,                   // 1MB chunks
+                min_chunk_file_size: 5 * 1024 * 1024,      // Only chunk files >= 5MB
+                max_cacheable_size: Some(64 * 1024 * 1024), // Allow files up to 64MB
+                excluded_content_types: HashSet::new(),    // Allow video/audio/binary payloads
                 ..Default::default()
-            })
+            }),
     )
     .build();
 ```
 
 **Benefits:**
-- 90% memory reduction for large file workloads
-- Instant seeking for video streaming (no re-download)
-- Range requests served directly from memory
-- Only cache accessed chunks (partial file caching)
+- In-memory chunk serving for HTTP `206 Partial Content` range requests
+- Bounded chunk index (`128 MiB` / `1,024` entries by default) with LRU and TTL eviction
+- `If-Range` validation and seamless fallback to the backend entry when needed
+- Range requests served directly from memory without re-reading the backend
 
 **Example:**
 See `examples/chunk_cache_demo.rs` for a complete working example.
@@ -130,7 +165,7 @@ async fn build_redis_layer(redis_url: &str) -> CacheLayer<RedisBackend> {
 
 ### Enabling Auto-Refresh
 
-Auto-refresh proactively refreshes frequently-accessed cache entries before they expire, reducing cache misses and latency for hot endpoints:
+Auto-refresh proactively refreshes frequently-accessed cache entries before they expire, reducing cache misses and latency for hot endpoints. Set a non-zero `.refresh_before(...)` window alongside `.auto_refresh(...)` (with the default `Duration::ZERO`, entries only qualify for refresh after expiry):
 
 ```rust
 use std::time::Duration;
@@ -172,9 +207,11 @@ let cache_layer = CacheLayer::builder(backend)
     )
     .build();
 
-// Later: invalidate all entries with a tag
-backend.invalidate_by_tag("user:123").await?;
-backend.invalidate_by_tags(&["user:123", "posts"]).await?;
+// Later: invalidate through the layer (also evicts ChunkCache when enabled;
+// calling `backend.invalidate*` directly bypasses ChunkCache).
+for tag in ["user:123", "posts"] {
+    cache_layer.invalidate_by_tag(tag).await?;
+}
 ```
 
 Tag-based invalidation works on `InMemoryBackend`, and on `MultiTierBackend`
@@ -190,13 +227,12 @@ index.
 Combine fast in-memory cache with larger distributed storage:
 
 ```rust
-use tower_http_cache::backend::MultiTierBackend;
+use tower_http_cache::backend::multi_tier::{MultiTierBackend, PromotionStrategy};
 
 let backend = MultiTierBackend::builder()
     .l1(InMemoryBackend::new(1_000))        // Hot data (fast)
     .l2(RedisBackend::new(manager))          // Cold storage (large)
-    .promotion_threshold(3)                   // Promote after 3 L2 hits
-    .promotion_strategy(PromotionStrategy::HitCount)
+    .promotion_strategy(PromotionStrategy::HitCount { threshold: 3 })
     .write_through(true)
     .build();
 
@@ -239,17 +275,21 @@ let cache_layer = CacheLayer::builder(backend)
 
 ### Admin API
 
-Enable cache introspection and management endpoints:
+Enable framework-agnostic cache introspection and management handlers (no Axum dependency required):
 
 ```rust
-use tower_http_cache::admin::AdminConfig;
+use tower_http_cache::admin::{AdminConfig, AdminState};
 
 let admin_config = AdminConfig::new()
     .with_require_auth(true)
     .with_auth_token("your-secret-token")
     .with_enabled(true);
 
-// Available handler functions (wire into your Axum router):
+// Wire AdminState to the CacheLayer's backend, live GlobalStats, and ChunkCache:
+// (Note: calling `backend.invalidate()` directly bypasses ChunkCache eviction.)
+let admin_state = AdminState::from_layer(&cache_layer, admin_config);
+
+// Available handler functions (wire into any HTTP framework):
 // tower_http_cache::admin::routes::handle_health
 // tower_http_cache::admin::routes::handle_stats
 // tower_http_cache::admin::routes::handle_hot_keys
@@ -259,7 +299,7 @@ let admin_config = AdminConfig::new()
 
 ### ML-Ready Structured Logging
 
-Enable structured logging for ML model training:
+Enable structured logging for cache operations and request correlation (automatically picks up `X-Request-ID` when present):
 
 ```rust
 use tower_http_cache::logging::MLLoggingConfig;
@@ -269,21 +309,23 @@ let cache_layer = CacheLayer::builder(backend)
         CachePolicy::default()
             .with_ml_logging(MLLoggingConfig {
                 enabled: true,
-                sample_rate: 1.0,        // Log 100% of operations
-                hash_keys: true,          // Hash keys for privacy
-                include_request_id: true, // Correlate with X-Request-ID
+                sample_rate: 1.0, // Log 100% of operations
+                hash_keys: true,  // Hash keys and URIs for privacy
+                ..Default::default()
             })
     )
     .build();
 
-// Logs will be emitted in JSON format:
+// Logs are emitted as structured JSON:
 // {
-//   "timestamp": "2025-11-10T12:00:00Z",
+//   "timestamp": "2026-11-17T12:00:00.000Z",
+//   "level": "info",
+//   "target": "tower_http_cache::ml",
+//   "event": "hit",
 //   "request_id": "550e8400-...",
-//   "operation": "cache_hit",
-//   "latency_us": 150,
-//   "tags": ["user:123"],
-//   "tier": "l1"
+//   "key": "sha256-hex...",
+//   "hit": true,
+//   "latency_us": 150
 // }
 ```
 
@@ -296,7 +338,8 @@ let cache_layer = CacheLayer::builder(backend)
 | `ttl` / `negative_ttl` | cache lifetime for successful and error responses |
 | `stale_while_revalidate` | serve stale data while a refresh is in progress |
 | `refresh_before` | proactively refresh the cache shortly before expiry |
-| `auto_refresh` | automatically refresh frequently-accessed entries before expiration |
+| `auto_refresh` | automatically refresh frequently-accessed entries (requires non-zero `refresh_before`) |
+| `cookie_policy` | configure how `Cookie` request headers interact with the cache (`Bypass`, `RequirePublic`, `Ignore`); `Vary` headers beyond `Accept-Encoding` are not part of the cache key |
 | `tag_policy` | configure cache tags and invalidation groups |
 | `multi_tier` | enable multi-tier caching with L1/L2 backends |
 | `ml_logging` | enable ML-ready structured logging |
@@ -385,106 +428,44 @@ cargo run --example v0_3_features --features admin-api
 | ------- | ----------- | :-----: |
 | `in-memory` | Enables the Moka-powered in-memory backend | ✓ |
 | `redis-backend` | Enables the Redis backend, codec, and async utilities | ✗ |
-| `admin-api` | Enables admin REST API endpoints (requires axum) | ✗ |
-| `serde` | Derives `serde` traits for cached entries/codecs | ✓ |
+| `admin-api` | Enables framework-agnostic admin stats, key inspection, and invalidation handlers | ✗ |
+| `serde` | Derives `serde` traits for cached entries/codecs and structured `CacheEvent` logging | ✓ |
 | `compression` | Adds optional gzip compression for cached payloads | ✗ |
 | `metrics` | Emits `metrics` counters (hit/miss/store/etc.) | ✗ |
 | `tracing` | Adds tracing spans around cache operations | ✗ |
-| `legacy-bincode1-read` | Reads cache entries written by 0.5.x (see below) | ✓ |
 
 ---
 
-## Upgrading from 0.5.x
+## Upgrading from 0.6.x to 0.7.0
 
-### The on-the-wire cache format changed
+### Removed 0.5.x legacy migration path
 
-Entries in Redis are now written as a 21-byte versioned envelope — `"THC"` magic,
-a format byte, a codec byte, and the expiry and stale timestamps as
-little-endian `u64` — followed by a `postcard`-encoded payload. 0.5.x wrote a
-bare `bincode 1` record. Tags are part of the payload now; they never crossed the
-Redis wire before.
+- Removed `legacy-bincode1-read`, the legacy reader module, and the deprecated `BincodeCodec` type alias. All Redis entries now use the versioned postcard envelope (`PostcardCodec`) introduced in `0.6.0`.
+- `CacheBackend::invalidate_by_tags` uses slice elements cleanly and `InMemoryBackend` automatically prunes overwritten, expired, and evicted keys from its tag index.
 
-**Upgrading does not cold-start your cache.** 0.6.0 reads 0.5.x entries through
-the `legacy-bincode1-read` feature, which is on by default. Entries are rewritten
-in the new format as they are refreshed.
+### Framework-agnostic `admin-api` & live stats wiring
 
-**Rolling back to 0.5.x is also safe.** A 0.5.x binary reading a 0.6.0 entry gets
-a clean decode error, which the cache layer already treats as a miss. The cost is
-a cold cache, not corrupted responses — that is what the envelope header buys.
-Without it, the old reader would have silently accepted the new bytes and ignored
-the trailing remainder.
+- `admin-api` no longer pulls `axum` as a dependency (`admin-api = ["serde"]`).
+- Connect [`CacheLayer`](https://docs.rs/tower-http-cache) to [`AdminState::from_layer`](https://docs.rs/tower-http-cache) so HTTP hits, misses, stores, invalidations, and `ChunkCache` evictions stay wired together (calling `backend.invalidate()` directly bypasses `ChunkCache`).
 
-`BincodeCodec` is renamed `PostcardCodec`. A deprecated alias keeps the old name
-working through 0.6.x.
+### Other breaking changes in 0.7.0
 
-### Turning `legacy-bincode1-read` off
+- Added `#[non_exhaustive]` to public enums (`StreamingDecision`, `CacheEventType`, `CompressionStrategy`, `PromotionStrategy`, `RangeHandling`, `CookiePolicy`) and removed the hidden `StreamingDecision::StreamThrough` placeholder variant.
+- Added new public fields: `CacheEntry::compressed` (custom `CacheCodec` implementations must persist and restore it), `StreamingPolicy::{max_chunk_cache_bytes, max_chunk_cache_entries}`, `AdminState::chunk_cache`, and `TierStats::writes`.
+- `MultiTierBackend::stats(&self)` now returns a `TierStats` snapshot by value (with a new `writes` field) instead of `&TierStats`.
+- `RangeRequest::normalize` resolves RFC 9110 suffix ranges (`bytes=-N`) alongside start-end and open-ended ranges; construct values with `RangeRequest::new` or `RangeRequest::suffix`.
+- Enabled `compression` now writes `Content-Encoding: gzip` and updates `Content-Length` on compressed cached entries, while skipping responses that already carry `Content-Encoding` and validating client `Accept-Encoding` on hits.
+- Redis envelope bumped to `FORMAT_V2` (`0x02`) while still reading `0.6.x` `FORMAT_V1` entries transparently (`compressed = false`). Requests carrying `Cookie` bypass the cache by default via `CookiePolicy::Bypass` (`RequirePublic` and `Ignore` are opt-in). `Vary` headers beyond `Accept-Encoding` are not part of the cache key: responses declaring `Vary: Cookie`, `Vary: Authorization`, or `Vary: *` are neither stored nor served when the corresponding request header is present.
 
-The reader is hand-written against the bincode 1 layout and pulls no dependency,
-so leaving it on costs only dead code. It exists so 0.7.0 can delete it cleanly,
-not to dodge an advisory.
-
-Turning it off is safe at any time and **cannot lose data**: an entry it would
-have read becomes a miss, the response is recomputed, and the entry is rewritten
-in the new format. The only cost is a colder cache while 0.5.x-written entries
-are re-populated. Since entries are self-expiring, once every 0.5.x entry has
-aged past its TTL plus its stale window the feature is doing nothing anyway.
-
-```toml
-tower-http-cache = { version = "0.6", default-features = false, features = ["in-memory", "serde"] }
-```
-
-The feature and the module behind it are removed in 0.7.0.
-
-### `CacheBackend` no longer uses `#[async_trait]`
-
-The trait uses native `async fn` in traits (RPITIT). Every method is declared as
-`fn name(..) -> impl Future<Output = ..> + Send`; the `+ Send` is required
-because the cache layer boxes backend futures into a `Send` future.
-
-If you implement `CacheBackend` yourself, the migration is one line per impl —
-delete the attribute. Method bodies are unchanged:
-
-```diff
--#[async_trait]
- impl CacheBackend for MyBackend {
-     async fn get(&self, key: &str) -> Result<Option<CacheRead>, CacheError> {
-         // unchanged
-     }
- }
-```
-
-Leaving `#[async_trait]` in place produces `error[E0195]: lifetime parameters or
-bounds on method 'get' do not match the trait declaration`. The same one-line
-change applies to any overridden default method (`get_keys_by_tag`,
-`invalidate_by_tag`, `invalidate_by_tags`, `list_tags`).
-
-`CacheBackend` was already non-dyn-compatible because of its `Clone` supertrait,
-so no working code used it as a trait object. MSRV is unchanged — RPITIT
-stabilised in Rust 1.75, well below this crate's floor.
-
-### Also breaking
-
-- `CacheError` is `#[non_exhaustive]` and gained an `Unsupported` variant.
-  Exhaustive matches need a `_` arm; `CacheError::is_unsupported()` avoids
-  matching at all.
-- `RedisBackend::get_keys_by_tag` and `list_tags` return `Unsupported` instead of
-  `Ok(vec![])`, so the defaulted `invalidate_by_tag` propagates an error where it
-  previously returned `Ok(0)`.
-- The `memcached-backend` feature and `MemcachedBackend` are removed.
-- redis `0.32` -> `1.6` changed `ConnectionManagerConfig`'s defaults from no
-  timeouts to a 500 ms response timeout and a 1 s connection timeout. See the
-  Redis backend example above.
-
-See [CHANGELOG.md](CHANGELOG.md) for the full list.
+See [CHANGELOG.md](CHANGELOG.md) for the full release history, including earlier `0.5.x` → `0.6.0` notes.
 
 ---
 
 ## Minimum Supported Rust Version
 
 MSRV: **1.85** for the default feature set, matching the crate's `rust-version`
-field. **`redis-backend` requires 1.88** — redis 1.6 declares it, and the feature
-also reaches `url` -> `idna` -> `icu_*`, which require the same. Both floors are
-enforced by separate CI jobs.
+field. **`redis-backend` requires 1.88** — `redis` 1.8 declares `rust-version = "1.88"`.
+Both floors are enforced by separate CI jobs.
 
 The MSRV will only increase with a minor version bump and will be documented in
 release notes.

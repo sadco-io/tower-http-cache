@@ -8,10 +8,14 @@ pub mod routes;
 pub mod stats;
 
 use crate::backend::CacheBackend;
+use crate::chunks::ChunkCache;
+use crate::layer::CacheLayer;
+use sha2::{Digest, Sha256};
+use std::fmt;
 use std::sync::Arc;
 
 /// Configuration for the admin API.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AdminConfig {
     /// Whether admin API is enabled
     pub enabled: bool,
@@ -30,6 +34,22 @@ pub struct AdminConfig {
 
     /// Maximum number of hot keys to track
     pub max_hot_keys: usize,
+}
+
+impl fmt::Debug for AdminConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AdminConfig")
+            .field("enabled", &self.enabled)
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "[redacted]"),
+            )
+            .field("require_auth", &self.require_auth)
+            .field("mount_path", &self.mount_path)
+            .field("max_keys_per_request", &self.max_keys_per_request)
+            .field("max_hot_keys", &self.max_hot_keys)
+            .finish()
+    }
 }
 
 impl Default for AdminConfig {
@@ -75,18 +95,34 @@ impl AdminConfig {
         self
     }
 
-    /// Validates the authentication token.
+    /// Validates the authentication token in constant time over SHA-256 digests
+    /// so neither token length nor prefix matching leaks timing information.
     pub fn validate_token(&self, provided: Option<&str>) -> bool {
         if !self.require_auth {
             return true;
         }
 
         match (&self.auth_token, provided) {
-            (Some(expected), Some(provided)) => expected == provided,
-            (None, _) => !self.require_auth,
+            (Some(expected), Some(provided)) => {
+                if expected.trim().is_empty() || provided.trim().is_empty() {
+                    return false;
+                }
+                constant_time_eq(expected.as_bytes(), provided.as_bytes())
+            }
+            (None, _) => false,
             _ => false,
         }
     }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let digest_a = Sha256::digest(a);
+    let digest_b = Sha256::digest(b);
+    let mut diff = 0u8;
+    for (&x, &y) in digest_a.iter().zip(digest_b.iter()) {
+        diff |= x ^ y;
+    }
+    std::hint::black_box(diff == 0)
 }
 
 /// Shared state for admin API handlers.
@@ -95,16 +131,42 @@ pub struct AdminState<B: CacheBackend> {
     pub backend: B,
     pub config: Arc<AdminConfig>,
     pub stats: Arc<stats::GlobalStats>,
+    pub chunk_cache: Option<Arc<ChunkCache>>,
 }
 
 impl<B: CacheBackend> AdminState<B> {
-    /// Creates new admin state.
+    /// Creates new admin state with an isolated [`stats::GlobalStats`] tracker.
     pub fn new(backend: B, config: AdminConfig) -> Self {
+        Self::with_stats(backend, config, Arc::new(stats::GlobalStats::new()))
+    }
+
+    /// Creates new admin state sharing an existing [`stats::GlobalStats`] tracker
+    /// (for example obtained from `CacheLayer::stats()`).
+    pub fn with_stats(backend: B, config: AdminConfig, stats: Arc<stats::GlobalStats>) -> Self {
         Self {
             backend,
             config: Arc::new(config),
-            stats: Arc::new(stats::GlobalStats::new()),
+            stats,
+            chunk_cache: None,
         }
+    }
+
+    /// Attaches a chunk cache so admin invalidations also evict cached chunks.
+    pub fn with_chunk_cache(mut self, chunk_cache: Arc<ChunkCache>) -> Self {
+        self.chunk_cache = Some(chunk_cache);
+        self
+    }
+
+    /// Builds admin state wired to the backend, shared stats, and optional chunk cache of a [`CacheLayer`].
+    pub fn from_layer(layer: &CacheLayer<B>, config: AdminConfig) -> Self
+    where
+        B: Clone,
+    {
+        let mut state = Self::with_stats(layer.backend().clone(), config, layer.stats());
+        if let Some(chunk_cache) = layer.chunk_cache().cloned() {
+            state = state.with_chunk_cache(chunk_cache);
+        }
+        state
     }
 }
 
@@ -159,5 +221,45 @@ mod tests {
 
         assert!(config.validate_token(None));
         assert!(config.validate_token(Some("anything")));
+    }
+
+    #[test]
+    fn admin_config_debug_redacts_auth_token() {
+        let with_token = AdminConfig::new().with_auth_token("super-secret-token");
+        let debug_str = format!("{with_token:?}");
+        assert!(!debug_str.contains("super-secret-token"));
+        assert!(debug_str.contains("[redacted]"));
+
+        let without_token = AdminConfig::new();
+        let debug_none = format!("{without_token:?}");
+        assert!(debug_none.contains("auth_token: None"));
+    }
+
+    #[test]
+    fn validate_token_rejects_prefix_and_different_lengths() {
+        let config = AdminConfig::new()
+            .with_auth_token("correct-horse-battery-staple")
+            .with_require_auth(true);
+
+        assert!(!config.validate_token(Some("correct-horse")));
+        assert!(!config.validate_token(Some("correct-horse-battery-staple-extra")));
+        assert!(!config.validate_token(Some("")));
+        assert!(config.validate_token(Some("correct-horse-battery-staple")));
+    }
+
+    #[test]
+    fn validate_token_rejects_empty_and_whitespace_configured_tokens() {
+        let empty = AdminConfig::new()
+            .with_auth_token("")
+            .with_require_auth(true);
+        assert!(!empty.validate_token(Some("")));
+        assert!(!empty.validate_token(Some("   ")));
+        assert!(!empty.validate_token(None));
+
+        let whitespace = AdminConfig::new()
+            .with_auth_token("   ")
+            .with_require_auth(true);
+        assert!(!whitespace.validate_token(Some("   ")));
+        assert!(!whitespace.validate_token(Some("")));
     }
 }

@@ -9,11 +9,23 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Supersede in-flight runs on a PR branch rather than letting every push queue
+# another full matrix.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Least privilege by default; no job here needs to write anything.
+permissions:
+  contents: read
+
 jobs:
   test:
     name: test (${{ matrix.rust }})
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       # The PR run already tested this exact tree -- strict status checks
@@ -29,38 +41,68 @@ jobs:
         with:
           toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@v2
-      # The feature-selected run below is the primary gate.
-      - run: cargo test --features in-memory,serde,redis-backend,metrics,tracing,compression,admin-api --all-targets
-      - run: cargo test --features in-memory,serde --doc
-      - run: cargo test --no-default-features --features in-memory
-      # Reduced feature sets skip doctests: the crate-level examples use
+      - run: cargo test --locked --all-features --all-targets
+      - run: cargo test --locked --all-features --doc
+      - run: cargo test --locked --no-default-features --features in-memory
+      # Reduced feature sets skip doctests: crate-level examples use
       # InMemoryBackend, which is a default feature. Doctests are covered
-      # by the default and --all-features runs above.
-      - run: cargo test --no-default-features --lib --tests
-      - run: cargo test --no-default-features --features serde --lib --tests
-      # The feature matrix regressed twice before CI existed: `serde` and
-      # `in-memory` were both load-bearing without being declared as such.
-      - run: cargo test --all-features --all-targets
-      # The 0.5.x legacy reader must build and pass with the feature both on
-      # and off, for the default set and for redis-backend. It is in `default`,
-      # so only the explicit off legs actually exercise the cfg-gated absence.
-      - run: cargo test --no-default-features --features in-memory,serde
-      - run: cargo test --no-default-features --features in-memory,serde,legacy-bincode1-read
-      - run: cargo test --no-default-features --features in-memory,serde,redis-backend
-      - run: cargo test --no-default-features --features in-memory,serde,redis-backend,legacy-bincode1-read
+      # by --all-features above.
+      - run: cargo test --locked --no-default-features --lib --tests
+      - run: cargo test --locked --no-default-features --features serde --lib --tests
+      - run: cargo test --locked --no-default-features --features in-memory,serde
+      - run: cargo test --locked --no-default-features --features in-memory,serde,redis-backend
+
+  redis-integration:
+    name: redis integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    env:
+      REDIS_URL: redis://127.0.0.1:6379/
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --test redis_example --all-features
+
+  features:
+    name: feature powerset
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-hack
+      - run: cargo hack --locked --feature-powerset check --lib --tests
 
   no-bincode:
     name: bincode absent from the graph
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # 0.6.0 deleted the RUSTSEC-2025-0141 suppression from deny.toml by
-      # removing bincode entirely; the 0.5.x reader is hand-written and pulls no
-      # dependency. Without this guard a transitive reintroduction would surface
-      # as an unexplained cargo-deny failure instead of here.
+      # removing bincode entirely, and 0.7.0 removed the 0.5.x legacy reader.
+      # Without this guard a transitive reintroduction would surface as an
+      # unexplained cargo-deny failure instead of here.
       #
       # `cargo tree -i` exits non-zero when the package is NOT found, which is
       # the outcome we want -- hence the deliberate inversion.
@@ -76,24 +118,27 @@ jobs:
     name: msrv (1.85 core / 1.88 backends)
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.85.0
       - uses: Swatinem/rust-cache@v2
       # Build only: dev-dependencies are allowed to outrun the MSRV.
-      # 1.85 covers everything except the shared backends.
-      - run: cargo build
-      - run: cargo build --features in-memory,serde,metrics,tracing,compression,admin-api
-      # redis-backend requires 1.88: redis 1.6 declares it, and it also
-      # reaches url -> idna -> icu_*. Enforced separately rather than papered
-      # over.
+      # 1.85 covers everything except `redis-backend`.
+      - run: cargo build --locked
+      - run: cargo build --locked --features in-memory,serde,metrics,tracing,compression,admin-api
+      # redis-backend requires 1.88: redis 1.8 declares it. Enforced
+      # separately rather than papered over.
       - uses: dtolnay/rust-toolchain@1.88.0
-      - run: cargo build --features redis-backend
+      - run: cargo build --locked --features redis-backend
 
   lint:
     name: fmt + clippy
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -101,26 +146,68 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --features in-memory,serde,redis-backend,metrics,tracing,compression,admin-api --all-targets -- -D warnings
+      - run: cargo clippy --locked --all-features --all-targets -- -D warnings
       # The minimal build has its own lints (cfg-gated code paths).
-      - run: cargo clippy --no-default-features --features in-memory -- -D warnings
+      - run: cargo clippy --locked --no-default-features --features in-memory -- -D warnings
 
   docs:
     name: docs
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      RUSTDOCFLAGS: "-D warnings"
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo doc --no-deps --features in-memory,serde,redis-backend,metrics,tracing,compression,admin-api
-        env:
-          RUSTDOCFLAGS: -D warnings
+      - run: cargo doc --locked --no-deps --all-features
+
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: raven-actions/actionlint@v2
+        with:
+          fail-on-error: true
+
+  unused-deps:
+    name: unused dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-machete
+      - run: cargo machete
+
+  package:
+    name: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo package --locked --no-verify --allow-dirty
+      - name: report package size
+        run: ls -lh target/package/*.crate
 
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2

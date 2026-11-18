@@ -11,17 +11,13 @@ use crate::range::RangeHandling;
 
 /// Decision on how to handle a response body based on size and content type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(clippy::manual_non_exhaustive)]
+#[non_exhaustive]
 pub enum StreamingDecision {
     /// Buffer the body and cache it (small enough, appropriate type)
     Buffer,
 
     /// Skip caching entirely (too large or excluded content type)
     SkipCache,
-
-    /// Stream the body without buffering (reserved for future use).
-    #[doc(hidden)]
-    StreamThrough,
 
     /// Try to stream if possible, fallback to buffer (unknown size)
     StreamIfPossible,
@@ -93,6 +89,14 @@ pub struct StreamingPolicy {
     /// Files smaller than this will not be chunked even if chunk caching is enabled.
     /// This prevents overhead for files that don't benefit from chunking.
     pub min_chunk_file_size: u64,
+
+    /// Maximum total chunk bytes retained in [`ChunkCache`](crate::chunks::ChunkCache)
+    /// (default: 128MB). Set to `None` for no byte limit.
+    pub max_chunk_cache_bytes: Option<usize>,
+
+    /// Maximum number of entries retained in [`ChunkCache`](crate::chunks::ChunkCache)
+    /// (default: 1024). Set to `None` for no entry count limit.
+    pub max_chunk_cache_entries: Option<usize>,
 }
 
 impl Default for StreamingPolicy {
@@ -121,6 +125,8 @@ impl Default for StreamingPolicy {
             enable_chunk_cache: false,             // Opt-in feature
             chunk_size: 1024 * 1024,               // 1MB chunks
             min_chunk_file_size: 10 * 1024 * 1024, // 10MB minimum
+            max_chunk_cache_bytes: Some(128 * 1024 * 1024),
+            max_chunk_cache_entries: Some(1024),
         }
     }
 }
@@ -139,6 +145,8 @@ impl StreamingPolicy {
             enable_chunk_cache: false,
             chunk_size: 1024 * 1024,
             min_chunk_file_size: 0,
+            max_chunk_cache_bytes: Some(128 * 1024 * 1024),
+            max_chunk_cache_entries: Some(1024),
         }
     }
 
@@ -154,6 +162,8 @@ impl StreamingPolicy {
             enable_chunk_cache: false,
             chunk_size: 1024 * 1024,
             min_chunk_file_size: 0,
+            max_chunk_cache_bytes: Some(128 * 1024 * 1024),
+            max_chunk_cache_entries: Some(1024),
         }
     }
 
@@ -169,6 +179,8 @@ impl StreamingPolicy {
             enable_chunk_cache: false,
             chunk_size: 1024 * 1024,
             min_chunk_file_size: 0,
+            max_chunk_cache_bytes: Some(128 * 1024 * 1024),
+            max_chunk_cache_entries: Some(1024),
         }
     }
 }

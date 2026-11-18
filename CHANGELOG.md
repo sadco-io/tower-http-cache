@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-17
+
+### Added
+
+- **Live wiring for `GlobalStats`, `MLLoggingConfig`, and `ChunkCache` management.**
+  - `CacheLayer::stats()` and `CacheLayerBuilder::stats(...)` expose and share `GlobalStats` across `CacheService` (recording hits, misses, stale hits, stores, and invalidations) and `AdminState::with_stats(...)` under `admin-api`.
+  - `CacheLayer::chunk_cache()`, `CacheLayer::invalidate(...)`, and `CacheLayer::invalidate_by_tag(...)` coordinate backend + chunk-cache invalidation, `GlobalStats`, and structured logging.
+  - `MLLoggingConfig` + `RequestId` (`X-Request-ID` extraction or UUID v4 generation) are now wired into `CacheService::call` (under `serde`) and `CacheEventType::Bypass` was added.
+- **Axum / non-`Sync` `ResBody` interoperability (Issue #24)**: relaxed the `ResBody: Sync` bound on `CacheService`'s `Service` implementation, replaced the `unsafe impl Sync` on `SyncBoxBody` with a `std::sync::Mutex<UnsyncBoxBody<Bytes, BoxError>>`, added `SyncBoxBody::from_body`, and updated `examples/axum_redis.rs` and `examples/redis_smoke.rs` to mount `CacheLayer` directly on `axum::Router` via `tower::ServiceBuilder` and `axum::error_handling::HandleErrorLayer`.
+- **Configurable `CookiePolicy` (`Bypass` default, `RequirePublic`, `Ignore`)** via `CachePolicy::with_cookie_policy`, `CacheLayerBuilder::cookie_policy`, and `CacheLayer::with_cookie_policy`.
+- **Bounded `ChunkCache` eviction and `AdminState::from_layer` / `with_chunk_cache`**: `StreamingPolicy` adds `max_chunk_cache_bytes` (`128 MiB` default) and `max_chunk_cache_entries` (`1,024` default), `ChunkCache::new` enforces those defaults, `ChunkCache::replace_with_ttl` atomically replaces complete entries, and `AdminState::from_layer` wires backend, stats, and chunk cache invalidation together.
+- **Suffix range support (`Range: bytes=-N`) and case-insensitive `bytes` unit parsing** in `range::parse_range_header` and `parse_content_range_header`, plus `RangeRequest::suffix(len)`.
+- **`ChunkCache::get_or_create_with_ttl` and `ChunkedEntry::is_expired`** with automatic expiry pruning in `ChunkCache::get` and `ChunkCache::stats`.
+- **`[package.metadata.docs.rs]`** configuration in `Cargo.toml`, an explicit `include` manifest whitelist, and tracked `Cargo.lock`.
+
+### Changed
+
+- **`admin-api` is now framework-agnostic** (`admin-api = ["serde"]`), dropping the unused optional `axum` dependency while keeping `axum` in `[dev-dependencies]` for examples and tests.
+- **Envelope wire format bumped to `FORMAT_V2` (`0x02`) with backward-compatible `0.6.x` `FORMAT_V1` reads**:
+  - `PostcardCodec` persists `CacheEntry::compressed` in `FORMAT_V2` payloads (`envelope::wrap`), while `envelope::read_stored` and `PostcardCodec::decode` continue reading `0.6.x` `FORMAT_V1` payloads seamlessly (`compressed = false`, zero cold-start, zero warnings).
+  - Rolling back to `0.6.x` (or older `0.6.x` nodes encountering `FORMAT_V2` entries) treats `FORMAT_V2` entries as clean cache misses (emitting a `cache_entry_decode_failed` warning and `decode_error` metric per read) instead of mis-decoding layer-compressed bodies.
+  - **`CompressionStrategy::Gzip` upgrade note:** `0.6.x` deployments that used `CompressionStrategy::Gzip` with a shared backend (such as Redis) stored gzip payloads without `Content-Encoding` under `FORMAT_V1`. On `0.7.0`, `FORMAT_V1` entries decode with `compressed = false`, so flush or rotate the cache namespace on upgrade and avoid mixing `0.6.x` and `0.7.0` gzip-enabled nodes.
+  - **Custom `CacheCodec` upgrade note:** `CacheEntry` adds the public `compressed: bool` field; downstream `CacheCodec` implementations that map fields manually must persist and restore `compressed` so layer-compressed entries continue to negotiate `Accept-Encoding` properly.
+- **New public struct fields (breaking for exhaustive struct literals)**: `CacheEntry::compressed`, `StreamingPolicy::{max_chunk_cache_bytes, max_chunk_cache_entries}`, `AdminState::chunk_cache`, and `TierStats::writes`.
+- **Improved HTTP caching & compression compliance**:
+  - `CacheLayer` negotiates `Accept-Encoding: gzip` for layer-compressed entries (decompressing for non-gzip clients, untagging/tagging `-gzip` ETags, and merging `Vary: Accept-Encoding`), and validates `Accept-Encoding` before serving upstream-encoded `Content-Encoding` entries on both full hits and chunk hits (treating mismatched encodings as misses).
+  - Requests carrying `Cookie` follow `CookiePolicy` (`Bypass` by default; `RequirePublic` matches `Authorization` rules; `Ignore` allows shared caching while still stripping `Set-Cookie`); requests carrying `Authorization` only cache/hit responses with `Cache-Control: public`, `must-revalidate`, or `s-maxage=...`. Because `Vary` headers beyond `Accept-Encoding` are not part of the cache key, responses declaring `Vary: Cookie`, `Vary: Authorization`, or `Vary: *` are neither stored nor served when the corresponding request header is present.
+  - `HEAD` requests never overwrite GET cache slots, strip bodies on miss and cached hits, and insert `Content-Length` equal to the full GET body length when the upstream response omits `Content-Length` (preserving RFC 9110 §8.6 behind Axum/Hyper).
+  - `CachePolicy::headers_to_cache` always strips `Set-Cookie`, RFC 9110 hop-by-hop headers, and `Connection`-nominated headers regardless of `header_allowlist`, while both `prepare_cached_payload_and_headers` and `populate_chunk_cache` preserve pre-encoded upstream `Content-Encoding` and `Vary`.
+  - Range requests validate `If-Range` before serving `206`, reject multi-range specs cleanly, normalize clamped end offsets per RFC 9110 §14.1.1, and check request `Range` headers in `RangeHandling::PassThrough`.
+- **Auto-refresh lifecycle & filtering**: `CacheLayer` and `CacheService` share a `RefreshShutdownGuard` so dropping a cloned layer does not stop background refreshes while services remain alive; `RefreshManager` tracks entry expirations against `refresh_before` (proactive pre-expiry refresh requires a non-zero `refresh_before`, otherwise a `tracing::warn!` is emitted), syncs `ChunkCache` during background refresh, and fixes `AccessStats::hits_per_minute` normalization against the full window duration.
+- **Removed unused `pin-project-lite` dependency**, replaced with plain `Pin::new` over `Mutex<UnsyncBoxBody>` in `SyncBoxBody`.
+- **Bounded `GlobalStats` hot-key tracking** (`1,000` keys default) with live `last_accessed` updates on repeat hits.
+- **ML logging & `RequestId` hardening**: `MLLoggingConfig::hash_keys` hashes URIs as well as keys, bypassed requests emit only `Bypass` (not duplicate `Miss`), and `RequestId::from_header` enforces `<= 128` printable ASCII bytes (`0x21..=0x7E`).
+- **`MultiTierBackend` improvements**: `MultiTierBackend::stats(&self)` returns a live `TierStats` snapshot by value (with a new `writes` field), counters are updated across `get`/`set`/promotion, `PromotionStrategy::HitRate` enforces a real 60-second sliding hit window, stale or expiry-less (`expires_at: None`) L2 entries are never promoted to L1, and `invalidate_by_tag` drives deduplicated key invalidation across both tiers without double-counting or leaking tagless L2 copies.
+- **`InMemoryBackend` tag index hygiene**: `set` removes stale prior tags on overwrite, `get` removes tags when a stale window expires, and `get_keys_by_tag` / `list_tags` prune expired or Moka-evicted keys.
+- **Added `#[non_exhaustive]` to public enums**: `StreamingDecision`, `CacheEventType`, `CompressionStrategy`, `PromotionStrategy`, `RangeHandling`, and `CookiePolicy`.
+- **Dependency bumps**: `redis 1.8.2`, `bytes 1.12.2`, `serde 1.0.229`, `serde_json 1.0.154`, `tokio 1.53.3`, `metrics 0.24.6`, `thiserror 2.0.21`, `tracing 0.1.44`, `flate2 1.1.11`, and updated `[dev-dependencies]`.
+
+### Fixed
+
+- **`AdminConfig` & Bearer auth security**: custom `Debug` redacts `auth_token`, `AdminConfig::validate_token` compares SHA-256 digests in constant time and rejects empty/whitespace tokens, and `validate_auth` requires a case-insensitive `Bearer ` scheme.
+- **`AccessStats` window rollover race & burst calculation** in `refresh.rs` (plus silencing unused `err` when `tracing` is disabled).
+- **`RangeRequest::len()`** now returns `Some(0)` when `end < start` so `is_empty()` reports `true`.
+- **`CacheEvent::log`** includes `"target": config.target` in its structured JSON payload.
+
+### Removed
+
+- **Unused optional `tokio-util` dependency**: removed `tokio-util` from `[dependencies]` and `redis-backend` (dropping the implicit `tokio-util` feature).
+- **0.5.x Redis legacy migration surface**: removed `legacy-bincode1-read` feature flag, `src/codec/legacy.rs`, deprecated `BincodeCodec` alias, `0.5.x` binary fixture files, and legacy envelope fallback branches.
+
 ## [0.6.1] - 2026-08-27
 
 ### Fixed

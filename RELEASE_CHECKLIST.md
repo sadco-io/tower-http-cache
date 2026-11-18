@@ -8,9 +8,6 @@ Use this checklist before publishing a new version to crates.io.
 - [ ] All targets compile: `cargo test --no-run --all-features --all-targets`
       (not `cargo check` — it skips `#[cfg(test)]` modules, integration tests,
       examples and benches, several of which carry `required-features`)
-- [ ] `legacy-bincode1-read` builds in both directions:
-      `cargo test --no-default-features --features in-memory,serde,redis-backend`
-      and the same line with `,legacy-bincode1-read` appended
 - [ ] `bincode` is absent from the graph: `cargo tree -i bincode --all-features`
       finds nothing
 - [ ] `cargo deny check` reports `advisories ok, bans ok, licenses ok, sources ok`

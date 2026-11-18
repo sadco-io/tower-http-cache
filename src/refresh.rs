@@ -20,8 +20,8 @@
 
 use dashmap::DashMap;
 use http::{Method, Request, Uri};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{RwLock, Semaphore};
 use tokio::task::JoinHandle;
@@ -33,6 +33,13 @@ use metrics::{counter, gauge, histogram};
 use tracing::{debug, error, info, instrument};
 
 /// Configuration for auto-refresh functionality.
+///
+/// Proactive refresh before expiry requires a non-zero
+/// [`CachePolicy::refresh_before`](crate::policy::CachePolicy::refresh_before)
+/// window (configured via
+/// [`CacheLayerBuilder::refresh_before`](crate::layer::CacheLayerBuilder::refresh_before));
+/// with the default `Duration::ZERO`, entries only qualify for refresh after
+/// they have already expired.
 #[derive(Debug, Clone)]
 pub struct AutoRefreshConfig {
     /// Enable auto-refresh (default: false)
@@ -152,17 +159,21 @@ impl RefreshMetadata {
     }
 }
 
-/// Lock-free access frequency tracker with time-decay.
+#[derive(Debug)]
+struct WindowState {
+    start_ms: u64,
+    hits: u64,
+}
+
+/// Access frequency tracker with synchronized sliding window reset.
 #[derive(Debug)]
 struct AccessStats {
     /// Total hit count
     hits: AtomicU64,
     /// Last access timestamp (milliseconds since UNIX_EPOCH)
     last_access_ms: AtomicU64,
-    /// First access timestamp in current window (milliseconds since UNIX_EPOCH)
-    window_start_ms: AtomicU64,
-    /// Hits in current window
-    window_hits: AtomicU64,
+    /// Synchronized `(window_start_ms, window_hits)` so window reset is atomic
+    window: Mutex<WindowState>,
 }
 
 impl AccessStats {
@@ -175,8 +186,10 @@ impl AccessStats {
         Self {
             hits: AtomicU64::new(0),
             last_access_ms: AtomicU64::new(now_ms),
-            window_start_ms: AtomicU64::new(now_ms),
-            window_hits: AtomicU64::new(0),
+            window: Mutex::new(WindowState {
+                start_ms: now_ms,
+                hits: 0,
+            }),
         }
     }
 
@@ -189,13 +202,13 @@ impl AccessStats {
         self.hits.fetch_add(1, Ordering::Relaxed);
         self.last_access_ms.store(now_ms, Ordering::Relaxed);
 
-        let window_start = self.window_start_ms.load(Ordering::Relaxed);
-        if now_ms.saturating_sub(window_start) > window_duration_ms {
-            // Reset window
-            self.window_start_ms.store(now_ms, Ordering::Relaxed);
-            self.window_hits.store(1, Ordering::Relaxed);
+        let mut window = self.window.lock().unwrap_or_else(|e| e.into_inner());
+        if now_ms.saturating_sub(window.start_ms) > window_duration_ms {
+            // Reset window atomically with respect to hits_per_minute readers.
+            window.start_ms = now_ms;
+            window.hits = 1;
         } else {
-            self.window_hits.fetch_add(1, Ordering::Relaxed);
+            window.hits = window.hits.saturating_add(1);
         }
     }
 
@@ -205,25 +218,25 @@ impl AccessStats {
             .unwrap_or_default()
             .as_millis() as u64;
 
-        let window_start = self.window_start_ms.load(Ordering::Relaxed);
-        let window_hits = self.window_hits.load(Ordering::Relaxed);
+        let (window_start, window_hits) = {
+            let window = self.window.lock().unwrap_or_else(|e| e.into_inner());
+            (window.start_ms, window.hits)
+        };
 
-        let elapsed_ms = now_ms.saturating_sub(window_start);
-        if elapsed_ms == 0 {
+        if window_hits == 0 {
             return 0.0;
         }
 
-        // Check if window has expired
+        let elapsed_ms = now_ms.saturating_sub(window_start);
         if elapsed_ms > window_duration_ms {
             return 0.0;
         }
 
-        let elapsed_minutes = elapsed_ms as f64 / 60_000.0;
-        if elapsed_minutes == 0.0 {
-            return 0.0;
-        }
-
-        window_hits as f64 / elapsed_minutes
+        // Normalize against the full configured window duration so early samples in a
+        // fresh window (e.g. 1 hit at 1ms in a 60s window) do not report artificially
+        // inflated rates like 60,000 hits/min.
+        let window_minutes = window_duration_ms.max(1) as f64 / 60_000.0;
+        window_hits as f64 / window_minutes
     }
 
     fn last_access(&self) -> SystemTime {
@@ -335,11 +348,18 @@ pub trait RefreshCallback: Send + Sync {
     fn refresh(&self, key: String, metadata: RefreshMetadata) -> RefreshFuture;
 }
 
+#[derive(Clone)]
+struct MetadataEntry {
+    metadata: RefreshMetadata,
+    expires_at: Option<SystemTime>,
+}
+
 /// Manages the auto-refresh background task and state.
 pub struct RefreshManager {
     tracker: AccessTracker,
-    metadata_store: Arc<DashMap<String, RefreshMetadata>>,
+    metadata_store: Arc<DashMap<String, MetadataEntry>>,
     config: Arc<AutoRefreshConfig>,
+    refresh_before: Duration,
     shutdown_tx: Arc<RwLock<Option<tokio::sync::oneshot::Sender<()>>>>,
     pub(crate) task_handle: Arc<RwLock<Option<JoinHandle<()>>>>,
 }
@@ -351,9 +371,16 @@ impl RefreshManager {
             tracker: AccessTracker::new(config.clone()),
             metadata_store: Arc::new(DashMap::new()),
             config: Arc::new(config),
+            refresh_before: Duration::ZERO,
             shutdown_tx: Arc::new(RwLock::new(None)),
             task_handle: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Configures the `refresh_before` expiry window for candidate selection.
+    pub fn with_refresh_before(mut self, refresh_before: Duration) -> Self {
+        self.refresh_before = refresh_before;
+        self
     }
 
     /// Returns the access tracker.
@@ -361,16 +388,45 @@ impl RefreshManager {
         &self.tracker
     }
 
-    /// Stores refresh metadata for a key.
+    /// Stores refresh metadata for a key without an expiry constraint.
     pub fn store_metadata(&self, key: String, metadata: RefreshMetadata) {
-        self.metadata_store.insert(key, metadata);
+        self.metadata_store.insert(
+            key,
+            MetadataEntry {
+                metadata,
+                expires_at: None,
+            },
+        );
+    }
+
+    /// Stores refresh metadata for a key along with the cache entry's expiration timestamp.
+    pub fn store_metadata_with_expiry(
+        &self,
+        key: String,
+        metadata: RefreshMetadata,
+        expires_at: SystemTime,
+    ) {
+        self.metadata_store.insert(
+            key,
+            MetadataEntry {
+                metadata,
+                expires_at: Some(expires_at),
+            },
+        );
+    }
+
+    /// Updates the stored expiration timestamp for a tracked key, if present.
+    pub fn update_expiry(&self, key: &str, expires_at: SystemTime) {
+        if let Some(mut entry) = self.metadata_store.get_mut(key) {
+            entry.expires_at = Some(expires_at);
+        }
     }
 
     /// Retrieves refresh metadata for a key.
     pub fn get_metadata(&self, key: &str) -> Option<RefreshMetadata> {
         self.metadata_store
             .get(key)
-            .map(|entry| entry.value().clone())
+            .map(|entry| entry.value().metadata.clone())
     }
 
     /// Starts the background refresh task.
@@ -402,9 +458,18 @@ impl RefreshManager {
         let config = self.config.clone();
         let tracker = self.tracker.clone();
         let metadata_store = self.metadata_store.clone();
+        let refresh_before = self.refresh_before;
 
         let handle = tokio::spawn(async move {
-            refresh_task(config, tracker, metadata_store, callback, shutdown_rx).await;
+            refresh_task(
+                config,
+                tracker,
+                metadata_store,
+                refresh_before,
+                callback,
+                shutdown_rx,
+            )
+            .await;
         });
 
         // Store task handle
@@ -460,7 +525,8 @@ impl Drop for RefreshManager {
 async fn refresh_task<C>(
     config: Arc<AutoRefreshConfig>,
     tracker: AccessTracker,
-    metadata_store: Arc<DashMap<String, RefreshMetadata>>,
+    metadata_store: Arc<DashMap<String, MetadataEntry>>,
+    refresh_before: Duration,
     callback: Arc<C>,
     mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
 ) where
@@ -486,7 +552,12 @@ async fn refresh_task<C>(
         tokio::select! {
             _ = check_interval.tick() => {
                 // Check for refresh candidates
-                let candidates = find_refresh_candidates(&tracker, &metadata_store);
+                let candidates = find_refresh_candidates(
+                    &tracker,
+                    &metadata_store,
+                    refresh_before,
+                    SystemTime::now(),
+                );
 
                 #[cfg(feature = "tracing")]
                 debug!(candidates = candidates.len(), "Found refresh candidates");
@@ -529,6 +600,8 @@ async fn refresh_task<C>(
 
                                     #[cfg(feature = "tracing")]
                                     error!(key = %key_clone, error = %err, "Refresh failed");
+                                    #[cfg(not(feature = "tracing"))]
+                                    let _ = err;
                                 }
                             }
                         }
@@ -569,14 +642,23 @@ async fn refresh_task<C>(
 /// Finds cache keys that should be refreshed proactively.
 fn find_refresh_candidates(
     tracker: &AccessTracker,
-    metadata_store: &DashMap<String, RefreshMetadata>,
+    metadata_store: &DashMap<String, MetadataEntry>,
+    refresh_before: Duration,
+    now: SystemTime,
 ) -> Vec<(String, RefreshMetadata)> {
     let mut candidates = Vec::new();
 
     for entry in metadata_store.iter() {
         let key = entry.key();
-        if tracker.should_auto_refresh(key) {
-            candidates.push((key.clone(), entry.value().clone()));
+        let value = entry.value();
+        let within_window = match value.expires_at {
+            Some(expires_at) => {
+                expires_at.duration_since(now).unwrap_or(Duration::ZERO) <= refresh_before
+            }
+            None => true,
+        };
+        if within_window && tracker.should_auto_refresh(key) {
+            candidates.push((key.clone(), value.metadata.clone()));
         }
     }
 
@@ -753,12 +835,25 @@ mod tests {
         for _ in 0..10 {
             tracker.record_hit("key1");
         }
-        metadata_store.insert("key1".to_string(), metadata.clone());
+        metadata_store.insert(
+            "key1".to_string(),
+            MetadataEntry {
+                metadata: metadata.clone(),
+                expires_at: None,
+            },
+        );
 
         // Add another key with no hits - should not be a candidate
-        metadata_store.insert("key2".to_string(), metadata.clone());
+        metadata_store.insert(
+            "key2".to_string(),
+            MetadataEntry {
+                metadata: metadata.clone(),
+                expires_at: None,
+            },
+        );
 
-        let candidates = find_refresh_candidates(&tracker, &metadata_store);
+        let candidates =
+            find_refresh_candidates(&tracker, &metadata_store, Duration::ZERO, SystemTime::now());
 
         // Either 0 or 1 candidate depending on timing - both are acceptable
         // The important thing is that key2 is not included
@@ -770,5 +865,83 @@ mod tests {
         if !candidates.is_empty() {
             assert_eq!(candidates[0].0, "key1");
         }
+    }
+
+    #[test]
+    fn access_stats_submillisecond_burst_and_window_rollover() {
+        let stats = AccessStats::new();
+        assert_eq!(stats.hits_per_minute(1_000), 0.0);
+
+        stats.record_hit(1_000);
+        stats.record_hit(1_000);
+        let rate = stats.hits_per_minute(1_000);
+        assert!(
+            rate > 0.0,
+            "burst traffic should produce non-zero rate, got {rate}"
+        );
+
+        // Force window expiration and verify rollover resets window count atomically.
+        {
+            let mut w = stats.window.lock().unwrap();
+            w.start_ms = w.start_ms.saturating_sub(500);
+        }
+        assert_eq!(stats.hits_per_minute(100), 0.0);
+
+        stats.record_hit(100);
+        let post_rollover = stats.window.lock().unwrap();
+        assert_eq!(post_rollover.hits, 1);
+    }
+
+    #[test]
+    fn access_stats_does_not_inflate_early_window_rate() {
+        let stats = AccessStats::new();
+        stats.record_hit(60_000);
+        let rate = stats.hits_per_minute(60_000);
+        assert!(
+            (rate - 1.0).abs() < 1e-6,
+            "1 hit in a 60s window must equal 1.0 hits/min, got {rate}"
+        );
+    }
+
+    #[test]
+    fn find_refresh_candidates_respects_refresh_before_window() {
+        let config = AutoRefreshConfig {
+            min_hits_per_minute: 1.0,
+            hit_rate_window: Duration::from_secs(60),
+            ..Default::default()
+        };
+        let tracker = AccessTracker::new(config);
+        let metadata_store = DashMap::new();
+        let metadata = RefreshMetadata {
+            method: Method::GET,
+            uri: Uri::from_static("http://example.com"),
+            headers: Vec::new(),
+        };
+
+        for _ in 0..5 {
+            tracker.record_hit("far");
+            tracker.record_hit("soon");
+        }
+
+        let now = SystemTime::now();
+        metadata_store.insert(
+            "far".to_string(),
+            MetadataEntry {
+                metadata: metadata.clone(),
+                expires_at: Some(now + Duration::from_secs(30)),
+            },
+        );
+        metadata_store.insert(
+            "soon".to_string(),
+            MetadataEntry {
+                metadata,
+                expires_at: Some(now + Duration::from_secs(2)),
+            },
+        );
+
+        let candidates =
+            find_refresh_candidates(&tracker, &metadata_store, Duration::from_secs(5), now);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, "soon");
     }
 }

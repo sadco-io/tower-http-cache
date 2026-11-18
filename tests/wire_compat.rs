@@ -1,5 +1,4 @@
-//! Wire-format tests: the 0.6.0 envelope, and cross-version compatibility with
-//! entries written by 0.5.x.
+//! Wire-format tests for the versioned `THC` envelope and `PostcardCodec`.
 //!
 //! These operate on byte slices only, so no Redis server is needed.
 
@@ -39,6 +38,7 @@ fn assert_entry_eq(got: &CacheEntry, want: &CacheEntry) {
     assert_eq!(got.headers, want.headers, "headers");
     assert_eq!(got.body, want.body, "body");
     assert_eq!(got.tags, want.tags, "tags");
+    assert_eq!(got.compressed, want.compressed, "compressed");
 }
 
 // --------------------------------------------------------------------------
@@ -58,7 +58,7 @@ fn envelope_header_layout_is_as_documented() {
     );
 
     assert_eq!(&bytes[0..3], b"THC");
-    assert_eq!(bytes[3], envelope::FORMAT_V1);
+    assert_eq!(bytes[3], envelope::FORMAT_V2);
     assert_eq!(bytes[4], envelope::CODEC_POSTCARD);
     assert_eq!(
         u64::from_le_bytes(bytes[5..13].try_into().unwrap()),
@@ -216,14 +216,81 @@ fn unknown_codec_id_is_a_miss() {
 fn unknown_format_version_is_a_miss() {
     let entry = sample(Bytes::from_static(b"payload"), None);
     let payload = PostcardCodec.encode(&entry).unwrap();
-    let mut bytes = envelope::wrap(PostcardCodec::CODEC_ID, 1, 2, &payload);
-    bytes[3] = 0x02;
+    for version in [0x00_u8, 0x03, 0x7f] {
+        let mut bytes = envelope::wrap(PostcardCodec::CODEC_ID, 1, 2, &payload);
+        bytes[3] = version;
 
-    assert!(
-        envelope::read_stored(&bytes, &PostcardCodec)
-            .unwrap()
-            .is_none()
+        assert!(
+            envelope::read_stored(&bytes, &PostcardCodec)
+                .unwrap()
+                .is_none(),
+            "format version {version:#04x} must read as a miss"
+        );
+    }
+}
+
+/// Golden 0.6.x (`FORMAT_V1`) payload: 5-field postcard `StoredEntry` without
+/// `compressed`, wrapped with `FORMAT_V1 = 0x01`. `0.7.0` must read it cleanly
+/// with `compressed = false`, and `0.6.x` nodes must reject `FORMAT_V2` as a miss.
+#[test]
+fn v1_06x_golden_payload_decodes_cleanly_and_v2_is_rejected_by_v1_readers() {
+    // Authentic 0.6.x postcard payload (5 fields: status=200, version=2 (HTTP/1.1),
+    // headers=[("content-type", b"text/plain")], body=b"hello-06", tags=Some(["tag:a"])).
+    #[derive(serde::Serialize)]
+    struct StoredEntryV06<'a> {
+        status: u16,
+        version: u8,
+        headers: Vec<(&'a str, &'a [u8])>,
+        body: &'a [u8],
+        tags: Option<Vec<&'a str>>,
+    }
+
+    let v06_payload = postcard::to_allocvec(&StoredEntryV06 {
+        status: 200,
+        version: 2,
+        headers: vec![("content-type", b"text/plain")],
+        body: b"hello-06",
+        tags: Some(vec!["tag:a"]),
+    })
+    .unwrap();
+
+    // Direct PostcardCodec::decode fallback on 0.6.x payload.
+    let direct = PostcardCodec.decode(&v06_payload).unwrap();
+    assert_eq!(direct.status, StatusCode::OK);
+    assert_eq!(direct.version, Version::HTTP_11);
+    assert_eq!(
+        direct.headers,
+        vec![("content-type".to_string(), b"text/plain".to_vec())]
     );
+    assert_eq!(direct.body, Bytes::from_static(b"hello-06"));
+    assert_eq!(direct.tags, Some(vec!["tag:a".to_string()]));
+    assert!(!direct.compressed);
+
+    // Full FORMAT_V1 envelope as written by 0.6.x RedisBackend::set.
+    let mut v1_envelope = Vec::with_capacity(envelope::ENVELOPE_HEADER_LEN + v06_payload.len());
+    v1_envelope.extend_from_slice(&envelope::MAGIC);
+    v1_envelope.push(envelope::FORMAT_V1);
+    v1_envelope.push(envelope::CODEC_POSTCARD);
+    v1_envelope.extend_from_slice(&1_777_000_000_000u64.to_le_bytes());
+    v1_envelope.extend_from_slice(&1_777_000_060_000u64.to_le_bytes());
+    v1_envelope.extend_from_slice(&v06_payload);
+
+    let read = envelope::read_stored(&v1_envelope, &PostcardCodec)
+        .unwrap()
+        .expect("0.6.x FORMAT_V1 entry must decode cleanly");
+    assert_eq!(read.entry.body, Bytes::from_static(b"hello-06"));
+    assert_eq!(read.entry.tags, Some(vec!["tag:a".to_string()]));
+    assert!(!read.entry.compressed);
+
+    // Reverse mixed-fleet check: 0.7.0 writes FORMAT_V2, which 0.6.x readers
+    // (checking bytes[3] == FORMAT_V1) cleanly reject as a miss instead of
+    // mis-decoding compressed bodies.
+    let mut compressed_entry = sample(Bytes::from_static(b"\x1f\x8b\x08\x00"), None);
+    compressed_entry.compressed = true;
+    let v2_payload = PostcardCodec.encode(&compressed_entry).unwrap();
+    let v2_envelope = envelope::wrap(PostcardCodec::CODEC_ID, 1, 2, &v2_payload);
+    assert_eq!(v2_envelope[3], envelope::FORMAT_V2);
+    assert_ne!(v2_envelope[3], envelope::FORMAT_V1);
 }
 
 // --------------------------------------------------------------------------
@@ -257,362 +324,6 @@ fn rollback_bytes_are_rejected_by_0_5_x_readers() {
 }
 
 // --------------------------------------------------------------------------
-// 0.5.x compatibility: golden fixtures
-//
-// The `.bin` files under tests/fixtures/v0_5_1/ are real bytes written by the
-// published 0.5.1 code path -- see the README there. The expectations below
-// are recomputed from the same deterministic generators the fixture writer
-// used, so the expected values are not stored twice; the *encoding* is never
-// restated by hand.
-// --------------------------------------------------------------------------
-
-/// `(name, status, version_u8, header_kind, body_kind, body_len, tag_kind)`
-const FIXTURE_CASES: &[(&str, u16, u8, u8, u8, usize, u8)] = &[
-    ("s200_v11_h0_b0_ascii", 200, 2, 0, 0, 0, 0),
-    ("s200_v11_h1_b1_ascii", 200, 2, 1, 0, 1, 1),
-    ("s204_v10_h0_b0_ascii", 204, 1, 0, 0, 0, 2),
-    ("s404_v2_h8_b512_ascii", 404, 3, 2, 0, 512, 3),
-    ("s500_v11_h1_b4096_nonutf8", 500, 2, 1, 1, 4096, 0),
-    ("s200_v11_h8_b4096_ascii", 200, 2, 2, 0, 4096, 3),
-    ("s200_v09_h1_b13_nonutf8", 200, 0, 1, 1, 13, 1),
-    ("s200_v3_h1_b13_ascii", 200, 4, 1, 0, 13, 2),
-    ("s200_v11_h8_b256_nonutf8", 200, 2, 2, 1, 256, 3),
-];
-
-fn fx_body(kind: u8, n: usize) -> Vec<u8> {
-    match kind {
-        0 => (0..n).map(|i| b'a' + (i % 26) as u8).collect(),
-        _ => (0..n).map(|i| (i % 256) as u8).collect(),
-    }
-}
-
-fn fx_headers(kind: u8) -> Vec<(String, Vec<u8>)> {
-    match kind {
-        0 => Vec::new(),
-        1 => vec![("content-type".to_string(), b"application/json".to_vec())],
-        _ => vec![
-            (
-                "content-type".to_string(),
-                b"application/json; charset=utf-8".to_vec(),
-            ),
-            ("etag".to_string(), b"\"9f8a7b6c\"".to_vec()),
-            ("cache-control".to_string(), b"public, max-age=60".to_vec()),
-            ("vary".to_string(), b"accept-encoding".to_vec()),
-            (
-                "x-request-id".to_string(),
-                b"01890f3e-2c2a-7c1e-9a1b-000000000000".to_vec(),
-            ),
-            ("content-encoding".to_string(), b"gzip".to_vec()),
-            ("x-binary".to_string(), vec![0x00, 0xff, 0xfe, 0x80, 0x7f]),
-            ("server".to_string(), b"tower-http-cache/0.5.1".to_vec()),
-        ],
-    }
-}
-
-fn fx_tags(kind: u8) -> Option<Vec<String>> {
-    match kind {
-        0 => None,
-        1 => Some(vec![]),
-        2 => Some(vec!["user:123".to_string()]),
-        _ => Some(vec!["user:123".to_string(), "tenant:acme".to_string()]),
-    }
-}
-
-fn fx_version(v: u8) -> Version {
-    match v {
-        0 => Version::HTTP_09,
-        1 => Version::HTTP_10,
-        2 => Version::HTTP_11,
-        3 => Version::HTTP_2,
-        _ => Version::HTTP_3,
-    }
-}
-
-fn fx_times(i: usize) -> (u64, u64) {
-    let expires = 1_777_000_000_000u64 + (i as u64) * 1_000;
-    (expires, expires + 60_000)
-}
-
-fn fixture_bytes(name: &str) -> Vec<u8> {
-    let path = format!(
-        "{}/tests/fixtures/v0_5_1/redis_{}.bin",
-        env!("CARGO_MANIFEST_DIR"),
-        name
-    );
-    std::fs::read(&path).unwrap_or_else(|e| panic!("missing fixture {path}: {e}"))
-}
-
-// --------------------------------------------------------------------------
-// A bincode-1 writer, used only to scale the fixtures up to sizes that would
-// be wasteful to commit. It is not trusted on its own: the first test below
-// asserts it reproduces every committed fixture byte for byte, so anything
-// built with it afterwards has the same authority as a real 0.5.1 buffer.
-// --------------------------------------------------------------------------
-
-mod bincode1 {
-    fn push_len(out: &mut Vec<u8>, n: usize) {
-        out.extend_from_slice(&(n as u64).to_le_bytes());
-    }
-
-    fn push_bytes(out: &mut Vec<u8>, b: &[u8]) {
-        push_len(out, b.len());
-        out.extend_from_slice(b);
-    }
-
-    fn push_headers(out: &mut Vec<u8>, headers: &[(String, Vec<u8>)]) {
-        push_len(out, headers.len());
-        for (name, value) in headers {
-            push_bytes(out, name.as_bytes());
-            push_bytes(out, value);
-        }
-    }
-
-    /// 0.5.x `codec::StoredEntry` -- note: no tags field.
-    pub fn stored_entry(
-        status: u16,
-        version: u8,
-        headers: &[(String, Vec<u8>)],
-        body: &[u8],
-    ) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(&status.to_le_bytes());
-        out.push(version);
-        push_headers(&mut out, headers);
-        push_bytes(&mut out, body);
-        out
-    }
-
-    /// 0.5.x `backend::redis::RedisRecord`.
-    pub fn redis_record(payload: &[u8], expires_at_ms: u64, stale_until_ms: u64) -> Vec<u8> {
-        let mut out = Vec::with_capacity(payload.len() + 24);
-        push_bytes(&mut out, payload);
-        out.extend_from_slice(&expires_at_ms.to_le_bytes());
-        out.extend_from_slice(&stale_until_ms.to_le_bytes());
-        out
-    }
-}
-
-fn synthetic_legacy_redis(
-    status: u16,
-    version: u8,
-    headers: &[(String, Vec<u8>)],
-    body: &[u8],
-    expires_at_ms: u64,
-    stale_until_ms: u64,
-) -> Vec<u8> {
-    let payload = bincode1::stored_entry(status, version, headers, body);
-    bincode1::redis_record(&payload, expires_at_ms, stale_until_ms)
-}
-
-/// Establishes the synthetic writer's authority: it must reproduce every real
-/// 0.5.1 fixture exactly. If this fails, nothing built with the writer means
-/// anything.
-#[test]
-fn synthetic_writer_reproduces_real_fixtures() {
-    for (i, (name, status, ver, hk, bk, blen, _tk)) in FIXTURE_CASES.iter().enumerate() {
-        let headers = fx_headers(*hk);
-        let body = fx_body(*bk, *blen);
-        let (expires, stale) = fx_times(i);
-
-        let redis = synthetic_legacy_redis(*status, *ver, &headers, &body, expires, stale);
-        assert_eq!(
-            redis,
-            fixture_bytes(name),
-            "synthetic redis bytes differ from the real 0.5.1 fixture for {name}"
-        );
-    }
-}
-
-#[cfg(feature = "legacy-bincode1-read")]
-mod legacy_reader {
-    use super::*;
-    use tower_http_cache::codec::legacy::decode_legacy_redis;
-
-    /// Every real 0.5.1 Redis fixture decodes field by field. `tags` must be
-    /// `None`: 0.5.x's Redis codec genuinely dropped them, and asserting that
-    /// here pins the scope of the A1 fix.
-    #[test]
-    fn legacy_redis_entries_decode() {
-        for (i, (name, status, ver, hk, bk, blen, _tk)) in FIXTURE_CASES.iter().enumerate() {
-            let read =
-                decode_legacy_redis(&fixture_bytes(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
-
-            assert_eq!(read.entry.status.as_u16(), *status, "{name} status");
-            assert_eq!(read.entry.version, fx_version(*ver), "{name} version");
-            assert_eq!(read.entry.headers, fx_headers(*hk), "{name} headers");
-            assert_eq!(
-                read.entry.body,
-                Bytes::from(fx_body(*bk, *blen)),
-                "{name} body"
-            );
-            assert_eq!(
-                read.entry.tags, None,
-                "{name} tags (0.5.x redis dropped them)"
-            );
-
-            let (expires, stale) = fx_times(i);
-            assert_eq!(
-                read.expires_at,
-                Some(envelope::unix_ms_to_system_time(expires)),
-                "{name} expires_at"
-            );
-            assert_eq!(
-                read.stale_until,
-                Some(envelope::unix_ms_to_system_time(stale)),
-                "{name} stale_until"
-            );
-        }
-    }
-
-    /// The reader must reject bytes it did not fully consume.
-    #[test]
-    fn legacy_reader_rejects_trailing_bytes_and_truncation() {
-        for (name, ..) in FIXTURE_CASES.iter() {
-            let redis = fixture_bytes(name);
-            let mut extended = redis.clone();
-            extended.push(0);
-            assert!(
-                decode_legacy_redis(&extended).is_err(),
-                "{name}: trailing bytes must be rejected"
-            );
-            assert!(
-                decode_legacy_redis(&redis[..redis.len() - 1]).is_err(),
-                "{name}: truncation must be rejected"
-            );
-        }
-    }
-}
-
-// --------------------------------------------------------------------------
-// Dispatch: a 0.5.x buffer must never be mistaken for an envelope, and vice
-// versa
-// --------------------------------------------------------------------------
-
-/// No committed 0.5.1 fixture carries the envelope magic.
-#[test]
-fn magic_never_matches_legacy_fixtures() {
-    for (name, ..) in FIXTURE_CASES.iter() {
-        let bytes = fixture_bytes(name);
-        assert!(
-            !envelope::looks_like_v2(&bytes),
-            "{name} was misread as an envelope"
-        );
-    }
-}
-
-/// The property version: thousands of legacy buffers across body sizes and tag
-/// configurations, none of which may look like an envelope.
-#[test]
-fn magic_never_matches_legacy_property() {
-    for n in 0..3000usize {
-        let headers = fx_headers((n % 3) as u8);
-        let body = fx_body((n % 2) as u8, n);
-
-        let redis = synthetic_legacy_redis(200, 2, &headers, &body, n as u64, n as u64);
-        assert!(!envelope::looks_like_v2(&redis), "redis body={n}");
-    }
-}
-
-/// The case the naive magic-prefix argument missed.
-///
-/// A legacy Redis value begins with its inner payload length as a
-/// little-endian `u64`. If that length is exactly `0x0143_4854` the first four
-/// bytes *are* `"THC"` followed by `FORMAT_V1` — so `looks_like_v2` returns
-/// true on a genuine 0.5.x buffer. `CachePolicy::max_body_size` defaults to
-/// `None`, so a ~20 MiB cached response is reachable in a default
-/// configuration and this is not a hypothetical.
-///
-/// The exact `is_legacy_redis` length identity is what makes the dispatch
-/// correct anyway.
-#[test]
-fn twenty_one_megabyte_legacy_redis_buffer_carries_the_magic_and_still_decodes() {
-    // payload_len == 0x0143_4854 puts "THC\x01" in bytes 0..4.
-    const TARGET_PAYLOAD_LEN: usize = 0x0143_4854;
-    // StoredEntry with zero headers: u16 status + u8 version + u64 header
-    // count + u64 body length = 19 bytes of overhead.
-    let body_len = TARGET_PAYLOAD_LEN - 19;
-    let body = vec![0x5au8; body_len];
-
-    let payload = bincode1::stored_entry(200, 2, &[], &body);
-    assert_eq!(payload.len(), TARGET_PAYLOAD_LEN);
-    let bytes = bincode1::redis_record(&payload, 1_777_000_000_000, 1_777_000_060_000);
-
-    assert_eq!(&bytes[0..3], b"THC");
-    assert_eq!(bytes[3], envelope::FORMAT_V1);
-    assert!(
-        envelope::looks_like_v2(&bytes),
-        "this is the hazard being pinned: the magic check alone says yes"
-    );
-    assert!(
-        envelope::is_legacy_redis(&bytes),
-        "the exact length identity must still identify it as legacy"
-    );
-
-    let read = envelope::read_stored(&bytes, &PostcardCodec).unwrap();
-    if cfg!(feature = "legacy-bincode1-read") {
-        let read = read.expect("must decode as a legacy entry, not as an envelope");
-        assert_eq!(read.entry.status, StatusCode::OK);
-        assert_eq!(read.entry.body.len(), body_len);
-        assert_eq!(
-            read.expires_at,
-            Some(envelope::unix_ms_to_system_time(1_777_000_000_000))
-        );
-    } else {
-        assert!(read.is_none(), "without the legacy reader this is a miss");
-    }
-}
-
-/// `is_legacy_redis` identifies every legacy Redis buffer and no envelope.
-#[test]
-fn is_legacy_redis_is_exact() {
-    let headers = fx_headers(2);
-    let codec = PostcardCodec;
-
-    for n in (0..2000usize).chain([100_000, 1_000_000]) {
-        let body = fx_body((n % 2) as u8, n);
-        let entry = sample(Bytes::from(body.clone()), fx_tags((n % 4) as u8));
-
-        let legacy = synthetic_legacy_redis(200, 2, &headers, &body, n as u64, n as u64);
-        assert!(envelope::is_legacy_redis(&legacy), "legacy body={n}");
-
-        let payload = codec.encode(&entry).unwrap();
-        let v2 = envelope::wrap(
-            PostcardCodec::CODEC_ID,
-            1_777_000_000_000 + n as u64,
-            1_777_000_060_000,
-            &payload,
-        );
-        assert!(!envelope::is_legacy_redis(&v2), "envelope body={n}");
-    }
-}
-
-/// The feature is verified in both directions from one test: with the legacy
-/// reader compiled in, real 0.5.1 bytes are a hit; without it, they are a
-/// clean miss -- never an error, never a panic.
-#[test]
-fn legacy_fixtures_through_read_stored() {
-    for (name, status, ver, hk, bk, blen, _tk) in FIXTURE_CASES.iter() {
-        let bytes = fixture_bytes(name);
-        let read = envelope::read_stored(&bytes, &PostcardCodec).unwrap();
-
-        if cfg!(feature = "legacy-bincode1-read") {
-            let read = read.unwrap_or_else(|| panic!("{name} must be a hit"));
-            assert_eq!(read.entry.status.as_u16(), *status);
-            assert_eq!(read.entry.version, fx_version(*ver));
-            assert_eq!(read.entry.headers, fx_headers(*hk));
-            assert_eq!(read.entry.body, Bytes::from(fx_body(*bk, *blen)));
-            // 0.5.x's Redis codec dropped tags, so they must not reappear.
-            assert_eq!(read.entry.tags, None);
-        } else {
-            assert!(
-                read.is_none(),
-                "{name} must be a miss without legacy-bincode1-read"
-            );
-        }
-    }
-}
-
-// --------------------------------------------------------------------------
 // Hostile input
 // --------------------------------------------------------------------------
 
@@ -641,7 +352,7 @@ fn hostile_inputs() -> Vec<Vec<u8>> {
         },
         // absurd declared length followed by nothing
         vec![0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1, 2, 3],
-        // a length identity that says "legacy" over a buffer of noise
+        // a length-prefixed noise buffer
         {
             let mut v = 8u64.to_le_bytes().to_vec();
             v.extend_from_slice(&[0xab; 24]);
@@ -649,8 +360,18 @@ fn hostile_inputs() -> Vec<Vec<u8>> {
         },
     ];
 
-    // Truncations and single-byte flips of a real fixture.
-    let bytes = fixture_bytes("s200_v11_h8_b256_nonutf8");
+    // Truncations and single-byte flips of a real v2 envelope.
+    let sample_entry = sample(
+        Bytes::from((0..=255u8).collect::<Vec<u8>>()),
+        Some(vec!["tag:a".to_string()]),
+    );
+    let payload = PostcardCodec.encode(&sample_entry).unwrap();
+    let bytes = envelope::wrap(
+        PostcardCodec::CODEC_ID,
+        1_777_000_000_000,
+        1_777_000_060_000,
+        &payload,
+    );
     for cut in [0, 1, 7, 8, 9, 20, 21, 40, bytes.len() / 2, bytes.len() - 1] {
         cases.push(bytes[..cut].to_vec());
     }
@@ -689,4 +410,25 @@ fn corrupt_input_never_panics() {
         // is never acceptable is a panic or an unbounded allocation.
         let _ = result.unwrap();
     }
+}
+
+#[test]
+fn postcard_codec_round_trips_compressed_flag() {
+    let codec = PostcardCodec;
+
+    let uncompressed = sample(Bytes::from_static(b"plain"), None);
+    let encoded_plain = codec.encode(&uncompressed).unwrap();
+    let decoded_plain = codec.decode(&encoded_plain).unwrap();
+    assert_entry_eq(&decoded_plain, &uncompressed);
+    assert!(!decoded_plain.compressed);
+
+    let mut compressed = sample(
+        Bytes::from_static(b"\x1f\x8b\x08\x00"),
+        Some(vec!["gz".into()]),
+    );
+    compressed.compressed = true;
+    let encoded_gz = codec.encode(&compressed).unwrap();
+    let decoded_gz = codec.decode(&encoded_gz).unwrap();
+    assert_entry_eq(&decoded_gz, &compressed);
+    assert!(decoded_gz.compressed);
 }

@@ -18,14 +18,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 #[cfg(feature = "redis-backend")]
-use axum::{Router, routing::get};
+use axum::{Router, error_handling::HandleErrorLayer, http::StatusCode, routing::get};
 #[cfg(feature = "redis-backend")]
 use redis::Client;
 #[cfg(feature = "redis-backend")]
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 #[cfg(feature = "redis-backend")]
-use tower_http_cache::prelude::*;
+use tower::ServiceBuilder;
 #[cfg(feature = "redis-backend")]
+use tower_http_cache::layer::BoxError;
+#[cfg(feature = "redis-backend")]
+use tower_http_cache::prelude::*;
+
 #[cfg(feature = "redis-backend")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -47,7 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let backend = RedisBackend::new(manager);
 
-    let _cache_layer = CacheLayer::builder(backend)
+    let cache_layer = CacheLayer::builder(backend)
         .ttl(Duration::from_secs(5))
         .stale_while_revalidate(Duration::from_secs(10))
         .refresh_before(Duration::from_secs(2))
@@ -61,29 +65,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let counter = Arc::new(AtomicUsize::new(0));
 
-    // Note: Due to error type incompatibilities between tower-http-cache (BoxError)
-    // and Axum (Infallible), we demonstrate a working pattern using the into_make_service approach.
-    // For production use, consider using axum::middleware or handling errors explicitly.
-    let app = Router::new().route(
-        "/",
-        get({
-            let counter = counter.clone();
-            move || {
+    // Axum requires Router layers to be infallible (`Error = Infallible`),
+    // while `CacheLayer` surfaces `BoxError`. Wrapping it with
+    // `HandleErrorLayer` bridges the two cleanly.
+    let app = Router::new()
+        .route(
+            "/",
+            get({
                 let counter = counter.clone();
-                async move {
-                    let value = counter.fetch_add(1, Ordering::SeqCst) + 1;
-                    format!("Hello from backend call #{value}")
+                move || {
+                    let counter = counter.clone();
+                    async move {
+                        let value = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                        format!("Hello from backend call #{value}")
+                    }
                 }
-            }
-        }),
-    );
+            }),
+        )
+        .layer(
+            ServiceBuilder::new()
+                .layer(HandleErrorLayer::new(|err: BoxError| async move {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Cache middleware error: {err}"),
+                    )
+                }))
+                .layer(cache_layer),
+        );
 
     let addr: SocketAddr = "127.0.0.1:3000".parse()?;
     println!("Listening on http://{addr}");
-    println!("Try curling the endpoint multiple times to observe cached responses.");
-    println!();
-    println!("NOTE: This example demonstrates the library's Sync-compatible body type.");
-    println!("For full caching integration with Axum, see the axum::middleware examples.");
+    println!("Try curling http://{addr}/ multiple times within 5s to observe cached responses.");
 
     axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
     Ok(())

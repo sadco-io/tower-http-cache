@@ -20,6 +20,8 @@ use uuid::Uuid;
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct RequestId(String);
 
+const MAX_REQUEST_ID_LEN: usize = 128;
+
 impl RequestId {
     /// Generates a new random request ID using UUID v4.
     pub fn new() -> Self {
@@ -36,9 +38,17 @@ impl RequestId {
 
     /// Attempts to extract a request ID from an HTTP header.
     ///
-    /// Returns `None` if the header value is not valid UTF-8.
+    /// Returns `None` if the header value is empty, exceeds 128 bytes, or
+    /// contains whitespace / control / non-ASCII bytes outside printable ASCII (`0x21..=0x7E`).
     pub fn from_header(header: &HeaderValue) -> Option<Self> {
-        header.to_str().ok().map(|s| Self(s.to_owned()))
+        let s = header.to_str().ok()?;
+        if s.is_empty()
+            || s.len() > MAX_REQUEST_ID_LEN
+            || !s.bytes().all(|b| (0x21..=0x7E).contains(&b))
+        {
+            return None;
+        }
+        Some(Self(s.to_owned()))
     }
 
     /// Extracts a request ID from the request headers, or generates a new one.
@@ -150,5 +160,23 @@ mod tests {
         let id = RequestId::from(original.clone());
         let converted: String = id.into();
         assert_eq!(original, converted);
+    }
+
+    #[test]
+    fn from_header_rejects_oversized_empty_and_unsafe_values() {
+        let empty = HeaderValue::from_static("");
+        assert!(RequestId::from_header(&empty).is_none());
+
+        let too_long = HeaderValue::from_str(&"a".repeat(129)).unwrap();
+        assert!(RequestId::from_header(&too_long).is_none());
+
+        let at_limit = HeaderValue::from_str(&"a".repeat(128)).unwrap();
+        assert!(RequestId::from_header(&at_limit).is_some());
+
+        let with_space = HeaderValue::from_static("id with space");
+        assert!(RequestId::from_header(&with_space).is_none());
+
+        let non_ascii = HeaderValue::from_bytes(b"bad\xc3\xa9id").unwrap();
+        assert!(RequestId::from_header(&non_ascii).is_none());
     }
 }

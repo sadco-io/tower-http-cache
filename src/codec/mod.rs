@@ -13,8 +13,6 @@
 //! [`CacheCodec`]; the envelope is applied by the backend.
 
 pub mod envelope;
-#[cfg(feature = "legacy-bincode1-read")]
-pub mod legacy;
 
 use bytes::Bytes;
 use http::{StatusCode, Version};
@@ -51,13 +49,6 @@ pub trait CacheCodec: Send + Sync + Clone + 'static {
 #[derive(Clone, Default)]
 pub struct PostcardCodec;
 
-/// Former name of [`PostcardCodec`].
-#[deprecated(
-    since = "0.6.0",
-    note = "renamed to PostcardCodec; the default wire format is now postcard inside a versioned envelope, not bare bincode"
-)]
-pub type BincodeCodec = PostcardCodec;
-
 #[derive(Serialize, Deserialize)]
 struct StoredEntry {
     status: u16,
@@ -65,6 +56,38 @@ struct StoredEntry {
     headers: Vec<(String, Vec<u8>)>,
     body: Vec<u8>,
     tags: Option<Vec<String>>,
+    compressed: bool,
+}
+
+/// Wire layout written by 0.6.x releases before `compressed` was added.
+#[derive(Serialize, Deserialize)]
+struct StoredEntryV06 {
+    status: u16,
+    version: u8,
+    headers: Vec<(String, Vec<u8>)>,
+    body: Vec<u8>,
+    tags: Option<Vec<String>>,
+}
+
+fn cache_entry_from_parts(
+    status: u16,
+    version: u8,
+    headers: Vec<(String, Vec<u8>)>,
+    body: Vec<u8>,
+    tags: Option<Vec<String>>,
+    compressed: bool,
+) -> Result<CacheEntry, CacheError> {
+    // Deliberately a struct literal rather than `CacheEntry::new`, which
+    // hardcodes `tags: None`. Routing through it is what dropped tags in
+    // 0.5.x.
+    Ok(CacheEntry {
+        status: StatusCode::from_u16(status).map_err(|err| CacheError::Backend(err.to_string()))?,
+        version: version_from_u8(version)?,
+        headers,
+        body: Bytes::from(body),
+        tags,
+        compressed,
+    })
 }
 
 impl CacheCodec for PostcardCodec {
@@ -77,25 +100,38 @@ impl CacheCodec for PostcardCodec {
             headers: entry.headers.clone(),
             body: entry.body.to_vec(),
             tags: entry.tags.clone(),
+            compressed: entry.compressed,
         };
 
         postcard::to_allocvec(&stored).map_err(|err| CacheError::Backend(err.to_string()))
     }
 
     fn decode(&self, bytes: &[u8]) -> Result<CacheEntry, CacheError> {
-        let stored: StoredEntry =
-            postcard::from_bytes(bytes).map_err(|err| CacheError::Backend(err.to_string()))?;
-        // Deliberately a struct literal rather than `CacheEntry::new`, which
-        // hardcodes `tags: None`. Routing through it is what dropped tags in
-        // 0.5.x.
-        Ok(CacheEntry {
-            status: StatusCode::from_u16(stored.status)
-                .map_err(|err| CacheError::Backend(err.to_string()))?,
-            version: version_from_u8(stored.version)?,
-            headers: stored.headers,
-            body: Bytes::from(stored.body),
-            tags: stored.tags,
-        })
+        match postcard::from_bytes::<StoredEntry>(bytes) {
+            Ok(stored) => cache_entry_from_parts(
+                stored.status,
+                stored.version,
+                stored.headers,
+                stored.body,
+                stored.tags,
+                stored.compressed,
+            ),
+            Err(primary_err) => {
+                if let Ok((stored_v06, rest)) = postcard::take_from_bytes::<StoredEntryV06>(bytes) {
+                    if rest.is_empty() {
+                        return cache_entry_from_parts(
+                            stored_v06.status,
+                            stored_v06.version,
+                            stored_v06.headers,
+                            stored_v06.body,
+                            stored_v06.tags,
+                            false,
+                        );
+                    }
+                }
+                Err(CacheError::Backend(primary_err.to_string()))
+            }
+        }
     }
 }
 

@@ -1,0 +1,21 @@
+# Owners listed here are automatically requested to review pull requests that
+# touch the matching paths, and `master` requires an approving review from a
+# code owner before a pull request can be merged.
+#
+# Owners must have write access to this repository.
+#
+# Rules are evaluated in order and the last matching rule wins: a narrow rule
+# below the wildcard replaces the wildcard's owners for those paths rather
+# than adding to them.
+
+* @danielrcurtis @sophneum @Owebiwan
+
+# Core caching layer, policy definitions, and wire codec.
+/src/layer.rs @danielrcurtis @sophneum @Owebiwan
+/src/policy.rs @danielrcurtis @sophneum @Owebiwan
+/src/codec/ @danielrcurtis @sophneum @Owebiwan
+
+# Supply chain and CI. deny.toml governs which advisories and licenses are
+# accepted; the workflows run every other check.
+/deny.toml @danielrcurtis @sophneum @Owebiwan
+/.github/ @danielrcurtis @sophneum @Owebiwan
