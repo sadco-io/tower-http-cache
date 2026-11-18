@@ -15,7 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `CacheLayer::stats()` and `CacheLayerBuilder::stats(...)` expose and share `GlobalStats` across `CacheService` (recording hits, misses, stale hits, stores, and invalidations) and `AdminState::with_stats(...)` under `admin-api`.
   - `CacheLayer::chunk_cache()`, `CacheLayer::invalidate(...)`, and `CacheLayer::invalidate_by_tag(...)` coordinate backend + chunk-cache invalidation, `GlobalStats`, and structured logging.
   - `MLLoggingConfig` + `RequestId` (`X-Request-ID` extraction or UUID v4 generation) are now wired into `CacheService::call` (under `serde`) and `CacheEventType::Bypass` was added.
-- **`examples/axum_redis.rs` now mounts `CacheLayer` directly on the Axum `Router`** using `tower::ServiceBuilder` and `axum::error_handling::HandleErrorLayer` (Issue #24).
+- **`examples/axum_redis.rs` and `examples/redis_smoke.rs` now mount `CacheLayer` directly on the Axum `Router`** using `tower::ServiceBuilder` and `axum::error_handling::HandleErrorLayer` (Issue #24).
+- **Bounded `ChunkCache` eviction and `AdminState::from_layer` / `with_chunk_cache`**: `StreamingPolicy` adds `max_chunk_cache_bytes` (128 MiB default) and `max_chunk_cache_entries` (1,024 default), `ChunkCache::replace_with_ttl` atomically replaces complete entries, and `AdminState::from_layer` wires backend, stats, and chunk cache invalidation together.
 - **Suffix range support (`Range: bytes=-N`) and case-insensitive `bytes` unit parsing** in `range::parse_range_header` and `parse_content_range_header`, plus `RangeRequest::suffix(len)`.
 - **`ChunkCache::get_or_create_with_ttl` and `ChunkedEntry::is_expired`** with automatic expiry pruning in `ChunkCache::get` and `ChunkCache::stats`.
 - **`[package.metadata.docs.rs]`** configuration in `Cargo.toml`, an explicit `include` manifest whitelist, and tracked `Cargo.lock`.
@@ -23,16 +24,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **`admin-api` is now framework-agnostic** (`admin-api = ["serde"]`), dropping the unused optional `axum` dependency while keeping `axum` in `[dev-dependencies]` for examples and tests.
-- **Compressed cache entries set `Content-Encoding: gzip` and updated `Content-Length`**, and `CacheService` / auto-refresh skip compression when upstream responses already carry `Content-Encoding`.
-- **`ChunkCache` population now runs only after `should_store` and non-zero `ttl_for` checks succeed**, inherits response TTL, avoids `.unwrap()` panics on 206 construction, and preserves multi-value headers with `append`.
-- **`MultiTierBackend` improvements**: `MultiTierBackend::stats(&self)` returns a live `TierStats` snapshot by value (with a new `writes` field), counters are updated across `get`/`set`/promotion, and `PromotionStrategy::HitRate { threshold_per_minute }` enforces a real 60-second sliding hit window.
+- **RFC 9110 / RFC 9111 HTTP caching & compression compliance**:
+  - `CacheEntry::into_response_with_options` and `CacheService::call` negotiate `Accept-Encoding: gzip`, decompress for non-gzip clients, untag/tag `-gzip` ETags, and merge `Vary: Accept-Encoding`.
+  - Requests carrying `Cookie` bypass lookup/storage; requests carrying `Authorization` only cache/hit responses with `Cache-Control: public`, `must-revalidate`, or `s-maxage=...`.
+  - `HEAD` requests never overwrite GET cache slots and strip response bodies on cached hits.
+  - `CachePolicy::headers_to_cache` always strips `Set-Cookie`, RFC 9110 hop-by-hop headers, and `Connection`-nominated headers regardless of `header_allowlist`, while `prepare_cached_payload_and_headers` preserves pre-encoded upstream `Content-Encoding` and `Vary`.
+  - Range requests validate `If-Range` before serving `206`, reject multi-range specs cleanly, normalize clamped end offsets per RFC 9110 §14.1.1, and check request `Range` headers in `RangeHandling::PassThrough`.
+- **Auto-refresh lifecycle & filtering**: `CacheLayer` and `CacheService` share a `RefreshShutdownGuard` so dropping a cloned layer does not stop background refreshes while services remain alive; `RefreshManager` tracks entry expirations against `refresh_before`, syncs `ChunkCache` during background refresh, and fixes `AccessStats::hits_per_minute` normalization against the full window duration.
+- **Removed unused `pin-project-lite` dependency**, replaced with plain `Pin::new` over `Mutex<UnsyncBoxBody>` in `SyncBoxBody`.
+- **Bounded `GlobalStats` hot-key tracking** (`1,000` keys default) with live `last_accessed` updates on repeat hits.
+- **ML logging & `RequestId` hardening**: `MLLoggingConfig::hash_keys` hashes URIs as well as keys, bypassed requests emit only `Bypass` (not duplicate `Miss`), and `RequestId::from_header` enforces `<= 128` printable ASCII bytes (`0x21..=0x7E`).
+- **`MultiTierBackend` improvements**: `MultiTierBackend::stats(&self)` returns a live `TierStats` snapshot by value (with a new `writes` field), counters are updated across `get`/`set`/promotion, `PromotionStrategy::HitRate` enforces a real 60-second sliding hit window, stale L2 entries are never promoted as fresh to L1, and `invalidate_by_tag` drives deduplicated key invalidation across both tiers without double-counting or leaking tagless L2 copies.
 - **`InMemoryBackend` tag index hygiene**: `set` removes stale prior tags on overwrite, `get` removes tags when a stale window expires, and `get_keys_by_tag` / `list_tags` prune expired or Moka-evicted keys.
 - **Added `#[non_exhaustive]` to public enums**: `StreamingDecision`, `CacheEventType`, `CompressionStrategy`, `PromotionStrategy`, and `RangeHandling`.
-- **Dependency bumps**: `redis 1.8.2`, `bytes 1.12.2`, `serde 1.0.229`, `serde_json 1.0.154`, `tokio 1.53.3`, `tokio-util 0.7.20`, `metrics 0.24.6`, `pin-project-lite 0.2.17`, `thiserror 2.0.21`, `tracing 0.1.44`, `flate2 1.1.11`, and updated `[dev-dependencies]`.
+- **Dependency bumps**: `redis 1.8.2`, `bytes 1.12.2`, `serde 1.0.229`, `serde_json 1.0.154`, `tokio 1.53.3`, `tokio-util 0.7.20`, `metrics 0.24.6`, `thiserror 2.0.21`, `tracing 0.1.44`, `flate2 1.1.11`, and updated `[dev-dependencies]`.
 
 ### Fixed
 
-- **`AdminConfig` security & redaction**: custom `Debug` redacts `auth_token`, and `AdminConfig::validate_token` compares SHA-256 digests in constant time without accepting missing tokens when `require_auth` is enabled.
+- **`AdminConfig` & Bearer auth security**: custom `Debug` redacts `auth_token`, `AdminConfig::validate_token` compares SHA-256 digests in constant time and rejects empty/whitespace tokens, and `validate_auth` requires a case-insensitive `Bearer ` scheme.
 - **`AccessStats` window rollover race & burst calculation** in `refresh.rs` (plus silencing unused `err` when `tracing` is disabled).
 - **`RangeRequest::len()`** now returns `Some(0)` when `end < start` so `is_empty()` reports `true`.
 - **`CacheEvent::log`** includes `"target": config.target` in its structured JSON payload.

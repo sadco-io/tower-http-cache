@@ -38,6 +38,7 @@ fn assert_entry_eq(got: &CacheEntry, want: &CacheEntry) {
     assert_eq!(got.headers, want.headers, "headers");
     assert_eq!(got.body, want.body, "body");
     assert_eq!(got.tags, want.tags, "tags");
+    assert_eq!(got.compressed, want.compressed, "compressed");
 }
 
 // --------------------------------------------------------------------------
@@ -342,4 +343,25 @@ fn corrupt_input_never_panics() {
         // is never acceptable is a panic or an unbounded allocation.
         let _ = result.unwrap();
     }
+}
+
+#[test]
+fn postcard_codec_round_trips_compressed_flag() {
+    let codec = PostcardCodec;
+
+    let uncompressed = sample(Bytes::from_static(b"plain"), None);
+    let encoded_plain = codec.encode(&uncompressed).unwrap();
+    let decoded_plain = codec.decode(&encoded_plain).unwrap();
+    assert_entry_eq(&decoded_plain, &uncompressed);
+    assert!(!decoded_plain.compressed);
+
+    let mut compressed = sample(
+        Bytes::from_static(b"\x1f\x8b\x08\x00"),
+        Some(vec!["gz".into()]),
+    );
+    compressed.compressed = true;
+    let encoded_gz = codec.encode(&compressed).unwrap();
+    let decoded_gz = codec.decode(&encoded_gz).unwrap();
+    assert_entry_eq(&decoded_gz, &compressed);
+    assert!(decoded_gz.compressed);
 }

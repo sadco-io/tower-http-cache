@@ -23,6 +23,36 @@ fn manager_config() -> ConnectionManagerConfig {
         .set_connection_timeout(Some(Duration::from_secs(5)))
 }
 
+fn unique_namespace(prefix: &str) -> String {
+    format!("{prefix}_{}", uuid::Uuid::new_v4().simple())
+}
+
+async fn cleanup_namespace(
+    conn: &mut redis::aio::ConnectionManager,
+    namespace: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let pattern = format!("{namespace}:*");
+    let mut cursor: u64 = 0;
+    loop {
+        let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg(&pattern)
+            .arg("COUNT")
+            .arg(100)
+            .query_async(conn)
+            .await?;
+        if !keys.is_empty() {
+            redis::cmd("DEL").arg(&keys).query_async::<()>(conn).await?;
+        }
+        cursor = next_cursor;
+        if cursor == 0 {
+            break;
+        }
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn redis_backend_round_trip() -> Result<(), Box<dyn std::error::Error>> {
     let redis_url = match std::env::var("REDIS_URL") {
@@ -38,11 +68,9 @@ async fn redis_backend_round_trip() -> Result<(), Box<dyn std::error::Error>> {
         .get_connection_manager_with_config(manager_config())
         .await?;
 
-    // Clean slate for the test DB
     let mut conn = manager.clone();
-    redis::cmd("FLUSHDB").query_async::<()>(&mut conn).await?;
-
-    let backend = RedisBackend::new(manager).with_namespace("tower_http_cache_test");
+    let namespace = unique_namespace("thc_round_trip");
+    let backend = RedisBackend::new(manager).with_namespace(&namespace);
 
     let layer = CacheLayer::builder(backend)
         .ttl(Duration::from_secs(1))
@@ -89,6 +117,7 @@ async fn redis_backend_round_trip() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(second, "1");
 
     assert_eq!(counter.load(Ordering::SeqCst), 1);
+    cleanup_namespace(&mut conn, &namespace).await?;
     Ok(())
 }
 
@@ -106,12 +135,13 @@ async fn redis_backend_reports_tags_unsupported() -> Result<(), Box<dyn std::err
     };
 
     let client = Client::open(redis_url)?;
+    let namespace = unique_namespace("thc_tag_test");
     let backend = RedisBackend::new(
         client
             .get_connection_manager_with_config(manager_config())
             .await?,
     )
-    .with_namespace("thc_tag_test");
+    .with_namespace(&namespace);
 
     let err = backend.get_keys_by_tag("tenant:acme").await.unwrap_err();
     assert!(err.is_unsupported(), "get_keys_by_tag: {err}");
@@ -146,10 +176,9 @@ async fn redis_ignores_unrecognised_bytes_and_writes_the_envelope()
         .get_connection_manager_with_config(manager_config())
         .await?;
     let mut conn = manager.clone();
-    redis::cmd("FLUSHDB").query_async::<()>(&mut conn).await?;
 
-    let namespace = "thc_xver_test";
-    let backend = RedisBackend::new(manager).with_namespace(namespace);
+    let namespace = unique_namespace("thc_xver_test");
+    let backend = RedisBackend::new(manager).with_namespace(&namespace);
 
     redis::cmd("SET")
         .arg(format!("{namespace}:foreign"))
@@ -185,6 +214,56 @@ async fn redis_ignores_unrecognised_bytes_and_writes_the_envelope()
     let read = backend.get("fresh").await?.expect("hit");
     assert_eq!(read.entry.body, bytes::Bytes::from_static(b"fresh"));
 
-    redis::cmd("FLUSHDB").query_async::<()>(&mut conn).await?;
+    cleanup_namespace(&mut conn, &namespace).await?;
+    Ok(())
+}
+
+#[cfg(feature = "in-memory")]
+#[tokio::test]
+async fn multi_tier_tag_invalidation_clears_redis_l2() -> Result<(), Box<dyn std::error::Error>> {
+    let redis_url = match std::env::var("REDIS_URL") {
+        Ok(url) => url,
+        Err(_) => {
+            eprintln!("skipping redis integration test: set REDIS_URL");
+            return Ok(());
+        }
+    };
+
+    let client = Client::open(redis_url)?;
+    let manager = client
+        .get_connection_manager_with_config(manager_config())
+        .await?;
+    let mut conn = manager.clone();
+    let namespace = unique_namespace("thc_mt_tag_test");
+
+    let l1 = InMemoryBackend::new(100);
+    let l2 = RedisBackend::new(manager).with_namespace(&namespace);
+    let mt = MultiTierBackend::new(l1.clone(), l2.clone());
+
+    let entry = CacheEntry::new(
+        http::StatusCode::OK,
+        http::Version::HTTP_11,
+        vec![],
+        bytes::Bytes::from_static(b"tagged"),
+    )
+    .with_tags(vec!["tenant:42".to_string()]);
+    mt.set(
+        "k1".to_string(),
+        entry,
+        Duration::from_secs(60),
+        Duration::ZERO,
+    )
+    .await?;
+
+    let invalidated = mt.invalidate_by_tag("tenant:42").await?;
+    assert_eq!(invalidated, 1);
+    assert!(mt.get("k1").await?.is_none());
+    assert!(l1.get("k1").await?.is_none());
+    assert!(
+        l2.get("k1").await?.is_none(),
+        "L2 Redis copy must also be removed"
+    );
+
+    cleanup_namespace(&mut conn, &namespace).await?;
     Ok(())
 }

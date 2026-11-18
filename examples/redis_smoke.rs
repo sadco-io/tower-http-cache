@@ -22,33 +22,25 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 #[cfg(feature = "redis-backend")]
+use axum::error_handling::HandleErrorLayer;
+#[cfg(feature = "redis-backend")]
 use axum::http::StatusCode;
 #[cfg(feature = "redis-backend")]
-use axum::{
-    Router,
-    extract::State,
-    response::{Html, IntoResponse, Response},
-    routing::get,
-};
-#[cfg(feature = "redis-backend")]
-use http_body_util::{BodyExt, Full};
+use axum::{Router, extract::State, response::Html, routing::get};
 #[cfg(feature = "redis-backend")]
 use redis::Client;
 #[cfg(feature = "redis-backend")]
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 #[cfg(feature = "redis-backend")]
-use tower::Layer;
+use tower::ServiceBuilder;
 #[cfg(feature = "redis-backend")]
-use tower::ServiceExt;
-#[cfg(feature = "redis-backend")]
-use tower::service_fn;
+use tower_http_cache::layer::BoxError;
 #[cfg(feature = "redis-backend")]
 use tower_http_cache::prelude::*;
 
 #[cfg(feature = "redis-backend")]
 #[derive(Clone)]
 struct AppState {
-    cache_layer: CacheLayer<RedisBackend>,
     counter: Arc<AtomicUsize>,
 }
 
@@ -79,11 +71,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build();
 
     let state = AppState {
-        cache_layer,
         counter: Arc::new(AtomicUsize::new(0)),
     };
 
-    let app = Router::new().route("/", get(handler)).with_state(state);
+    let app = Router::new()
+        .route("/", get(handler))
+        .with_state(state)
+        .layer(
+            ServiceBuilder::new()
+                .layer(HandleErrorLayer::new(|err: BoxError| async move {
+                    (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+                }))
+                .layer(cache_layer),
+        );
 
     let addr: SocketAddr = "127.0.0.1:3000".parse()?;
     println!("Redis smoke server listening at http://{addr}");
@@ -92,38 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(feature = "redis-backend")]
-async fn handler(
-    State(state): State<AppState>,
-    req: axum::http::Request<axum::body::Body>,
-) -> Result<Response, (StatusCode, String)> {
-    let inner = service_fn({
-        let counter = state.counter.clone();
-        move |_req: http::Request<()>| {
-            let counter = counter.clone();
-            async move {
-                let value = counter.fetch_add(1, Ordering::SeqCst) + 1;
-                let body = format!("Hello from backend call #{value}");
-                Ok::<_, std::convert::Infallible>(http::Response::new(Full::from(body)))
-            }
-        }
-    });
-
-    let response = state
-        .cache_layer
-        .clone()
-        .layer(inner)
-        .oneshot(req.map(|_| ()))
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-
-    let collected = response.into_body().collect().await.map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to read body".into(),
-        )
-    })?;
-
-    let body = collected.to_bytes();
-    let body = String::from_utf8(body.to_vec()).unwrap_or_else(|_| "<invalid utf-8>".into());
-    Ok(Html(body).into_response())
+async fn handler(State(state): State<AppState>) -> Html<String> {
+    let value = state.counter.fetch_add(1, Ordering::SeqCst) + 1;
+    Html(format!("Hello from backend call #{value}"))
 }

@@ -89,6 +89,14 @@ pub struct StreamingPolicy {
     /// Files smaller than this will not be chunked even if chunk caching is enabled.
     /// This prevents overhead for files that don't benefit from chunking.
     pub min_chunk_file_size: u64,
+
+    /// Maximum total chunk bytes retained in [`ChunkCache`](crate::chunks::ChunkCache)
+    /// (default: 128MB). Set to `None` for no byte limit.
+    pub max_chunk_cache_bytes: Option<usize>,
+
+    /// Maximum number of entries retained in [`ChunkCache`](crate::chunks::ChunkCache)
+    /// (default: 1024). Set to `None` for no entry count limit.
+    pub max_chunk_cache_entries: Option<usize>,
 }
 
 impl Default for StreamingPolicy {
@@ -117,6 +125,8 @@ impl Default for StreamingPolicy {
             enable_chunk_cache: false,             // Opt-in feature
             chunk_size: 1024 * 1024,               // 1MB chunks
             min_chunk_file_size: 10 * 1024 * 1024, // 10MB minimum
+            max_chunk_cache_bytes: Some(128 * 1024 * 1024),
+            max_chunk_cache_entries: Some(1024),
         }
     }
 }
@@ -135,6 +145,8 @@ impl StreamingPolicy {
             enable_chunk_cache: false,
             chunk_size: 1024 * 1024,
             min_chunk_file_size: 0,
+            max_chunk_cache_bytes: Some(128 * 1024 * 1024),
+            max_chunk_cache_entries: Some(1024),
         }
     }
 
@@ -150,6 +162,8 @@ impl StreamingPolicy {
             enable_chunk_cache: false,
             chunk_size: 1024 * 1024,
             min_chunk_file_size: 0,
+            max_chunk_cache_bytes: Some(128 * 1024 * 1024),
+            max_chunk_cache_entries: Some(1024),
         }
     }
 
@@ -165,6 +179,8 @@ impl StreamingPolicy {
             enable_chunk_cache: false,
             chunk_size: 1024 * 1024,
             min_chunk_file_size: 0,
+            max_chunk_cache_bytes: Some(128 * 1024 * 1024),
+            max_chunk_cache_entries: Some(1024),
         }
     }
 }

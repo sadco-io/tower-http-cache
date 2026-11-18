@@ -254,61 +254,61 @@ where
             // Record hit and check for promotion
             self.record_hit(key);
 
-            if self.should_promote(key) {
-                let entry_size = read.entry.body.len();
+            let now = std::time::SystemTime::now();
+            let remaining_ttl = match read.expires_at {
+                Some(expires_at) => expires_at.duration_since(now).ok().filter(|d| !d.is_zero()),
+                None => Some(Duration::from_secs(60)),
+            };
 
-                // Check if entry is small enough for L1
-                let should_promote_l1 = if let Some(max_size) = self.config.max_l1_entry_size {
-                    entry_size <= max_size
-                } else {
-                    true
-                };
+            if let Some(ttl) = remaining_ttl {
+                if self.should_promote(key) {
+                    let entry_size = read.entry.body.len();
 
-                if should_promote_l1 {
-                    self.tier_stats.promotions.fetch_add(1, Ordering::Relaxed);
-                    #[cfg(feature = "metrics")]
-                    metrics::counter!("tower_http_cache.tier.promoted").increment(1);
-
-                    // Calculate remaining TTL for promotion
-                    let ttl = if let Some(expires_at) = read.expires_at {
-                        expires_at
-                            .duration_since(std::time::SystemTime::now())
-                            .unwrap_or(Duration::from_secs(60))
+                    // Check if entry is small enough for L1
+                    let should_promote_l1 = if let Some(max_size) = self.config.max_l1_entry_size {
+                        entry_size <= max_size
                     } else {
-                        Duration::from_secs(60)
+                        true
                     };
 
-                    let stale_for = if let (Some(stale_until), Some(expires_at)) =
-                        (read.stale_until, read.expires_at)
-                    {
-                        stale_until.duration_since(expires_at).unwrap_or_default()
+                    if should_promote_l1 {
+                        self.tier_stats.promotions.fetch_add(1, Ordering::Relaxed);
+                        #[cfg(feature = "metrics")]
+                        metrics::counter!("tower_http_cache.tier.promoted").increment(1);
+
+                        let stale_for = if let (Some(stale_until), Some(expires_at)) =
+                            (read.stale_until, read.expires_at)
+                        {
+                            stale_until.duration_since(expires_at).unwrap_or_default()
+                        } else {
+                            Duration::ZERO
+                        };
+
+                        // Promote asynchronously (best effort)
+                        let entry = read.entry.clone();
+                        let key = key.to_string();
+                        let l1 = self.l1.clone();
+                        let key_stats = self.key_stats.clone();
+
+                        tokio::spawn(async move {
+                            let _ = l1.set(key.clone(), entry, ttl, stale_for).await;
+                            if let Some(stats) = key_stats.get(&key) {
+                                stats.reset();
+                            }
+                        });
                     } else {
-                        Duration::ZERO
-                    };
+                        #[cfg(feature = "metrics")]
+                        metrics::counter!("tower_http_cache.tier.promotion_skipped_large")
+                            .increment(1);
 
-                    // Promote asynchronously (best effort)
-                    let entry = read.entry.clone();
-                    let key = key.to_string();
-                    let l1 = self.l1.clone();
-                    let key_stats = self.key_stats.clone();
-
-                    tokio::spawn(async move {
-                        let _ = l1.set(key.clone(), entry, ttl, stale_for).await;
-                        if let Some(stats) = key_stats.get(&key) {
-                            stats.reset();
-                        }
-                    });
-                } else {
-                    #[cfg(feature = "metrics")]
-                    metrics::counter!("tower_http_cache.tier.promotion_skipped_large").increment(1);
-
-                    #[cfg(feature = "tracing")]
-                    tracing::debug!(
-                        key = %key,
-                        size = entry_size,
-                        max_l1_size = ?self.config.max_l1_entry_size,
-                        "skipping promotion for large entry"
-                    );
+                        #[cfg(feature = "tracing")]
+                        tracing::debug!(
+                            key = %key,
+                            size = entry_size,
+                            max_l1_size = ?self.config.max_l1_entry_size,
+                            "skipping promotion for large entry"
+                        );
+                    }
                 }
             }
 
@@ -402,16 +402,22 @@ where
         Ok(keys)
     }
 
-    /// Invalidates in both tiers, tolerating a tier without a tag index in the
-    /// same way as [`get_keys_by_tag`](Self::get_keys_by_tag).
+    /// Invalidates matching keys across both tiers using the merged tag index,
+    /// removing entries from both L1 and L2 even if only one tier maintains a
+    /// tag index and without double-counting keys present in both tiers.
     async fn invalidate_by_tag(&self, tag: &str) -> Result<usize, CacheError> {
+        let keys = self.get_keys_by_tag(tag).await?;
+
+        for key in &keys {
+            self.invalidate(key).await?;
+        }
+
+        // Clean up any tag-index metadata left on either tier.
         let l1 = self.l1.invalidate_by_tag(tag).await;
         let l2 = self.l2.invalidate_by_tag(tag).await;
+        let _ = merge_tiers(l1, l2)?;
 
-        match merge_tiers(l1, l2)? {
-            Some((l1_count, l2_count)) => Ok(l1_count + l2_count),
-            None => Ok(0),
-        }
+        Ok(keys.len())
     }
 
     /// Merges both tiers, tolerating a tier without a tag index in the same
@@ -771,6 +777,109 @@ mod tests {
         assert!(backend.get("rate-key").await.unwrap().is_some());
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(l1.get("rate-key").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn stale_l2_entry_is_not_promoted_to_l1() {
+        let l1 = InMemoryBackend::new(100);
+        let l2 = InMemoryBackend::new(100);
+        let backend = MultiTierBackend::builder()
+            .l1(l1.clone())
+            .l2(l2.clone())
+            .promotion_threshold(1)
+            .build();
+
+        // Short fresh TTL with longer stale window.
+        l2.set(
+            "stale-key".to_string(),
+            test_entry(),
+            Duration::from_millis(20),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        let read = backend.get("stale-key").await.unwrap().unwrap();
+        assert!(read.expires_at.unwrap() <= std::time::SystemTime::now());
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            l1.get("stale-key").await.unwrap().is_none(),
+            "stale L2 entry must not be promoted into L1"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidate_by_tag_deduplicates_across_tiers_and_clears_tagless_l2() {
+        #[derive(Clone)]
+        struct TaglessBackend(InMemoryBackend);
+
+        impl CacheBackend for TaglessBackend {
+            async fn get(
+                &self,
+                key: &str,
+            ) -> Result<Option<crate::backend::CacheRead>, CacheError> {
+                self.0.get(key).await
+            }
+
+            async fn set(
+                &self,
+                key: String,
+                entry: CacheEntry,
+                ttl: Duration,
+                stale_for: Duration,
+            ) -> Result<(), CacheError> {
+                self.0.set(key, entry, ttl, stale_for).await
+            }
+
+            async fn invalidate(&self, key: &str) -> Result<(), CacheError> {
+                self.0.invalidate(key).await
+            }
+        }
+
+        // Case 1: both tiers support tags; shared key must be counted once.
+        let l1 = InMemoryBackend::new(100);
+        let l2 = InMemoryBackend::new(100);
+        let shared = MultiTierBackend::builder()
+            .l1(l1.clone())
+            .l2(l2.clone())
+            .build();
+
+        shared
+            .set(
+                "item:1".to_string(),
+                test_entry().with_tags(vec!["tag:a".to_string()]),
+                Duration::from_secs(60),
+                Duration::ZERO,
+            )
+            .await
+            .unwrap();
+        let removed = shared.invalidate_by_tag("tag:a").await.unwrap();
+        assert_eq!(removed, 1);
+        assert!(l1.get("item:1").await.unwrap().is_none());
+        assert!(l2.get("item:1").await.unwrap().is_none());
+
+        // Case 2: L2 does not implement tag indexing (`Unsupported`).
+        // L1's tag index must drive key invalidation in both L1 and L2.
+        let l1b = InMemoryBackend::new(100);
+        let l2b_inner = InMemoryBackend::new(100);
+        let l2b = TaglessBackend(l2b_inner.clone());
+        let mixed = MultiTierBackend::builder().l1(l1b.clone()).l2(l2b).build();
+
+        mixed
+            .set(
+                "item:2".to_string(),
+                test_entry().with_tags(vec!["tag:b".to_string()]),
+                Duration::from_secs(60),
+                Duration::ZERO,
+            )
+            .await
+            .unwrap();
+        let removed = mixed.invalidate_by_tag("tag:b").await.unwrap();
+        assert_eq!(removed, 1);
+        assert!(l1b.get("item:2").await.unwrap().is_none());
+        assert!(l2b_inner.get("item:2").await.unwrap().is_none());
     }
 }
 

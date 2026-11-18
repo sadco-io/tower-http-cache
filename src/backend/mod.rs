@@ -35,6 +35,9 @@ pub struct CacheEntry {
     #[cfg_attr(feature = "serde", serde(with = "bytes_serde"))]
     pub body: Bytes,
     pub tags: Option<Vec<String>>,
+    /// Whether the cache layer compressed `body` with gzip on store.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub compressed: bool,
 }
 
 // Custom serde helpers for http types
@@ -137,6 +140,7 @@ impl CacheEntry {
             headers,
             body,
             tags: None,
+            compressed: false,
         }
     }
 
@@ -144,6 +148,59 @@ impl CacheEntry {
     pub fn with_tags(mut self, tags: Vec<String>) -> Self {
         self.tags = Some(tags);
         self
+    }
+
+    /// Marks whether this entry's body was gzip-compressed by the cache layer.
+    pub(crate) fn with_compressed(mut self, compressed: bool) -> Self {
+        self.compressed = compressed;
+        self
+    }
+
+    /// Converts the entry back into an `http::Response`, negotiating
+    /// layer-compressed bodies against `accept_gzip` and stripping the body
+    /// when `strip_body` is true (e.g., for `HEAD` requests).
+    pub(crate) fn into_response_with_options(
+        mut self,
+        accept_gzip: bool,
+        strip_body: bool,
+    ) -> Response<SyncBoxBody> {
+        if self.compressed && !accept_gzip {
+            #[cfg(feature = "compression")]
+            {
+                use flate2::read::GzDecoder;
+                use std::io::Read;
+
+                let mut decoder = GzDecoder::new(&self.body[..]);
+                let mut decompressed = Vec::new();
+                if decoder.read_to_end(&mut decompressed).is_ok() {
+                    self.body = Bytes::from(decompressed);
+                    self.headers.retain(|(name, _)| {
+                        !name.eq_ignore_ascii_case("content-encoding")
+                            && !name.eq_ignore_ascii_case("content-length")
+                    });
+                    self.headers.push((
+                        "content-length".to_string(),
+                        self.body.len().to_string().into_bytes(),
+                    ));
+                    for (name, value) in &mut self.headers {
+                        if name.eq_ignore_ascii_case("etag") {
+                            if let Ok(etag_str) = std::str::from_utf8(value) {
+                                if let Some(restored) = untag_gzip_etag(etag_str) {
+                                    *value = restored.into_bytes();
+                                }
+                            }
+                        }
+                    }
+                    self.compressed = false;
+                }
+            }
+        }
+
+        if strip_body {
+            self.body = Bytes::new();
+        }
+
+        self.into_response()
     }
 
     /// Converts the entry back into an `http::Response`.
@@ -171,6 +228,16 @@ impl CacheEntry {
         }
 
         response
+    }
+}
+
+#[cfg(feature = "compression")]
+fn untag_gzip_etag(etag: &str) -> Option<String> {
+    let trimmed = etag.trim();
+    if let Some(inner) = trimmed.strip_suffix("-gzip\"") {
+        Some(format!("{inner}\""))
+    } else {
+        trimmed.strip_suffix("-gzip").map(ToOwned::to_owned)
     }
 }
 

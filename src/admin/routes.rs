@@ -154,6 +154,10 @@ pub async fn handle_invalidate<B: CacheBackend>(
             .await
             .map_err(|e| format!("Failed to invalidate key: {}", e))?;
 
+        if let Some(chunk_cache) = &state.chunk_cache {
+            chunk_cache.remove(&key);
+        }
+
         state.stats.record_invalidation();
 
         Ok(InvalidationResponse {
@@ -162,12 +166,23 @@ pub async fn handle_invalidate<B: CacheBackend>(
             message: format!("Invalidated key: {}", key),
         })
     } else if let Some(tag) = request.tag {
+        // Capture tagged keys before invalidation so we can evict matching chunk entries too.
+        let tagged_keys = if state.chunk_cache.is_some() {
+            state.backend.get_keys_by_tag(&tag).await.ok()
+        } else {
+            None
+        };
+
         // Invalidate by single tag
         let count = state
             .backend
             .invalidate_by_tag(&tag)
             .await
             .map_err(|e| format!("Failed to invalidate by tag: {}", e))?;
+
+        if let Some(chunk_cache) = &state.chunk_cache {
+            evict_chunk_keys(chunk_cache, tagged_keys, count);
+        }
 
         for _ in 0..count {
             state.stats.record_invalidation();
@@ -179,12 +194,33 @@ pub async fn handle_invalidate<B: CacheBackend>(
             message: format!("Invalidated {} keys with tag: {}", count, tag),
         })
     } else if let Some(tags) = request.tags {
+        let tagged_keys = if state.chunk_cache.is_some() {
+            let mut collected = Vec::new();
+            let mut complete = true;
+            for tag in &tags {
+                match state.backend.get_keys_by_tag(tag).await {
+                    Ok(mut keys) => collected.append(&mut keys),
+                    Err(_) => {
+                        complete = false;
+                        break;
+                    }
+                }
+            }
+            if complete { Some(collected) } else { None }
+        } else {
+            None
+        };
+
         // Invalidate by multiple tags
         let count = state
             .backend
             .invalidate_by_tags(&tags)
             .await
             .map_err(|e| format!("Failed to invalidate by tags: {}", e))?;
+
+        if let Some(chunk_cache) = &state.chunk_cache {
+            evict_chunk_keys(chunk_cache, tagged_keys, count);
+        }
 
         for _ in 0..count {
             state.stats.record_invalidation();
@@ -200,11 +236,35 @@ pub async fn handle_invalidate<B: CacheBackend>(
     }
 }
 
+fn evict_chunk_keys(
+    chunk_cache: &crate::chunks::ChunkCache,
+    keys: Option<Vec<String>>,
+    invalidated_count: usize,
+) {
+    match keys {
+        Some(keys) if !keys.is_empty() => {
+            for key in keys {
+                chunk_cache.remove(&key);
+            }
+        }
+        _ if invalidated_count > 0 => {
+            chunk_cache.clear();
+        }
+        _ => {}
+    }
+}
+
 /// Validates authentication for admin requests.
 pub fn validate_auth(config: &AdminConfig, auth_header: Option<&str>) -> bool {
     let token = auth_header.and_then(|h| {
-        // Extract token from "Bearer <token>"
-        h.strip_prefix("Bearer ").or(Some(h))
+        let trimmed = h.trim();
+        let (scheme, rest) = trimmed.split_once(' ')?;
+        if scheme.eq_ignore_ascii_case("bearer") {
+            let token = rest.trim_start();
+            if token.is_empty() { None } else { Some(token) }
+        } else {
+            None
+        }
     });
 
     config.validate_token(token)
@@ -348,7 +408,11 @@ mod tests {
             .with_require_auth(true);
 
         assert!(validate_auth(&config, Some("Bearer secret123")));
-        assert!(validate_auth(&config, Some("secret123")));
+        assert!(validate_auth(&config, Some("bearer secret123")));
+        assert!(validate_auth(&config, Some("BEARER secret123")));
+        assert!(!validate_auth(&config, Some("secret123")));
+        assert!(!validate_auth(&config, Some("Basic secret123")));
+        assert!(!validate_auth(&config, Some("Bearer ")));
         assert!(!validate_auth(&config, Some("Bearer wrong")));
         assert!(!validate_auth(&config, None));
     }

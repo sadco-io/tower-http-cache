@@ -111,8 +111,9 @@ let cache_layer = CacheLayer::builder(InMemoryBackend::new(500))
             .with_ttl(Duration::from_secs(3600))
             .with_streaming_policy(StreamingPolicy {
                 enable_chunk_cache: true,
-                chunk_size: 1024 * 1024,         // 1MB chunks
+                chunk_size: 1024 * 1024,              // 1MB chunks
                 min_chunk_file_size: 5 * 1024 * 1024, // Only chunk files >= 5MB
+                max_cacheable_size: Some(64 * 1024 * 1024), // Allow files up to 64MB
                 ..Default::default()
             })
     )
@@ -454,9 +455,8 @@ See [CHANGELOG.md](CHANGELOG.md) for the full release history, including earlier
 ## Minimum Supported Rust Version
 
 MSRV: **1.85** for the default feature set, matching the crate's `rust-version`
-field. **`redis-backend` requires 1.88** — `redis` 1.8 declares `rust-version = "1.88"`, and the feature
-also reaches `url` -> `idna` -> `icu_*`, which require the same. Both floors are
-enforced by separate CI jobs.
+field. **`redis-backend` requires 1.88** — `redis` 1.8 declares `rust-version = "1.88"`.
+Both floors are enforced by separate CI jobs.
 
 The MSRV will only increase with a minor version bump and will be documented in
 release notes.

@@ -1,8 +1,11 @@
 //! Integration tests for smart streaming and large file handling.
 
+use bytes::Bytes;
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::Full;
 use std::convert::Infallible;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tower::{Layer, Service, ServiceExt};
 use tower_http_cache::backend::CacheBackend;
@@ -911,4 +914,330 @@ async fn test_chunk_cache_entry_expires_with_policy_ttl() {
             .is_none(),
         "chunk cache entry must expire after response TTL elapses"
     );
+}
+
+#[tokio::test]
+async fn chunk_cache_replaces_live_entry_on_refetch_without_mixing_bytes() {
+    use http_body_util::BodyExt;
+
+    let sp = StreamingPolicy {
+        enable_chunk_cache: true,
+        chunk_size: 8,
+        min_chunk_file_size: 1,
+        max_cacheable_size: Some(1 << 20),
+        excluded_content_types: Default::default(),
+        ..Default::default()
+    };
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let layer = CacheLayer::builder(InMemoryBackend::new(100))
+        .policy(
+            CachePolicy::default()
+                .with_streaming_policy(sp)
+                .with_ttl(Duration::from_secs(60)),
+        )
+        .refresh_before(Duration::from_secs(120))
+        .build();
+
+    let mut svc = layer.layer(tower::service_fn({
+        let calls = calls.clone();
+        move |_r: Request<()>| {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                let (body, etag) = if n == 0 {
+                    ("AAAAAAAABBBBBBBBCCCCCCCCDDDDDDDD".to_string(), "\"v1\"")
+                } else {
+                    ("zzzzzzzzyyyyyyyy".to_string(), "\"v2\"")
+                };
+                Ok::<_, Infallible>(
+                    Response::builder()
+                        .header("content-type", "text/plain")
+                        .header("etag", etag)
+                        .body(Full::from(body))
+                        .unwrap(),
+                )
+            }
+        }
+    }));
+
+    let _ = svc
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::get("/f").body(()).unwrap())
+        .await
+        .unwrap();
+    let _ = svc
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::get("/f").body(()).unwrap())
+        .await
+        .unwrap();
+
+    let range_resp = svc
+        .ready()
+        .await
+        .unwrap()
+        .call(
+            Request::get("/f")
+                .header("range", "bytes=0-31")
+                .body(())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(range_resp.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(range_resp.headers().get("etag").unwrap(), "\"v2\"");
+    let body = range_resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], b"zzzzzzzzyyyyyyyy");
+}
+
+#[cfg(feature = "admin-api")]
+#[tokio::test]
+async fn admin_invalidate_evicts_chunk_cache() {
+    use http_body_util::BodyExt;
+    use tower_http_cache::admin::routes::{InvalidationRequest, handle_invalidate};
+    use tower_http_cache::{AdminConfig, AdminState};
+
+    let sp = StreamingPolicy {
+        enable_chunk_cache: true,
+        chunk_size: 8,
+        min_chunk_file_size: 1,
+        max_cacheable_size: Some(1 << 20),
+        excluded_content_types: Default::default(),
+        ..Default::default()
+    };
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let backend = InMemoryBackend::new(100);
+    let layer = CacheLayer::builder(backend)
+        .policy(
+            CachePolicy::default()
+                .with_streaming_policy(sp)
+                .with_ttl(Duration::from_secs(60)),
+        )
+        .build();
+    let admin = AdminState::from_layer(&layer, AdminConfig::default());
+
+    let mut svc = layer.layer(tower::service_fn({
+        let calls = calls.clone();
+        move |_r: Request<()>| {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                let body = if n == 0 {
+                    "OLDOLDOLDOLDOLDO"
+                } else {
+                    "NEWNEWNEWNEWNEWN"
+                };
+                Ok::<_, Infallible>(
+                    Response::builder()
+                        .header("content-type", "text/plain")
+                        .body(Full::from(body))
+                        .unwrap(),
+                )
+            }
+        }
+    }));
+
+    let _ = svc
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::get("/a").body(()).unwrap())
+        .await
+        .unwrap();
+
+    let resp = handle_invalidate(
+        &admin,
+        InvalidationRequest {
+            key: Some("/a".into()),
+            tag: None,
+            tags: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(resp.success);
+    assert!(layer.chunk_cache().unwrap().get("/a").is_none());
+
+    let after = svc
+        .ready()
+        .await
+        .unwrap()
+        .call(
+            Request::get("/a")
+                .header("range", "bytes=0-15")
+                .body(())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(after.status(), StatusCode::OK);
+    let body = after.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], b"NEWNEWNEWNEWNEWN");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn if_range_mismatch_ignores_chunk_206_and_serves_full_response() {
+    use http_body_util::BodyExt;
+
+    let sp = StreamingPolicy {
+        enable_chunk_cache: true,
+        chunk_size: 8,
+        min_chunk_file_size: 1,
+        max_cacheable_size: Some(1 << 20),
+        excluded_content_types: Default::default(),
+        ..Default::default()
+    };
+
+    let layer = CacheLayer::builder(InMemoryBackend::new(100))
+        .policy(
+            CachePolicy::default()
+                .with_streaming_policy(sp)
+                .with_ttl(Duration::from_secs(60)),
+        )
+        .build();
+    let mut svc = layer.layer(tower::service_fn(|_r: Request<()>| async move {
+        Ok::<_, Infallible>(
+            Response::builder()
+                .header("content-type", "text/plain")
+                .header("etag", "\"current\"")
+                .body(Full::from("0123456789abcdef"))
+                .unwrap(),
+        )
+    }));
+
+    // Warm full + chunk caches.
+    let _ = svc
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::get("/ir").body(()).unwrap())
+        .await
+        .unwrap();
+
+    // Matching strong ETag If-Range -> 206 Partial Content from chunk cache.
+    let match_resp = svc
+        .ready()
+        .await
+        .unwrap()
+        .call(
+            Request::get("/ir")
+                .header("range", "bytes=0-3")
+                .header("if-range", "\"current\"")
+                .body(())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(match_resp.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        match_resp.into_body().collect().await.unwrap().to_bytes(),
+        Bytes::from_static(b"0123")
+    );
+
+    // Mismatched If-Range -> falls back to full 200 OK response instead of 206.
+    let mismatch_resp = svc
+        .ready()
+        .await
+        .unwrap()
+        .call(
+            Request::get("/ir")
+                .header("range", "bytes=0-3")
+                .header("if-range", "\"stale\"")
+                .body(())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(mismatch_resp.status(), StatusCode::OK);
+    assert_eq!(
+        mismatch_resp
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes(),
+        Bytes::from_static(b"0123456789abcdef")
+    );
+}
+
+#[tokio::test]
+async fn range_passthrough_checks_request_range_header_and_skips_storage() {
+    use http_body_util::BodyExt;
+    use tower_http_cache::range::RangeHandling;
+
+    let sp = StreamingPolicy {
+        enabled: true,
+        range_handling: RangeHandling::PassThrough,
+        enable_chunk_cache: false,
+        excluded_content_types: Default::default(),
+        ..Default::default()
+    };
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let layer = CacheLayer::builder(InMemoryBackend::new(100))
+        .policy(
+            CachePolicy::default()
+                .with_streaming_policy(sp)
+                .with_ttl(Duration::from_secs(60)),
+        )
+        .build();
+    let mut svc = layer.layer(tower::service_fn({
+        let calls = calls.clone();
+        move |_r: Request<()>| {
+            let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+            async move {
+                // Intentionally return 200 without Range/Content-Range on response headers
+                // to verify the request's Range header triggers PassThrough.
+                Ok::<_, Infallible>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "text/plain")
+                        .body(Full::from(format!("slice-{n}")))
+                        .unwrap(),
+                )
+            }
+        }
+    }));
+
+    let r1 = svc
+        .ready()
+        .await
+        .unwrap()
+        .call(
+            Request::get("/pt")
+                .header("range", "bytes=0-3")
+                .body(())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    let r2 = svc
+        .ready()
+        .await
+        .unwrap()
+        .call(
+            Request::get("/pt")
+                .header("range", "bytes=0-3")
+                .body(())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+
+    assert_ne!(r1, r2);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }

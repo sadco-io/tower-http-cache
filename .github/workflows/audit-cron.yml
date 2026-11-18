@@ -17,9 +17,9 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
-      # audit-check opens an issue when a new advisory lands, which is the
-      # point of running this on a schedule rather than only on a push.
+      # audit-check opens an issue and reports check-run status when advisories land.
       issues: write
+      checks: write
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

@@ -1,7 +1,7 @@
 use std::error::Error as StdError;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
 
@@ -47,12 +47,10 @@ pub type BoxError = Box<dyn StdError + Send + Sync>;
 /// dependency tree costs one type alias.
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
-pin_project_lite::pin_project! {
-    /// Response body type that implements [`Sync`] for Axum and Tower compatibility,
-    /// including when wrapping `!Sync` upstream response bodies such as `axum::body::Body`.
-    pub struct SyncBoxBody {
-        inner: std::sync::Mutex<UnsyncBoxBody<Bytes, BoxError>>,
-    }
+/// Response body type that implements [`Sync`] for Axum and Tower compatibility,
+/// including when wrapping `!Sync` upstream response bodies such as `axum::body::Body`.
+pub struct SyncBoxBody {
+    inner: std::sync::Mutex<UnsyncBoxBody<Bytes, BoxError>>,
 }
 
 impl SyncBoxBody {
@@ -122,9 +120,33 @@ pub struct CacheLayer<B> {
     key_extractor: KeyExtractor,
     locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
     refresh_manager: Option<Arc<RefreshManager>>,
+    refresh_shutdown: Option<Arc<RefreshShutdownGuard>>,
     chunk_cache: Option<Arc<ChunkCache>>,
     #[cfg(feature = "admin-api")]
     stats: Arc<GlobalStats>,
+}
+
+/// Drops the background auto-refresh task only once the last [`CacheLayer`]
+/// and every cloned [`CacheService`] have been dropped.
+struct RefreshShutdownGuard {
+    manager: Arc<RefreshManager>,
+}
+
+impl RefreshShutdownGuard {
+    fn new(manager: Arc<RefreshManager>) -> Self {
+        Self { manager }
+    }
+}
+
+impl Drop for RefreshShutdownGuard {
+    fn drop(&mut self) {
+        let manager = Arc::clone(&self.manager);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                manager.shutdown().await;
+            });
+        }
+    }
 }
 
 /// Strategy used to turn requests into cache keys.
@@ -138,7 +160,7 @@ pub struct KeyExtractor {
 }
 
 impl KeyExtractor {
-    /// Builds an extractor that uses `method + path + query` for GET/HEAD requests.
+    /// Builds an extractor that uses `path + query` (omitting method) for GET/HEAD requests.
     pub fn path_and_query() -> Self {
         Self {
             inner: Arc::new(|method: &Method, uri: &Uri| {
@@ -156,6 +178,7 @@ impl KeyExtractor {
         }
     }
 
+    /// Builds an extractor that uses `path` (omitting method and query) for GET/HEAD requests.
     pub fn path() -> Self {
         Self {
             inner: Arc::new(|method: &Method, uri: &Uri| {
@@ -314,15 +337,22 @@ where
     }
 
     pub fn build(self) -> CacheLayer<B> {
+        let refresh_before = self.policy.refresh_before();
         let refresh_manager = self
             .auto_refresh_config
             .filter(|cfg| cfg.enabled)
-            .map(|cfg| Arc::new(RefreshManager::new(cfg)));
+            .map(|cfg| Arc::new(RefreshManager::new(cfg).with_refresh_before(refresh_before)));
+        let refresh_shutdown = refresh_manager
+            .as_ref()
+            .map(|manager| Arc::new(RefreshShutdownGuard::new(Arc::clone(manager))));
 
         // Create chunk cache if enabled in streaming policy
-        let chunk_cache = if self.policy.streaming_policy().enable_chunk_cache {
-            Some(Arc::new(ChunkCache::new(
-                self.policy.streaming_policy().chunk_size,
+        let streaming_policy = self.policy.streaming_policy();
+        let chunk_cache = if streaming_policy.enable_chunk_cache {
+            Some(Arc::new(ChunkCache::with_limits(
+                streaming_policy.chunk_size,
+                streaming_policy.max_chunk_cache_bytes,
+                streaming_policy.max_chunk_cache_entries,
             )))
         } else {
             None
@@ -334,6 +364,7 @@ where
             key_extractor: self.key_extractor,
             locks: Arc::new(DashMap::new()),
             refresh_manager,
+            refresh_shutdown,
             chunk_cache,
             #[cfg(feature = "admin-api")]
             stats: self.stats.unwrap_or_else(|| Arc::new(GlobalStats::new())),
@@ -445,6 +476,11 @@ where
         self.chunk_cache.as_ref()
     }
 
+    /// Returns a reference to the underlying cache backend.
+    pub fn backend(&self) -> &B {
+        &self.backend
+    }
+
     /// Returns the shared [`GlobalStats`] tracker wired into services produced by this layer.
     #[cfg(feature = "admin-api")]
     pub fn stats(&self) -> Arc<GlobalStats> {
@@ -531,7 +567,8 @@ where
                 service,
                 self.backend.clone(),
                 self.policy.clone(),
-                self.key_extractor.clone(),
+                self.chunk_cache.clone(),
+                Some(Arc::downgrade(manager)),
             ));
             manager.start(callback).await
         } else {
@@ -554,26 +591,10 @@ where
             key_extractor: self.key_extractor.clone(),
             locks: self.locks.clone(),
             refresh_manager: self.refresh_manager.clone(),
+            refresh_shutdown: self.refresh_shutdown.clone(),
             chunk_cache: self.chunk_cache.clone(),
             #[cfg(feature = "admin-api")]
             stats: self.stats.clone(),
-        }
-    }
-}
-
-impl<B> Drop for CacheLayer<B> {
-    fn drop(&mut self) {
-        // Trigger graceful shutdown of refresh manager
-        // We use tokio::spawn to avoid blocking in Drop
-        if let Some(manager) = &self.refresh_manager {
-            let manager = manager.clone();
-            // Best-effort shutdown - spawn detached task
-            // Note: We cannot guarantee execution in Drop, but we try our best
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    manager.shutdown().await;
-                });
-            }
         }
     }
 }
@@ -586,6 +607,8 @@ pub struct CacheService<S, B> {
     key_extractor: KeyExtractor,
     locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
     refresh_manager: Option<Arc<RefreshManager>>,
+    #[allow(dead_code)]
+    refresh_shutdown: Option<Arc<RefreshShutdownGuard>>,
     chunk_cache: Option<Arc<ChunkCache>>,
     #[cfg(feature = "admin-api")]
     stats: Arc<GlobalStats>,
@@ -596,14 +619,24 @@ struct CacheRefreshCallback<S, B> {
     inner: S,
     backend: B,
     policy: CachePolicy,
+    chunk_cache: Option<Arc<ChunkCache>>,
+    refresh_manager: Option<Weak<RefreshManager>>,
 }
 
 impl<S, B> CacheRefreshCallback<S, B> {
-    fn new(inner: S, backend: B, policy: CachePolicy, _key_extractor: KeyExtractor) -> Self {
+    fn new(
+        inner: S,
+        backend: B,
+        policy: CachePolicy,
+        chunk_cache: Option<Arc<ChunkCache>>,
+        refresh_manager: Option<Weak<RefreshManager>>,
+    ) -> Self {
         Self {
             inner,
             backend,
             policy,
+            chunk_cache,
+            refresh_manager,
         }
     }
 }
@@ -621,6 +654,8 @@ where
         let backend = self.backend.clone();
         let policy = self.policy.clone();
         let inner = self.inner.clone();
+        let chunk_cache = self.chunk_cache.clone();
+        let refresh_manager = self.refresh_manager.clone();
 
         Box::pin(async move {
             #[cfg(feature = "tracing")]
@@ -630,6 +665,19 @@ where
             // tag extractor keys off the request, not the response.
             let request_method = metadata.method.clone();
             let request_uri = metadata.uri.clone();
+            let is_head = request_method == Method::HEAD;
+            let has_authorization = metadata
+                .headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("authorization"));
+            let has_cookie = metadata
+                .headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("cookie"));
+
+            if is_head || has_cookie {
+                return Ok(());
+            }
 
             // Reconstruct the request
             let request = match metadata.try_into_request() {
@@ -654,6 +702,28 @@ where
 
             let (parts, body) = response.into_parts();
 
+            let content_type = parts
+                .headers
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok());
+            let content_length = parts
+                .headers
+                .get(http::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok());
+            let size_hint = body.size_hint();
+            let streaming_decision = should_stream(
+                policy.streaming_policy(),
+                &size_hint,
+                content_type,
+                content_length,
+            );
+            if matches!(streaming_decision, StreamingDecision::SkipCache) {
+                return Ok(());
+            }
+
+            let streaming = size_hint.upper().is_none();
+
             // Collect the body
             let collected = match BodyExt::collect(body).await {
                 Ok(c) => c,
@@ -666,23 +736,26 @@ where
 
             let cache_bytes = collected.to_bytes();
 
-            // Check if we should cache this response
-            let body_too_large = policy
-                .max_body_size()
-                .is_some_and(|max| cache_bytes.len() > max);
-            let body_too_small = policy
-                .min_body_size()
-                .is_some_and(|min| cache_bytes.len() < min);
-
-            if body_too_large || body_too_small {
+            if !should_store_response(
+                &parts.headers,
+                &policy,
+                &cache_bytes,
+                streaming,
+                is_head,
+                has_authorization,
+            ) {
                 return Ok(()); // Successfully refreshed but not stored
             }
 
             // Store the refreshed entry
             if let Some(ttl) = policy.ttl_for(parts.status) {
                 if !ttl.is_zero() {
+                    if let Some(ref cc) = chunk_cache {
+                        populate_chunk_cache(cc, &key, &parts, &policy, &cache_bytes, ttl);
+                    }
+
                     let stale_for = policy.stale_while_revalidate();
-                    let (compressed_bytes, headers_to_cache, _compressed) =
+                    let (compressed_bytes, headers_to_cache, compressed) =
                         prepare_cached_payload_and_headers(&parts.headers, &policy, cache_bytes);
 
                     let entry = CacheEntry::new(
@@ -690,7 +763,8 @@ where
                         parts.version,
                         headers_to_cache,
                         compressed_bytes,
-                    );
+                    )
+                    .with_compressed(compressed);
                     let tags = policy.extract_tags(&request_method, &request_uri);
                     let entry = if tags.is_empty() {
                         entry
@@ -702,6 +776,10 @@ where
                         #[cfg(feature = "tracing")]
                         tracing::error!(key = %key, "Failed to store refreshed entry");
                         return Err("Failed to store entry".into());
+                    }
+
+                    if let Some(manager) = refresh_manager.as_ref().and_then(Weak::upgrade) {
+                        manager.update_expiry(&key, SystemTime::now() + ttl);
                     }
                 }
             }
@@ -737,10 +815,21 @@ where
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
         let method = req.method().clone();
         let uri = req.uri().clone();
+        let is_head = method == Method::HEAD;
         let should_cache_method = self.policy.should_cache_method(&method);
         let request_bypass =
             self.policy.respect_cache_control() && cache_control_disallows(req.headers());
-        let key = if should_cache_method && !request_bypass {
+        let has_cookie = req.headers().contains_key(http::header::COOKIE);
+        let has_authorization = req.headers().contains_key(http::header::AUTHORIZATION);
+        let accept_gzip = client_accepts_gzip(req.headers());
+        let has_range_header = req.headers().contains_key(http::header::RANGE);
+        let req_if_range = req
+            .headers()
+            .get(http::header::IF_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim().to_owned());
+
+        let key = if should_cache_method && !request_bypass && !has_cookie {
             self.key_extractor.extract(&method, &uri)
         } else {
             None
@@ -765,7 +854,7 @@ where
         let range_request = parse_range_header(req.headers());
 
         // Prepare refresh metadata if auto-refresh is enabled
-        let refresh_metadata = if refresh_manager.is_some() && key.is_some() {
+        let refresh_metadata = if refresh_manager.is_some() && key.is_some() && !is_head {
             Some(RefreshMetadata::from_request(&req))
         } else {
             None
@@ -788,48 +877,57 @@ where
                 (range_request.as_ref(), &chunk_cache, &key)
             {
                 if let Some(entry) = chunk_cache.get(key_ref) {
-                    // Check if range is satisfiable and normalize it
-                    if let Some(normalized) = range_req.normalize(entry.metadata.total_size) {
-                        let end = normalized
-                            .end
-                            .unwrap_or_else(|| entry.metadata.total_size.saturating_sub(1));
+                    let auth_allowed = !has_authorization
+                        || cached_entry_allows_shared_auth(&entry.metadata.headers);
+                    let if_range_ok = if_range_matches(
+                        req_if_range.as_deref(),
+                        entry.metadata.etag.as_deref(),
+                        entry.metadata.last_modified.as_deref(),
+                    );
+                    if auth_allowed && if_range_ok {
+                        // Check if range is satisfiable and normalize it
+                        if let Some(normalized) = range_req.normalize(entry.metadata.total_size) {
+                            let end = normalized
+                                .end
+                                .unwrap_or_else(|| entry.metadata.total_size.saturating_sub(1));
 
-                        // Try to get range from chunks
-                        if let Some(range_data) = entry.get_range(normalized.start, end) {
-                            let range_len = range_data.len();
-                            #[cfg(feature = "metrics")]
-                            counter!("tower_http_cache.chunk_cache_hit").increment(1);
-                            #[cfg(feature = "admin-api")]
-                            stats.record_hit(key_ref);
+                            // Try to get range from chunks
+                            if let Some(range_data) = entry.get_range(normalized.start, end) {
+                                let range_len = range_data.len();
+                                #[cfg(feature = "metrics")]
+                                counter!("tower_http_cache.chunk_cache_hit").increment(1);
+                                #[cfg(feature = "admin-api")]
+                                stats.record_hit(key_ref);
 
-                            #[cfg(feature = "tracing")]
-                            tracing::debug!(
-                                key = %key_ref,
-                                start = normalized.start,
-                                end = end,
-                                "chunk_cache_hit"
-                            );
+                                #[cfg(feature = "tracing")]
+                                tracing::debug!(
+                                    key = %key_ref,
+                                    start = normalized.start,
+                                    end = end,
+                                    "chunk_cache_hit"
+                                );
 
-                            let response = build_chunk_hit_response(
-                                &entry,
-                                range_data,
-                                normalized.start,
-                                end,
-                            )?;
+                                let response = build_chunk_hit_response(
+                                    &entry,
+                                    if is_head { Bytes::new() } else { range_data },
+                                    normalized.start,
+                                    end,
+                                )?;
 
-                            #[cfg(feature = "serde")]
-                            if let (Some(ml), Some(t0)) = (&ml_ctx, call_start) {
-                                ml.event(CacheEventType::Hit, key_ref.as_str())
-                                    .with_hit(true)
-                                    .with_status(response.status())
-                                    .with_version(response.version())
-                                    .with_size(range_len)
-                                    .with_latency(t0.elapsed())
-                                    .log(&ml.config);
+                                #[cfg(feature = "serde")]
+                                if let (Some(ml), Some(t0)) = (&ml_ctx, call_start) {
+                                    ml.event(CacheEventType::Hit, key_ref.as_str())
+                                        .with_hit(true)
+                                        .with_status(response.status())
+                                        .with_version(response.version())
+                                        .with_size(range_len)
+                                        .with_latency(t0.elapsed())
+                                        .log(&ml.config);
+                                }
+
+                                let _ = range_len;
+                                return Ok(response);
                             }
-
-                            let _ = range_len;
-                            return Ok(response);
                         }
                     }
                 }
@@ -842,7 +940,7 @@ where
             if let Some(ref key_ref) = key {
                 if let Ok(Some(hit)) = backend.get(key_ref).await {
                     match classify_hit(hit, stale_window, refresh_before) {
-                        HitState::Fresh(entry) => {
+                        HitState::Fresh(entry) if is_usable_hit(&entry, has_authorization) => {
                             #[cfg(feature = "metrics")]
                             counter!("tower_http_cache.hit").increment(1);
                             #[cfg(feature = "admin-api")]
@@ -864,9 +962,9 @@ where
                                     .log(&ml.config);
                             }
 
-                            return Ok(entry.into_response());
+                            return Ok(entry.into_response_with_options(accept_gzip, is_head));
                         }
-                        HitState::Stale(entry) => {
+                        HitState::Stale(entry) if is_usable_hit(&entry, has_authorization) => {
                             #[cfg(feature = "metrics")]
                             counter!("tower_http_cache.stale_hit").increment(1);
 
@@ -877,7 +975,7 @@ where
 
                             stale_entry = Some(entry);
                         }
-                        HitState::Expired => {}
+                        _ => {}
                     }
                 }
             }
@@ -904,7 +1002,7 @@ where
                                     .with_latency(t0.elapsed())
                                     .log(&ml.config);
                             }
-                            return Ok(entry.into_response());
+                            return Ok(entry.into_response_with_options(accept_gzip, is_head));
                         }
 
                         let secondary_guard = lock.lock_owned().await;
@@ -912,7 +1010,9 @@ where
 
                         if let Ok(Some(hit)) = backend.get(key_ref).await {
                             match classify_hit(hit, stale_window, refresh_before) {
-                                HitState::Fresh(entry) => {
+                                HitState::Fresh(entry)
+                                    if is_usable_hit(&entry, has_authorization) =>
+                                {
                                     #[cfg(feature = "metrics")]
                                     counter!("tower_http_cache.hit_after_wait").increment(1);
                                     #[cfg(feature = "admin-api")]
@@ -927,9 +1027,13 @@ where
                                             .with_latency(t0.elapsed())
                                             .log(&ml.config);
                                     }
-                                    return Ok(entry.into_response());
+                                    return Ok(
+                                        entry.into_response_with_options(accept_gzip, is_head)
+                                    );
                                 }
-                                HitState::Stale(entry) => {
+                                HitState::Stale(entry)
+                                    if is_usable_hit(&entry, has_authorization) =>
+                                {
                                     #[cfg(feature = "metrics")]
                                     counter!("tower_http_cache.stale_served").increment(1);
                                     #[cfg(feature = "admin-api")]
@@ -944,9 +1048,11 @@ where
                                             .with_latency(t0.elapsed())
                                             .log(&ml.config);
                                     }
-                                    return Ok(entry.into_response());
+                                    return Ok(
+                                        entry.into_response_with_options(accept_gzip, is_head)
+                                    );
                                 }
-                                HitState::Expired => {}
+                                _ => {}
                             }
                         }
 
@@ -972,21 +1078,23 @@ where
                         if let HitState::Fresh(entry) =
                             classify_hit(hit, stale_window, refresh_before)
                         {
-                            #[cfg(feature = "metrics")]
-                            counter!("tower_http_cache.hit_after_lock").increment(1);
-                            #[cfg(feature = "admin-api")]
-                            stats.record_hit(key_ref);
-                            #[cfg(feature = "serde")]
-                            if let (Some(ml), Some(t0)) = (&ml_ctx, call_start) {
-                                ml.event(CacheEventType::Hit, key_ref.as_str())
-                                    .with_hit(true)
-                                    .with_status(entry.status)
-                                    .with_version(entry.version)
-                                    .with_size(entry.body.len())
-                                    .with_latency(t0.elapsed())
-                                    .log(&ml.config);
+                            if is_usable_hit(&entry, has_authorization) {
+                                #[cfg(feature = "metrics")]
+                                counter!("tower_http_cache.hit_after_lock").increment(1);
+                                #[cfg(feature = "admin-api")]
+                                stats.record_hit(key_ref);
+                                #[cfg(feature = "serde")]
+                                if let (Some(ml), Some(t0)) = (&ml_ctx, call_start) {
+                                    ml.event(CacheEventType::Hit, key_ref.as_str())
+                                        .with_hit(true)
+                                        .with_status(entry.status)
+                                        .with_version(entry.version)
+                                        .with_size(entry.body.len())
+                                        .with_latency(t0.elapsed())
+                                        .log(&ml.config);
+                                }
+                                return Ok(entry.into_response_with_options(accept_gzip, is_head));
                             }
-                            return Ok(entry.into_response());
                         }
                     }
                 }
@@ -1006,11 +1114,10 @@ where
             #[cfg(feature = "metrics")]
             histogram!("tower_http_cache.backend_latency").record(start.elapsed().as_secs_f64());
 
-            let (parts, body) = response.into_parts();
+            let (mut parts, body) = response.into_parts();
 
             #[cfg(feature = "serde")]
-            if let (Some(ml), Some(t0)) = (&ml_ctx, call_start) {
-                let miss_key = key.clone().unwrap_or_else(|| uri.to_string());
+            if let (Some(ml), Some(t0), Some(miss_key)) = (&ml_ctx, call_start, key.as_deref()) {
                 ml.event(CacheEventType::Miss, miss_key)
                     .with_hit(false)
                     .with_status(parts.status)
@@ -1041,7 +1148,7 @@ where
             );
 
             // Check for range requests
-            let is_range_request = parse_range_header(&parts.headers).is_some();
+            let is_range_request = has_range_header;
             let is_partial_response = is_partial_content(parts.status);
             let range_handling = policy.streaming_policy().range_handling;
 
@@ -1097,22 +1204,17 @@ where
 
             let collected = BodyExt::collect(body).await.map_err(|err| err.into())?;
             let cache_bytes = collected.to_bytes();
-            let response_bytes = cache_bytes.clone();
-
-            let cache_control_block =
-                policy.respect_cache_control() && cache_control_disallows(&parts.headers);
-            let body_too_large = policy
-                .max_body_size()
-                .is_some_and(|max| cache_bytes.len() > max);
-            let body_too_small = policy
-                .min_body_size()
-                .is_some_and(|min| cache_bytes.len() < min);
+            let mut response_bytes = cache_bytes.clone();
 
             let should_store = key.is_some()
-                && !cache_control_block
-                && !body_too_large
-                && !body_too_small
-                && (policy.allow_streaming_bodies() || !streaming);
+                && should_store_response(
+                    &parts.headers,
+                    &policy,
+                    &cache_bytes,
+                    streaming,
+                    is_head,
+                    has_authorization,
+                );
 
             let version = parts.version;
             let status = parts.status;
@@ -1143,13 +1245,29 @@ where
                             if compressed {
                                 #[cfg(feature = "metrics")]
                                 counter!("tower_http_cache.compressed").increment(1);
+
+                                merge_vary_accept_encoding_header_map(&mut parts.headers);
+                                if accept_gzip {
+                                    parts.headers.insert(
+                                        http::header::CONTENT_ENCODING,
+                                        http::HeaderValue::from_static("gzip"),
+                                    );
+                                    if let Ok(len_val) = http::HeaderValue::from_str(
+                                        &compressed_bytes.len().to_string(),
+                                    ) {
+                                        parts.headers.insert(http::header::CONTENT_LENGTH, len_val);
+                                    }
+                                    tag_gzip_etag_header_map(&mut parts.headers);
+                                    response_bytes = compressed_bytes.clone();
+                                }
                             }
                             let entry = CacheEntry::new(
                                 status,
                                 version,
                                 headers_to_cache,
                                 compressed_bytes,
-                            );
+                            )
+                            .with_compressed(compressed);
                             // `extract_tags` returns an empty vector unless
                             // `TagPolicy::enabled` is set, which defaults to
                             // false -- so this is inert for anyone who has not
@@ -1192,7 +1310,11 @@ where
                                 if let (Some(manager), Some(metadata)) =
                                     (&refresh_manager, refresh_metadata)
                                 {
-                                    manager.store_metadata(key_ref.clone(), metadata);
+                                    manager.store_metadata_with_expiry(
+                                        key_ref.clone(),
+                                        metadata,
+                                        SystemTime::now() + ttl,
+                                    );
                                 }
                             }
                         }
@@ -1206,7 +1328,11 @@ where
             drop(primary_guard);
 
             // Box the response body
-            let full_body = Full::from(response_bytes);
+            let full_body = Full::from(if is_head {
+                Bytes::new()
+            } else {
+                response_bytes
+            });
             let boxed_body = SyncBoxBody::new(full_body.map_err(Into::into).boxed());
             Ok(Response::from_parts(parts, boxed_body))
         })
@@ -1441,23 +1567,218 @@ fn populate_chunk_cache(
         headers: policy.headers_to_cache(&parts.headers),
     };
 
-    let entry = chunk_cache.get_or_create_with_ttl(key.to_string(), metadata, Some(ttl));
-    let chunk_size = streaming_policy.chunk_size;
+    let chunk_size = streaming_policy.chunk_size.max(1);
+    let mut chunks = Vec::new();
     let mut offset = 0;
-    let mut chunk_index = 0;
 
     while offset < cache_bytes.len() {
         let end = std::cmp::min(offset + chunk_size, cache_bytes.len());
-        entry.add_chunk(chunk_index, cache_bytes.slice(offset..end));
+        chunks.push(cache_bytes.slice(offset..end));
         offset = end;
-        chunk_index += 1;
     }
+
+    let chunk_count = chunks.len();
+    chunk_cache.replace_with_ttl(key.to_string(), metadata, Some(ttl), chunks);
 
     #[cfg(feature = "metrics")]
     counter!("tower_http_cache.chunk_cache_stored").increment(1);
 
     #[cfg(feature = "tracing")]
-    tracing::debug!(key = %key, chunks = chunk_index, "chunk_cache_populated");
+    tracing::debug!(key = %key, chunks = chunk_count, "chunk_cache_populated");
+    let _ = chunk_count;
+}
+
+fn should_store_response(
+    headers: &HeaderMap,
+    policy: &CachePolicy,
+    cache_bytes: &[u8],
+    streaming: bool,
+    is_head: bool,
+    has_authorization: bool,
+) -> bool {
+    let cache_control_block = policy.respect_cache_control() && cache_control_disallows(headers);
+    let body_too_large = policy
+        .max_body_size()
+        .is_some_and(|max| cache_bytes.len() > max);
+    let body_too_small = policy
+        .min_body_size()
+        .is_some_and(|min| cache_bytes.len() < min);
+    let auth_allowed = !has_authorization || response_allows_shared_auth(headers);
+
+    !is_head
+        && !cache_control_block
+        && !body_too_large
+        && !body_too_small
+        && auth_allowed
+        && (policy.allow_streaming_bodies() || !streaming)
+}
+
+fn is_usable_hit(entry: &CacheEntry, has_authorization: bool) -> bool {
+    !has_authorization || cached_entry_allows_shared_auth(&entry.headers)
+}
+
+fn cache_control_allows_shared_auth_str(value: &str) -> bool {
+    value.split(',').any(|directive| {
+        let trimmed = directive.trim().to_ascii_lowercase();
+        trimmed == "public" || trimmed == "must-revalidate" || trimmed.starts_with("s-maxage=")
+    })
+}
+
+fn response_allows_shared_auth(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(CACHE_CONTROL)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .any(cache_control_allows_shared_auth_str)
+}
+
+fn cached_entry_allows_shared_auth(headers: &[(String, Vec<u8>)]) -> bool {
+    headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("cache-control"))
+        .filter_map(|(_, value)| std::str::from_utf8(value).ok())
+        .any(cache_control_allows_shared_auth_str)
+}
+
+fn client_accepts_gzip(headers: &HeaderMap) -> bool {
+    let mut gzip_q: Option<f32> = None;
+    let mut star_q: Option<f32> = None;
+
+    for value in headers.get_all(http::header::ACCEPT_ENCODING) {
+        let Ok(raw) = value.to_str() else {
+            continue;
+        };
+        for item in raw.split(',') {
+            let mut parts = item.split(';');
+            let coding = parts.next().map(str::trim).unwrap_or("");
+            if coding.is_empty() {
+                continue;
+            }
+            let mut q = 1.0_f32;
+            for param in parts {
+                let param = param.trim();
+                if let Some(q_str) = param
+                    .strip_prefix("q=")
+                    .or_else(|| param.strip_prefix("Q="))
+                {
+                    if let Ok(parsed) = q_str.trim().parse::<f32>() {
+                        q = parsed;
+                    }
+                }
+            }
+            if coding.eq_ignore_ascii_case("gzip") {
+                gzip_q = Some(q);
+            } else if coding == "*" {
+                star_q = Some(q);
+            }
+        }
+    }
+
+    match gzip_q {
+        Some(q) => q > 0.0,
+        None => star_q.is_some_and(|q| q > 0.0),
+    }
+}
+
+fn if_range_matches(
+    if_range: Option<&str>,
+    etag: Option<&str>,
+    last_modified: Option<&str>,
+) -> bool {
+    let Some(raw) = if_range else {
+        return true;
+    };
+    let val = raw.trim();
+    if val.is_empty() || val.starts_with("W/") {
+        return false;
+    }
+    if val.starts_with('"') {
+        etag.is_some_and(|e| {
+            let e = e.trim();
+            !e.starts_with("W/") && e == val
+        })
+    } else {
+        last_modified.is_some_and(|lm| lm.trim() == val)
+    }
+}
+
+fn preserve_header_if_missing(
+    cached_headers: &mut Vec<(String, Vec<u8>)>,
+    source: &HeaderMap,
+    header_name: http::header::HeaderName,
+) {
+    if cached_headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case(header_name.as_str()))
+    {
+        return;
+    }
+    for value in source.get_all(&header_name) {
+        cached_headers.push((header_name.as_str().to_string(), value.as_bytes().to_vec()));
+    }
+}
+
+fn vary_includes_accept_encoding(value: &str) -> bool {
+    value
+        .split(',')
+        .map(str::trim)
+        .any(|tok| tok == "*" || tok.eq_ignore_ascii_case("accept-encoding"))
+}
+
+fn merge_vary_accept_encoding_vec(headers: &mut Vec<(String, Vec<u8>)>) {
+    for (name, value) in headers.iter_mut() {
+        if name.eq_ignore_ascii_case("vary") {
+            if let Ok(existing) = std::str::from_utf8(value) {
+                if vary_includes_accept_encoding(existing) {
+                    return;
+                }
+                let updated = if existing.trim().is_empty() {
+                    "Accept-Encoding".to_string()
+                } else {
+                    format!("{}, Accept-Encoding", existing.trim())
+                };
+                *value = updated.into_bytes();
+            }
+            return;
+        }
+    }
+    headers.push(("vary".to_string(), b"Accept-Encoding".to_vec()));
+}
+
+fn merge_vary_accept_encoding_header_map(headers: &mut HeaderMap) {
+    let already_covered = headers
+        .get_all(http::header::VARY)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .any(vary_includes_accept_encoding);
+    if !already_covered {
+        headers.append(
+            http::header::VARY,
+            http::HeaderValue::from_static("Accept-Encoding"),
+        );
+    }
+}
+
+fn tag_gzip_etag_str(etag: &str) -> Option<String> {
+    let trimmed = etag.trim();
+    if trimmed.ends_with('"') && !trimmed.ends_with("-gzip\"") && trimmed.len() >= 2 {
+        let prefix = &trimmed[..trimmed.len() - 1];
+        Some(format!("{prefix}-gzip\""))
+    } else {
+        None
+    }
+}
+
+fn tag_gzip_etag_header_map(headers: &mut HeaderMap) {
+    if let Some(etag) = headers
+        .get(http::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .and_then(tag_gzip_etag_str)
+    {
+        if let Ok(val) = http::HeaderValue::from_str(&etag) {
+            headers.insert(http::header::ETAG, val);
+        }
+    }
 }
 
 fn prepare_cached_payload_and_headers(
@@ -1467,8 +1788,11 @@ fn prepare_cached_payload_and_headers(
 ) -> (Bytes, Vec<(String, Vec<u8>)>, bool) {
     let mut cached_headers = policy.headers_to_cache(headers);
 
-    // Never double-compress upstream payloads that already carry Content-Encoding.
+    // Never double-compress upstream payloads that already carry Content-Encoding,
+    // and preserve Content-Encoding / Vary even when header_allowlist omits them.
     if headers.contains_key(http::header::CONTENT_ENCODING) {
+        preserve_header_if_missing(&mut cached_headers, headers, http::header::CONTENT_ENCODING);
+        preserve_header_if_missing(&mut cached_headers, headers, http::header::VARY);
         return (raw_bytes, cached_headers, false);
     }
 
@@ -1483,6 +1807,16 @@ fn prepare_cached_payload_and_headers(
             "content-length".to_string(),
             stored_bytes.len().to_string().into_bytes(),
         ));
+        for (name, value) in &mut cached_headers {
+            if name.eq_ignore_ascii_case("etag") {
+                if let Ok(s) = std::str::from_utf8(value) {
+                    if let Some(tagged) = tag_gzip_etag_str(s) {
+                        *value = tagged.into_bytes();
+                    }
+                }
+            }
+        }
+        merge_vary_accept_encoding_vec(&mut cached_headers);
     }
 
     (stored_bytes, cached_headers, compressed)

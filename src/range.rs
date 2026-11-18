@@ -89,7 +89,7 @@ impl RangeRequest {
         }
 
         if let Some(end) = self.end {
-            if end >= total_size || end < self.start {
+            if end < self.start {
                 return false;
             }
         }
@@ -177,11 +177,14 @@ pub fn parse_range_header(headers: &HeaderMap) -> Option<RangeRequest> {
         return None;
     }
 
-    // Split on comma to get first range (we only support single ranges for now)
-    let first_range = range_spec.split(',').next()?;
+    // Multi-range requests (e.g. "bytes=0-10, 20-30") are unsupported; return None
+    // so callers fall through rather than silently serving only the first range.
+    if range_spec.contains(',') {
+        return None;
+    }
 
     // Parse "start-end" or suffix "-len" format
-    let parts: Vec<&str> = first_range.split('-').collect();
+    let parts: Vec<&str> = range_spec.split('-').collect();
     if parts.len() != 2 {
         return None;
     }
@@ -317,7 +320,11 @@ mod tests {
     fn test_range_is_satisfiable() {
         let range = RangeRequest::new(0, Some(1023));
         assert!(range.is_satisfiable(10240));
-        assert!(!range.is_satisfiable(512));
+        // Per RFC 9110 §14.1.1, last-pos >= total_size is satisfiable and clamps to total_size - 1.
+        assert!(range.is_satisfiable(512));
+        let clamped = range.normalize(512).unwrap();
+        assert_eq!(clamped.start, 0);
+        assert_eq!(clamped.end, Some(511));
 
         let range_at_end = RangeRequest::new(10240, Some(10250));
         assert!(!range_at_end.is_satisfiable(10240));
@@ -403,17 +410,15 @@ mod tests {
     }
 
     #[test]
-    fn test_range_multiple_ranges_first_only() {
+    fn test_range_multiple_ranges_rejected() {
         let mut headers = HeaderMap::new();
         headers.insert(
             http::header::RANGE,
             "bytes=0-1023,1024-2047".parse().unwrap(),
         );
 
-        // We only support single ranges, should parse first one
-        let range = parse_range_header(&headers).unwrap();
-        assert_eq!(range.start, 0);
-        assert_eq!(range.end, Some(1023));
+        // Multi-range requests are unsupported and must return None.
+        assert!(parse_range_header(&headers).is_none());
     }
 
     #[test]

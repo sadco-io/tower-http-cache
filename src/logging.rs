@@ -269,19 +269,24 @@ impl CacheEvent {
         self
     }
 
-    /// Logs this event using the provided configuration.
-    pub fn log(&self, config: &MLLoggingConfig) {
-        if !config.should_sample() {
-            return;
-        }
-
+    /// Builds the structured JSON payload for this event.
+    fn to_log_json(&self, config: &MLLoggingConfig) -> serde_json::Value {
         let key = if config.hash_keys {
             hash_key(&self.key)
         } else {
             self.key.clone()
         };
 
-        let log_data = json!({
+        let uri = self.uri.as_ref().map(|u| {
+            let rendered = u.to_string();
+            if config.hash_keys {
+                hash_key(&rendered)
+            } else {
+                rendered
+            }
+        });
+
+        json!({
             "timestamp": crate::time_fmt::format_iso8601_millis(self.timestamp),
             "level": "info",
             "target": config.target,
@@ -289,7 +294,7 @@ impl CacheEvent {
             "request_id": self.request_id.as_str(),
             "key": key,
             "method": self.method.as_ref().map(|m| m.as_str()),
-            "uri": self.uri.as_ref().map(|u| u.to_string()),
+            "uri": uri,
             "version": self.version.as_ref().map(|v| format!("{:?}", v)),
             "status": self.status.as_ref().map(|s| s.as_u16()),
             "hit": self.hit,
@@ -300,7 +305,16 @@ impl CacheEvent {
             "tier": self.tier,
             "promoted": self.promoted,
             "metadata": self.metadata,
-        });
+        })
+    }
+
+    /// Logs this event using the provided configuration.
+    pub fn log(&self, config: &MLLoggingConfig) {
+        if !config.should_sample() {
+            return;
+        }
+
+        let log_data = self.to_log_json(config);
 
         #[cfg(feature = "tracing")]
         {
@@ -446,7 +460,13 @@ mod tests {
             .with_enabled(true)
             .with_hash_keys(true);
         let request_id = RequestId::new();
-        let event = CacheEvent::new(CacheEventType::Hit, request_id, "/api/secret".to_string());
+        let event = CacheEvent::new(CacheEventType::Hit, request_id, "/api/secret".to_string())
+            .with_uri("/api/secret?token=s3cr3t".parse().unwrap());
+
+        let payload = event.to_log_json(&config);
+        assert_eq!(payload["key"], hash_key("/api/secret"));
+        assert_eq!(payload["uri"], hash_key("/api/secret?token=s3cr3t"));
+        assert!(!payload.to_string().contains("s3cr3t"));
 
         // Should not panic when logging with hashing
         event.log(&config);

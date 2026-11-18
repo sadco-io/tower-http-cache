@@ -855,21 +855,44 @@ async fn compression_caches_gzip_payloads() {
     }));
 
     service.ready().await.expect("service ready");
-    let first = service
-        .call(Request::new(()))
+    let first_resp = service
+        .call(
+            Request::builder()
+                .header(http::header::ACCEPT_ENCODING, "gzip")
+                .body(())
+                .unwrap(),
+        )
         .await
-        .expect("first call succeeds")
+        .expect("first call succeeds");
+    assert_eq!(
+        first_resp
+            .headers()
+            .get(http::header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok()),
+        Some("gzip"),
+        "miss response for gzip-capable client must be gzip encoded"
+    );
+    let first = first_resp
         .into_body()
         .collect()
         .await
         .expect("first body collected")
         .to_bytes();
-    let first_text = String::from_utf8(first.to_vec()).expect("first body utf-8");
+    let mut decoder = GzDecoder::new(&first[..]);
+    let mut first_text = String::new();
+    decoder
+        .read_to_string(&mut first_text)
+        .expect("first gzip decode succeeds");
     assert_eq!(first_text, payload);
 
     service.ready().await.expect("service ready");
     let cached_response = service
-        .call(Request::new(()))
+        .call(
+            Request::builder()
+                .header(http::header::ACCEPT_ENCODING, "gzip")
+                .body(())
+                .unwrap(),
+        )
         .await
         .expect("cached call succeeds");
     assert_eq!(
@@ -878,7 +901,16 @@ async fn compression_caches_gzip_payloads() {
             .get(http::header::CONTENT_ENCODING)
             .and_then(|v| v.to_str().ok()),
         Some("gzip"),
-        "compressed cached response must set Content-Encoding: gzip"
+        "compressed cached response must set Content-Encoding: gzip when client accepts gzip"
+    );
+    assert!(
+        cached_response
+            .headers()
+            .get_all(http::header::VARY)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .any(|v| v.to_ascii_lowercase().contains("accept-encoding")),
+        "compressed cached response must include Vary: Accept-Encoding"
     );
     let advertised_len: usize = cached_response
         .headers()
@@ -906,6 +938,27 @@ async fn compression_caches_gzip_payloads() {
         .read_to_string(&mut decompressed)
         .expect("gzip decode succeeds");
     assert_eq!(decompressed, payload);
+
+    // Client that does not accept gzip must receive identity bytes from the same cached entry.
+    service.ready().await.expect("service ready");
+    let identity_resp = service
+        .call(Request::new(()))
+        .await
+        .expect("identity cached call succeeds");
+    assert!(
+        identity_resp
+            .headers()
+            .get(http::header::CONTENT_ENCODING)
+            .is_none(),
+        "identity client must not receive Content-Encoding: gzip"
+    );
+    let identity_body = identity_resp
+        .into_body()
+        .collect()
+        .await
+        .expect("identity body collected")
+        .to_bytes();
+    assert_eq!(identity_body, Bytes::copy_from_slice(payload.as_bytes()));
     assert_eq!(counter.load(Ordering::SeqCst), 1);
 }
 
@@ -1203,4 +1256,432 @@ async fn axum_router_caches_with_handle_error_layer() {
     assert_eq!(&b1[..], b"hit-1");
     assert_eq!(&b2[..], b"hit-1");
     assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(feature = "compression")]
+#[tokio::test]
+async fn compression_negotiates_accept_encoding_and_etag_untagging() {
+    use tower_http_cache::policy::{CompressionConfig, CompressionStrategy};
+
+    let layer = CacheLayer::builder(InMemoryBackend::new(100))
+        .compression(CompressionConfig {
+            strategy: CompressionStrategy::Gzip,
+            min_size: 16,
+        })
+        .build();
+    let body = "x".repeat(4096);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut svc = layer.layer(service_fn({
+        let calls = calls.clone();
+        move |_r: Request<()>| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let b = body.clone();
+            async move {
+                Ok::<_, Infallible>(
+                    http::Response::builder()
+                        .header("content-type", "text/plain")
+                        .header("etag", "\"v1\"")
+                        .body(Full::from(b))
+                        .unwrap(),
+                )
+            }
+        }
+    }));
+
+    // Miss for identity client receives uncompressed body + Vary: Accept-Encoding.
+    let miss_resp = svc
+        .ready()
+        .await
+        .unwrap()
+        .call(
+            Request::get("/c")
+                .header(http::header::ACCEPT_ENCODING, "identity")
+                .body(())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        miss_resp
+            .headers()
+            .get(http::header::CONTENT_ENCODING)
+            .is_none()
+    );
+    assert_eq!(
+        miss_resp.headers().get(http::header::ETAG).unwrap(),
+        "\"v1\""
+    );
+    assert!(miss_resp.headers().get(http::header::VARY).is_some());
+    let miss_bytes = miss_resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(miss_bytes.len(), 4096);
+
+    // Hit for `gzip;q=0` receives decompressed body, no Content-Encoding, untagged ETag.
+    let q0_resp = svc
+        .ready()
+        .await
+        .unwrap()
+        .call(
+            Request::get("/c")
+                .header(http::header::ACCEPT_ENCODING, "gzip;q=0")
+                .body(())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        q0_resp
+            .headers()
+            .get(http::header::CONTENT_ENCODING)
+            .is_none()
+    );
+    assert_eq!(q0_resp.headers().get(http::header::ETAG).unwrap(), "\"v1\"");
+    let q0_bytes = q0_resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(q0_bytes.len(), 4096);
+
+    // Hit for `gzip` receives compressed body and `-gzip` ETag.
+    let gz_resp = svc
+        .ready()
+        .await
+        .unwrap()
+        .call(
+            Request::get("/c")
+                .header(http::header::ACCEPT_ENCODING, "gzip")
+                .body(())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        gz_resp
+            .headers()
+            .get(http::header::CONTENT_ENCODING)
+            .unwrap(),
+        "gzip"
+    );
+    assert_eq!(
+        gz_resp.headers().get(http::header::ETAG).unwrap(),
+        "\"v1-gzip\""
+    );
+    let gz_bytes = gz_resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&gz_bytes[..2], &[0x1f, 0x8b]);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(feature = "compression")]
+#[tokio::test]
+async fn allowlist_preserves_upstream_content_encoding_and_vary() {
+    use std::io::Write;
+
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(b"hello hello hello").unwrap();
+    let gz = Bytes::from(enc.finish().unwrap());
+
+    let layer = CacheLayer::builder(InMemoryBackend::new(100))
+        .header_allowlist(["content-type"])
+        .build();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut svc = layer.layer(service_fn({
+        let calls = calls.clone();
+        move |_r: Request<()>| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let gz = gz.clone();
+            async move {
+                Ok::<_, Infallible>(
+                    http::Response::builder()
+                        .header("content-type", "text/plain")
+                        .header("content-encoding", "gzip")
+                        .header("vary", "Accept-Encoding")
+                        .body(Full::from(gz))
+                        .unwrap(),
+                )
+            }
+        }
+    }));
+
+    let _ = svc
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::get("/g").body(()).unwrap())
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap();
+
+    let hit = svc
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::get("/g").body(()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        hit.headers().get(http::header::CONTENT_ENCODING).unwrap(),
+        "gzip"
+    );
+    assert_eq!(
+        hit.headers().get(http::header::VARY).unwrap(),
+        "Accept-Encoding"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn head_does_not_poison_get_and_serves_cached_headers() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let layer = CacheLayer::builder(InMemoryBackend::new(100)).build();
+    let mut svc = layer.layer(service_fn({
+        let calls = calls.clone();
+        move |r: Request<()>| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                let body = if r.method() == http::Method::HEAD {
+                    ""
+                } else {
+                    "full body"
+                };
+                Ok::<_, Infallible>(
+                    http::Response::builder()
+                        .header("content-length", "9")
+                        .body(Full::from(body))
+                        .unwrap(),
+                )
+            }
+        }
+    }));
+
+    // HEAD miss must not store an empty body into GET's cache slot.
+    let head_miss = svc
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::head("/h").body(()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(head_miss.status(), StatusCode::OK);
+    assert!(
+        head_miss
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty()
+    );
+
+    // Subsequent GET hits origin and populates cache with the full body.
+    let get_miss = svc
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::get("/h").body(()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(get_miss.headers().get("content-length").unwrap(), "9");
+    assert_eq!(
+        get_miss.into_body().collect().await.unwrap().to_bytes(),
+        Bytes::from_static(b"full body")
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    // Subsequent HEAD hits cache without calling origin, keeping content-length=9 and empty body.
+    let head_hit = svc
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::head("/h").body(()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(head_hit.headers().get("content-length").unwrap(), "9");
+    assert!(
+        head_hit
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn axum_head_does_not_poison_get() {
+    use axum::{Router, body::Body, error_handling::HandleErrorLayer, routing::get};
+
+    let layer = CacheLayer::builder(InMemoryBackend::new(100)).build();
+    let app = Router::new()
+        .route("/", get(|| async { "hello from GET handler" }))
+        .layer(
+            tower::ServiceBuilder::new()
+                .layer(HandleErrorLayer::new(
+                    |_e: tower_http_cache::layer::BoxError| async {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    },
+                ))
+                .layer(layer),
+        );
+
+    let head = app
+        .clone()
+        .oneshot(Request::head("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(head.status(), StatusCode::OK);
+
+    let get_resp = app
+        .oneshot(Request::get("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let body = get_resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], b"hello from GET handler");
+}
+
+#[tokio::test]
+async fn cookie_and_authorization_follow_rfc9111_shared_cache_rules() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let layer = CacheLayer::builder(InMemoryBackend::new(100))
+        .ttl(Duration::from_secs(60))
+        .build();
+    let mut svc = layer.layer(service_fn({
+        let calls = calls.clone();
+        move |req: Request<()>| {
+            let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let is_public = req.uri().path() == "/public-auth";
+            async move {
+                let mut builder = http::Response::builder().status(StatusCode::OK);
+                if is_public {
+                    builder = builder.header(CACHE_CONTROL, "public, max-age=60");
+                }
+                Ok::<_, Infallible>(builder.body(Full::from(format!("resp-{n}"))).unwrap())
+            }
+        }
+    }));
+
+    // Cookie requests always bypass lookup & store.
+    for _ in 0..2 {
+        let _ = svc
+            .ready()
+            .await
+            .unwrap()
+            .call(
+                Request::get("/cookie")
+                    .header(http::header::COOKIE, "sid=secret")
+                    .body(())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    // Public response cached without Authorization is still private-to-Authorization without public directive.
+    let r1 = svc
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::get("/auth-default").body(()).unwrap())
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    let r2 = svc
+        .ready()
+        .await
+        .unwrap()
+        .call(
+            Request::get("/auth-default")
+                .header(http::header::AUTHORIZATION, "Bearer user1")
+                .body(())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_ne!(
+        r1, r2,
+        "authenticated request must not reuse non-public entry"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+
+    // Explicit `Cache-Control: public` allows caching & hitting for Authorization requests.
+    let p1 = svc
+        .ready()
+        .await
+        .unwrap()
+        .call(
+            Request::get("/public-auth")
+                .header(http::header::AUTHORIZATION, "Bearer user1")
+                .body(())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    let p2 = svc
+        .ready()
+        .await
+        .unwrap()
+        .call(
+            Request::get("/public-auth")
+                .header(http::header::AUTHORIZATION, "Bearer user1")
+                .body(())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(p1, p2);
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
+}
+
+#[cfg(feature = "admin-api")]
+#[tokio::test]
+async fn global_stats_key_hits_is_bounded() {
+    let layer = CacheLayer::builder(InMemoryBackend::new(10)).build();
+    let stats = layer.stats();
+    let mut svc = layer.layer(service_fn(|_r: Request<()>| async {
+        Ok::<_, Infallible>(http::Response::new(Full::from("ok")))
+    }));
+
+    for i in 0..1500 {
+        let uri = format!("/k?i={i}");
+        let _ = svc
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::get(uri.as_str()).body(()).unwrap())
+            .await
+            .unwrap();
+        let _ = svc
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::get(uri.as_str()).body(()).unwrap())
+            .await
+            .unwrap();
+    }
+
+    let tracked = stats.hot_keys(usize::MAX).len();
+    assert!(
+        tracked <= 1_000,
+        "GlobalStats hot-key tracking must remain bounded (got {tracked})"
+    );
 }

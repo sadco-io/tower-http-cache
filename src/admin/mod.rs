@@ -8,6 +8,8 @@ pub mod routes;
 pub mod stats;
 
 use crate::backend::CacheBackend;
+use crate::chunks::ChunkCache;
+use crate::layer::CacheLayer;
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::sync::Arc;
@@ -102,6 +104,9 @@ impl AdminConfig {
 
         match (&self.auth_token, provided) {
             (Some(expected), Some(provided)) => {
+                if expected.trim().is_empty() || provided.trim().is_empty() {
+                    return false;
+                }
                 constant_time_eq(expected.as_bytes(), provided.as_bytes())
             }
             (None, _) => false,
@@ -126,6 +131,7 @@ pub struct AdminState<B: CacheBackend> {
     pub backend: B,
     pub config: Arc<AdminConfig>,
     pub stats: Arc<stats::GlobalStats>,
+    pub chunk_cache: Option<Arc<ChunkCache>>,
 }
 
 impl<B: CacheBackend> AdminState<B> {
@@ -141,7 +147,26 @@ impl<B: CacheBackend> AdminState<B> {
             backend,
             config: Arc::new(config),
             stats,
+            chunk_cache: None,
         }
+    }
+
+    /// Attaches a chunk cache so admin invalidations also evict cached chunks.
+    pub fn with_chunk_cache(mut self, chunk_cache: Arc<ChunkCache>) -> Self {
+        self.chunk_cache = Some(chunk_cache);
+        self
+    }
+
+    /// Builds admin state wired to the backend, shared stats, and optional chunk cache of a [`CacheLayer`].
+    pub fn from_layer(layer: &CacheLayer<B>, config: AdminConfig) -> Self
+    where
+        B: Clone,
+    {
+        let mut state = Self::with_stats(layer.backend().clone(), config, layer.stats());
+        if let Some(chunk_cache) = layer.chunk_cache().cloned() {
+            state = state.with_chunk_cache(chunk_cache);
+        }
+        state
     }
 }
 
@@ -220,5 +245,21 @@ mod tests {
         assert!(!config.validate_token(Some("correct-horse-battery-staple-extra")));
         assert!(!config.validate_token(Some("")));
         assert!(config.validate_token(Some("correct-horse-battery-staple")));
+    }
+
+    #[test]
+    fn validate_token_rejects_empty_and_whitespace_configured_tokens() {
+        let empty = AdminConfig::new()
+            .with_auth_token("")
+            .with_require_auth(true);
+        assert!(!empty.validate_token(Some("")));
+        assert!(!empty.validate_token(Some("   ")));
+        assert!(!empty.validate_token(None));
+
+        let whitespace = AdminConfig::new()
+            .with_auth_token("   ")
+            .with_require_auth(true);
+        assert!(!whitespace.validate_token(Some("   ")));
+        assert!(!whitespace.validate_token(Some("")));
     }
 }

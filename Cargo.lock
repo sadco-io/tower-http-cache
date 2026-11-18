@@ -1644,7 +1644,6 @@ dependencies = [
  "metrics",
  "metrics-util",
  "moka",
- "pin-project-lite",
  "postcard",
  "redis",
  "serde",

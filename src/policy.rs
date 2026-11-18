@@ -198,19 +198,32 @@ impl CachePolicy {
         }
     }
 
-    /// Returns the headers that should be cached based on the allowlist.
+    /// Returns the headers that should be cached based on the allowlist,
+    /// always stripping `Set-Cookie` and RFC 9110 hop-by-hop headers.
     pub fn headers_to_cache(&self, headers: &HeaderMap) -> Vec<(String, Vec<u8>)> {
-        match &self.header_allowlist {
-            Some(allowlist) => headers
-                .iter()
-                .filter(|(name, _)| allowlist.contains(&name.as_str().to_ascii_lowercase()))
-                .map(|(name, value)| (name.as_str().to_owned(), value.as_bytes().to_vec()))
-                .collect(),
-            None => headers
-                .iter()
-                .map(|(name, value)| (name.as_str().to_owned(), value.as_bytes().to_vec()))
-                .collect(),
-        }
+        let connection_tokens: HashSet<String> = headers
+            .get_all(http::header::CONNECTION)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .map(|token| token.trim().to_ascii_lowercase())
+            .filter(|token| !token.is_empty())
+            .collect();
+
+        headers
+            .iter()
+            .filter(|(name, _)| {
+                let lower = name.as_str().to_ascii_lowercase();
+                if is_non_cacheable_header(&lower, &connection_tokens) {
+                    return false;
+                }
+                match &self.header_allowlist {
+                    Some(allowlist) => allowlist.contains(&lower),
+                    None => true,
+                }
+            })
+            .map(|(name, value)| (name.as_str().to_owned(), value.as_bytes().to_vec()))
+            .collect()
     }
 
     pub fn with_ttl(mut self, ttl: Duration) -> Self {
@@ -332,6 +345,21 @@ impl Default for CachePolicy {
     }
 }
 
+fn is_non_cacheable_header(lower_name: &str, connection_tokens: &HashSet<String>) -> bool {
+    matches!(
+        lower_name,
+        "set-cookie"
+            | "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    ) || connection_tokens.contains(lower_name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,5 +417,52 @@ mod tests {
         assert_eq!(policy.ttl_for(StatusCode::CREATED), Some(policy.ttl()));
         assert_eq!(policy.ttl_for(StatusCode::OK), None);
         assert_eq!(policy.cache_statuses, HashSet::from([201_u16, 202_u16]));
+    }
+
+    #[test]
+    fn headers_to_cache_strips_set_cookie_and_hop_by_hop() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("content-type"),
+            HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            HeaderName::from_static("set-cookie"),
+            HeaderValue::from_static("session=abc; HttpOnly"),
+        );
+        headers.insert(
+            HeaderName::from_static("connection"),
+            HeaderValue::from_static("keep-alive, x-hop-custom"),
+        );
+        headers.insert(
+            HeaderName::from_static("keep-alive"),
+            HeaderValue::from_static("timeout=5"),
+        );
+        headers.insert(
+            HeaderName::from_static("transfer-encoding"),
+            HeaderValue::from_static("chunked"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-hop-custom"),
+            HeaderValue::from_static("secret"),
+        );
+
+        let policy = CachePolicy::default();
+        let cached = policy.headers_to_cache(&headers);
+        assert_eq!(
+            cached,
+            vec![("content-type".to_owned(), b"application/json".to_vec())]
+        );
+
+        // Even with an explicit allowlist containing set-cookie/connection, they are stripped.
+        let allow_policy = CachePolicy::default().with_header_allowlist([
+            "content-type",
+            "set-cookie",
+            "connection",
+        ]);
+        assert_eq!(
+            allow_policy.headers_to_cache(&headers),
+            vec![("content-type".to_owned(), b"application/json".to_vec())]
+        );
     }
 }

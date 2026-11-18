@@ -3,8 +3,7 @@ name = "tower-http-cache"
 version = "0.7.0"
 edition = "2024"
 # 1.85 covers the default feature set and everything except `redis-backend`,
-# which requires 1.88 -- redis 1.8 declares `rust-version = "1.88"` outright,
-# and it also reaches `url` -> `idna` -> `icu_*`, which require the same. Both
+# which requires 1.88 -- `redis` 1.8 declares `rust-version = "1.88"`. Both
 # floors are enforced by separate CI jobs.
 rust-version = "1.85"
 description = "Tower-compatible caching layer with pluggable backends (in-memory, Redis, and more)"
@@ -28,7 +27,6 @@ authors = ["Daniel Curtis <drc@danielryancurtis.com>"]
 
 [package.metadata.docs.rs]
 all-features = true
-rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 tower = { version = "0.5.3", default-features = false, features = ["util"] }
@@ -46,7 +44,6 @@ moka = { version = "0.12.16", optional = true, features = ["future"] }
 redis = { version = "1.8.2", features = ["aio", "tokio-comp", "connection-manager"], optional = true }
 tokio-util = { version = "0.7.20", optional = true }
 metrics = { version = "0.24.6", optional = true }
-pin-project-lite = "0.2.17"
 thiserror = "2.0.21"
 dashmap = "6.2"
 # Wire format for cached entries. `default-features = false` is required: the

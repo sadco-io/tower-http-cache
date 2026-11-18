@@ -56,6 +56,7 @@ struct StoredEntry {
     headers: Vec<(String, Vec<u8>)>,
     body: Vec<u8>,
     tags: Option<Vec<String>>,
+    compressed: bool,
 }
 
 impl CacheCodec for PostcardCodec {
@@ -68,6 +69,7 @@ impl CacheCodec for PostcardCodec {
             headers: entry.headers.clone(),
             body: entry.body.to_vec(),
             tags: entry.tags.clone(),
+            compressed: entry.compressed,
         };
 
         postcard::to_allocvec(&stored).map_err(|err| CacheError::Backend(err.to_string()))
@@ -86,6 +88,7 @@ impl CacheCodec for PostcardCodec {
             headers: stored.headers,
             body: Bytes::from(stored.body),
             tags: stored.tags,
+            compressed: stored.compressed,
         })
     }
 }

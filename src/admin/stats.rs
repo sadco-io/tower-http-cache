@@ -4,7 +4,9 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const DEFAULT_MAX_TRACKED_KEYS: usize = 1_000;
 
 /// Global statistics collector.
 pub struct GlobalStats {
@@ -29,13 +31,21 @@ pub struct GlobalStats {
     /// Per-key hit tracking for hot keys
     key_hits: Arc<DashMap<String, KeyHitStats>>,
 
+    /// Maximum number of distinct keys retained in `key_hits`.
+    max_tracked_keys: usize,
+
     /// Uptime start
     pub uptime_start: SystemTime,
 }
 
 impl GlobalStats {
-    /// Creates a new statistics collector.
+    /// Creates a new statistics collector with the default tracked-key bound (1,000 keys).
     pub fn new() -> Self {
+        Self::with_max_tracked_keys(DEFAULT_MAX_TRACKED_KEYS)
+    }
+
+    /// Creates a new statistics collector tracking at most `max_tracked_keys` distinct hot keys.
+    pub fn with_max_tracked_keys(max_tracked_keys: usize) -> Self {
         Self {
             total_requests: AtomicU64::new(0),
             hits: AtomicU64::new(0),
@@ -44,6 +54,7 @@ impl GlobalStats {
             stores: AtomicU64::new(0),
             invalidations: AtomicU64::new(0),
             key_hits: Arc::new(DashMap::new()),
+            max_tracked_keys,
             uptime_start: SystemTime::now(),
         }
     }
@@ -80,10 +91,47 @@ impl GlobalStats {
 
     /// Records a hit for a specific key (for hot key tracking).
     fn record_key_hit(&self, key: &str) {
+        if let Some(existing) = self.key_hits.get(key) {
+            existing.increment();
+            return;
+        }
+        if self.max_tracked_keys == 0 {
+            return;
+        }
+
+        if self.key_hits.len() >= self.max_tracked_keys {
+            self.evict_coldest_key(Some(key));
+        }
+
         self.key_hits
             .entry(key.to_string())
             .or_insert_with(KeyHitStats::new)
             .increment();
+
+        while self.key_hits.len() > self.max_tracked_keys {
+            if !self.evict_coldest_key(Some(key)) {
+                break;
+            }
+        }
+    }
+
+    fn evict_coldest_key(&self, exclude_key: Option<&str>) -> bool {
+        let victim = self
+            .key_hits
+            .iter()
+            .filter(|entry| exclude_key != Some(entry.key().as_str()))
+            .min_by_key(|entry| {
+                (
+                    entry.value().hits(),
+                    entry.value().last_accessed_ms.load(Ordering::Relaxed),
+                )
+            })
+            .map(|entry| entry.key().clone());
+
+        match victim {
+            Some(key) => self.key_hits.remove(&key).is_some(),
+            None => false,
+        }
     }
 
     /// Returns the top N most frequently accessed keys.
@@ -94,7 +142,7 @@ impl GlobalStats {
             .map(|entry| HotKeyInfo {
                 key: entry.key().clone(),
                 hits: entry.value().hits(),
-                last_accessed: entry.value().last_accessed,
+                last_accessed: entry.value().last_accessed(),
             })
             .collect();
 
@@ -157,26 +205,38 @@ impl Default for GlobalStats {
     }
 }
 
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
 /// Per-key hit statistics.
 struct KeyHitStats {
     hits: AtomicU64,
-    last_accessed: SystemTime,
+    last_accessed_ms: AtomicU64,
 }
 
 impl KeyHitStats {
     fn new() -> Self {
         Self {
             hits: AtomicU64::new(0),
-            last_accessed: SystemTime::now(),
+            last_accessed_ms: AtomicU64::new(now_millis()),
         }
     }
 
     fn increment(&self) {
         self.hits.fetch_add(1, Ordering::Relaxed);
+        self.last_accessed_ms.store(now_millis(), Ordering::Relaxed);
     }
 
     fn hits(&self) -> u64 {
         self.hits.load(Ordering::Relaxed)
+    }
+
+    fn last_accessed(&self) -> SystemTime {
+        UNIX_EPOCH + Duration::from_millis(self.last_accessed_ms.load(Ordering::Relaxed))
     }
 }
 
@@ -314,5 +374,35 @@ mod tests {
         let json = serde_json::to_string(&snapshot).unwrap();
         assert!(json.contains("\"total_requests\":100"));
         assert!(json.contains("\"hit_rate\":0.8"));
+    }
+
+    #[test]
+    fn key_hits_are_bounded_and_evict_coldest() {
+        let stats = GlobalStats::with_max_tracked_keys(3);
+
+        for _ in 0..5 {
+            stats.record_hit("hot");
+        }
+        for _ in 0..3 {
+            stats.record_hit("warm");
+        }
+        stats.record_hit("cold");
+        stats.record_hit("newcomer");
+
+        let keys = stats.hot_keys(10);
+        assert!(keys.len() <= 3);
+        assert!(keys.iter().any(|k| k.key == "hot"));
+        assert!(keys.iter().any(|k| k.key == "warm"));
+    }
+
+    #[test]
+    fn last_accessed_updates_on_repeat_hits() {
+        let stats = GlobalStats::new();
+        stats.record_hit("repeat");
+        let first = stats.hot_keys(1)[0].last_accessed;
+        std::thread::sleep(Duration::from_millis(10));
+        stats.record_hit("repeat");
+        let second = stats.hot_keys(1)[0].last_accessed;
+        assert!(second > first);
     }
 }
