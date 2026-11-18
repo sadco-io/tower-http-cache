@@ -33,6 +33,13 @@ use metrics::{counter, gauge, histogram};
 use tracing::{debug, error, info, instrument};
 
 /// Configuration for auto-refresh functionality.
+///
+/// Proactive refresh before expiry requires a non-zero
+/// [`CachePolicy::refresh_before`](crate::policy::CachePolicy::refresh_before)
+/// window (configured via
+/// [`CacheLayerBuilder::refresh_before`](crate::layer::CacheLayerBuilder::refresh_before));
+/// with the default `Duration::ZERO`, entries only qualify for refresh after
+/// they have already expired.
 #[derive(Debug, Clone)]
 pub struct AutoRefreshConfig {
     /// Enable auto-refresh (default: false)

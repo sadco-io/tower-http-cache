@@ -98,33 +98,40 @@ See [`examples/axum_redis.rs`](examples/axum_redis.rs) for a complete Redis + Ax
 
 ### Chunk Caching for Large Files
 
-Efficiently cache and serve large files with byte-range support - perfect for video streaming:
+Cache large responses once and serve `206 Partial Content` byte-range requests directly from in-memory slices. Note that `StreamingPolicy::default()` skips `video/*`, `audio/*`, `application/pdf`, and `application/zip` unless `excluded_content_types` is cleared (or overridden via `force_cache_content_types`):
 
 ```rust
+use std::collections::HashSet;
+use std::time::Duration;
 use tower_http_cache::prelude::*;
 use tower_http_cache::streaming::StreamingPolicy;
-use std::time::Duration;
 
 let cache_layer = CacheLayer::builder(InMemoryBackend::new(500))
     .policy(
         CachePolicy::default()
             .with_ttl(Duration::from_secs(3600))
             .with_streaming_policy(StreamingPolicy {
+                enabled: true,
                 enable_chunk_cache: true,
-                chunk_size: 1024 * 1024,              // 1MB chunks
-                min_chunk_file_size: 5 * 1024 * 1024, // Only chunk files >= 5MB
+                chunk_size: 1024 * 1024,                   // 1MB chunks
+                min_chunk_file_size: 5 * 1024 * 1024,      // Only chunk files >= 5MB
                 max_cacheable_size: Some(64 * 1024 * 1024), // Allow files up to 64MB
+                excluded_content_types: HashSet::new(),    // Allow video/audio/binary payloads
+                force_cache_content_types: HashSet::from([
+                    "video/*".to_string(),
+                    "audio/*".to_string(),
+                ]),
                 ..Default::default()
-            })
+            }),
     )
     .build();
 ```
 
 **Benefits:**
-- 90% memory reduction for large file workloads
-- Instant seeking for video streaming (no re-download)
-- Range requests served directly from memory
-- Only cache accessed chunks (partial file caching)
+- Zero-copy `Bytes::slice` serving for HTTP `206 Partial Content` range requests
+- Bounded chunk index (`128 MiB` / `1,024` entries by default) with LRU and TTL eviction
+- `If-Range` validation and seamless fallback to the backend entry when needed
+- Range requests served directly from memory without re-reading the backend
 
 **Example:**
 See `examples/chunk_cache_demo.rs` for a complete working example.
@@ -162,7 +169,7 @@ async fn build_redis_layer(redis_url: &str) -> CacheLayer<RedisBackend> {
 
 ### Enabling Auto-Refresh
 
-Auto-refresh proactively refreshes frequently-accessed cache entries before they expire, reducing cache misses and latency for hot endpoints:
+Auto-refresh proactively refreshes frequently-accessed cache entries before they expire, reducing cache misses and latency for hot endpoints. Set a non-zero `.refresh_before(...)` window alongside `.auto_refresh(...)` (with the default `Duration::ZERO`, entries only qualify for refresh after expiry):
 
 ```rust
 use std::time::Duration;
@@ -204,8 +211,9 @@ let cache_layer = CacheLayer::builder(backend)
     )
     .build();
 
-// Later: invalidate all entries with a tag
-backend.invalidate_by_tag("user:123").await?;
+// Later: invalidate through the layer (also evicts ChunkCache when enabled;
+// calling `backend.invalidate*` directly bypasses ChunkCache).
+cache_layer.invalidate_by_tag("user:123").await?;
 backend.invalidate_by_tags(&["user:123", "posts"]).await?;
 ```
 
@@ -280,8 +288,9 @@ let admin_config = AdminConfig::new()
     .with_auth_token("your-secret-token")
     .with_enabled(true);
 
-// Share the CacheLayer's live GlobalStats tracker with AdminState:
-let admin_state = AdminState::with_stats(backend, admin_config, cache_layer.stats());
+// Wire AdminState to the CacheLayer's backend, live GlobalStats, and ChunkCache:
+// (Note: calling `backend.invalidate()` directly bypasses ChunkCache eviction.)
+let admin_state = AdminState::from_layer(&cache_layer, admin_config);
 
 // Available handler functions (wire into any HTTP framework):
 // tower_http_cache::admin::routes::handle_health
@@ -304,7 +313,7 @@ let cache_layer = CacheLayer::builder(backend)
             .with_ml_logging(MLLoggingConfig {
                 enabled: true,
                 sample_rate: 1.0, // Log 100% of operations
-                hash_keys: true,  // Hash keys for privacy
+                hash_keys: true,  // Hash keys and URIs for privacy
                 ..Default::default()
             })
     )
@@ -332,7 +341,8 @@ let cache_layer = CacheLayer::builder(backend)
 | `ttl` / `negative_ttl` | cache lifetime for successful and error responses |
 | `stale_while_revalidate` | serve stale data while a refresh is in progress |
 | `refresh_before` | proactively refresh the cache shortly before expiry |
-| `auto_refresh` | automatically refresh frequently-accessed entries before expiration |
+| `auto_refresh` | automatically refresh frequently-accessed entries (requires non-zero `refresh_before`) |
+| `cookie_policy` | configure how `Cookie` request headers interact with the cache (`Bypass`, `RequirePublic`, `Ignore`) |
 | `tag_policy` | configure cache tags and invalidation groups |
 | `multi_tier` | enable multi-tier caching with L1/L2 backends |
 | `ml_logging` | enable ML-ready structured logging |
@@ -439,14 +449,16 @@ cargo run --example v0_3_features --features admin-api
 ### Framework-agnostic `admin-api` & live stats wiring
 
 - `admin-api` no longer pulls `axum` as a dependency (`admin-api = ["serde"]`).
-- Connect [`CacheLayer::stats()`](https://docs.rs/tower-http-cache) to [`AdminState::with_stats`](https://docs.rs/tower-http-cache) so HTTP hits, misses, stores, and invalidations appear directly in admin stats and hot-key queries.
+- Connect [`CacheLayer`](https://docs.rs/tower-http-cache) to [`AdminState::from_layer`](https://docs.rs/tower-http-cache) so HTTP hits, misses, stores, invalidations, and `ChunkCache` evictions stay wired together (calling `backend.invalidate()` directly bypasses `ChunkCache`).
 
 ### Other breaking changes in 0.7.0
 
-- Added `#[non_exhaustive]` to public enums (`StreamingDecision`, `CacheEventType`, `CompressionStrategy`, `PromotionStrategy`, `RangeHandling`) and removed the hidden `StreamingDecision::StreamThrough` placeholder variant.
+- Added `#[non_exhaustive]` to public enums (`StreamingDecision`, `CacheEventType`, `CompressionStrategy`, `PromotionStrategy`, `RangeHandling`, `CookiePolicy`) and removed the hidden `StreamingDecision::StreamThrough` placeholder variant.
+- Added new public fields: `CacheEntry::compressed` (custom `CacheCodec` implementations must persist and restore it), `StreamingPolicy::{max_chunk_cache_bytes, max_chunk_cache_entries}`, `AdminState::chunk_cache`, and `TierStats::writes`.
 - `MultiTierBackend::stats(&self)` now returns a `TierStats` snapshot by value (with a new `writes` field) instead of `&TierStats`.
 - `RangeRequest::normalize` resolves RFC 9110 suffix ranges (`bytes=-N`) alongside start-end and open-ended ranges; construct values with `RangeRequest::new` or `RangeRequest::suffix`.
-- Enabled `compression` now writes `Content-Encoding: gzip` and updates `Content-Length` on compressed cached entries, while skipping responses that already carry `Content-Encoding`.
+- Enabled `compression` now writes `Content-Encoding: gzip` and updates `Content-Length` on compressed cached entries, while skipping responses that already carry `Content-Encoding` and validating client `Accept-Encoding` on hits.
+- Redis envelope bumped to `FORMAT_V2` (`0x02`) while still reading `0.6.x` `FORMAT_V1` entries transparently (`compressed = false`). Requests carrying `Cookie` bypass the cache by default via `CookiePolicy::Bypass` (`RequirePublic` and `Ignore` are opt-in).
 
 See [CHANGELOG.md](CHANGELOG.md) for the full release history, including earlier `0.5.x` → `0.6.0` notes.
 

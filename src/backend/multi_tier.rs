@@ -255,10 +255,9 @@ where
             self.record_hit(key);
 
             let now = std::time::SystemTime::now();
-            let remaining_ttl = match read.expires_at {
-                Some(expires_at) => expires_at.duration_since(now).ok().filter(|d| !d.is_zero()),
-                None => Some(Duration::from_secs(60)),
-            };
+            let remaining_ttl = read.expires_at.and_then(|expires_at| {
+                expires_at.duration_since(now).ok().filter(|d| !d.is_zero())
+            });
 
             if let Some(ttl) = remaining_ttl {
                 if self.should_promote(key) {
@@ -880,6 +879,55 @@ mod tests {
         assert_eq!(removed, 1);
         assert!(l1b.get("item:2").await.unwrap().is_none());
         assert!(l2b_inner.get("item:2").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn l2_read_without_expiry_is_not_promoted_with_fabricated_ttl() {
+        #[derive(Clone)]
+        struct NoExpiryBackend;
+
+        impl CacheBackend for NoExpiryBackend {
+            async fn get(
+                &self,
+                _key: &str,
+            ) -> Result<Option<crate::backend::CacheRead>, CacheError> {
+                Ok(Some(crate::backend::CacheRead {
+                    entry: test_entry(),
+                    expires_at: None,
+                    stale_until: None,
+                }))
+            }
+
+            async fn set(
+                &self,
+                _key: String,
+                _entry: CacheEntry,
+                _ttl: Duration,
+                _stale_for: Duration,
+            ) -> Result<(), CacheError> {
+                Ok(())
+            }
+
+            async fn invalidate(&self, _key: &str) -> Result<(), CacheError> {
+                Ok(())
+            }
+        }
+
+        let l1 = InMemoryBackend::new(100);
+        let backend = MultiTierBackend::builder()
+            .l1(l1.clone())
+            .l2(NoExpiryBackend)
+            .promotion_strategy(PromotionStrategy::HitCount { threshold: 1 })
+            .build();
+
+        let read = backend.get("no-expiry").await.unwrap();
+        assert!(read.is_some());
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(backend.stats().promotions, 0);
+        assert!(
+            l1.get("no-expiry").await.unwrap().is_none(),
+            "L2 entry without expires_at must not be promoted into L1"
+        );
     }
 }
 

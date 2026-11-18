@@ -38,6 +38,24 @@ pub struct CachePolicy {
     tag_policy: TagPolicy,
     tag_extractor: Option<TagExtractorFn>,
     streaming_policy: StreamingPolicy,
+    cookie_policy: CookiePolicy,
+}
+
+/// Policy controlling how incoming `Cookie` headers interact with the cache.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CookiePolicy {
+    /// Requests carrying a `Cookie` header bypass cache lookup and storage
+    /// (default, safest for shared caches).
+    #[default]
+    Bypass,
+    /// Requests carrying a `Cookie` header may hit or populate the cache only
+    /// when the response explicitly allows shared caching (`Cache-Control:
+    /// public`, `must-revalidate`, or `s-maxage=...`).
+    RequirePublic,
+    /// Ignore `Cookie` headers on requests when deciding cacheability
+    /// (`Set-Cookie` response headers are still stripped on store).
+    Ignore,
 }
 
 /// Strategy for compressing cached payloads.
@@ -84,6 +102,7 @@ impl fmt::Debug for CachePolicy {
             )
             .field("allow_streaming_bodies", &self.allow_streaming_bodies)
             .field("compression", &self.compression)
+            .field("cookie_policy", &self.cookie_policy)
             .finish()
     }
 }
@@ -112,6 +131,7 @@ impl CachePolicy {
             tag_policy: TagPolicy::default(),
             tag_extractor: None,
             streaming_policy: StreamingPolicy::default(),
+            cookie_policy: CookiePolicy::default(),
         }
     }
 
@@ -182,6 +202,10 @@ impl CachePolicy {
 
     pub fn streaming_policy(&self) -> &StreamingPolicy {
         &self.streaming_policy
+    }
+
+    pub fn cookie_policy(&self) -> CookiePolicy {
+        self.cookie_policy
     }
 
     /// Extracts tags for a request using the configured tag extractor.
@@ -320,6 +344,11 @@ impl CachePolicy {
         self.streaming_policy = policy;
         self
     }
+
+    pub fn with_cookie_policy(mut self, cookie_policy: CookiePolicy) -> Self {
+        self.cookie_policy = cookie_policy;
+        self
+    }
 }
 
 impl Default for CachePolicy {
@@ -341,6 +370,7 @@ impl Default for CachePolicy {
             tag_policy: TagPolicy::default(),
             tag_extractor: None,
             streaming_policy: StreamingPolicy::default(),
+            cookie_policy: CookiePolicy::default(),
         }
     }
 }

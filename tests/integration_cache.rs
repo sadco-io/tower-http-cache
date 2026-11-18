@@ -1402,7 +1402,12 @@ async fn allowlist_preserves_upstream_content_encoding_and_vary() {
         .ready()
         .await
         .unwrap()
-        .call(Request::get("/g").body(()).unwrap())
+        .call(
+            Request::get("/g")
+                .header(http::header::ACCEPT_ENCODING, "gzip")
+                .body(())
+                .unwrap(),
+        )
         .await
         .unwrap()
         .into_body()
@@ -1414,7 +1419,12 @@ async fn allowlist_preserves_upstream_content_encoding_and_vary() {
         .ready()
         .await
         .unwrap()
-        .call(Request::get("/g").body(()).unwrap())
+        .call(
+            Request::get("/g")
+                .header(http::header::ACCEPT_ENCODING, "gzip")
+                .body(())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -1503,6 +1513,109 @@ async fn head_does_not_poison_get_and_serves_cached_headers() {
             .unwrap()
             .to_bytes()
             .is_empty()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn axum_head_preserves_content_length_on_miss_and_hit() {
+    use axum::{Router, body::Body, error_handling::HandleErrorLayer, routing::get};
+
+    let expected_body = b"hello from GET handler";
+    let expected_len = expected_body.len().to_string();
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    let layer = CacheLayer::builder(InMemoryBackend::new(100)).build();
+    let app = Router::new()
+        .route(
+            "/",
+            get({
+                let calls = calls.clone();
+                move || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    async move { "hello from GET handler" }
+                }
+            }),
+        )
+        .layer(
+            tower::ServiceBuilder::new()
+                .layer(HandleErrorLayer::new(
+                    |_e: tower_http_cache::layer::BoxError| async {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    },
+                ))
+                .layer(layer),
+        );
+
+    // 1. HEAD miss must preserve GET body Content-Length and return empty body.
+    let head_miss = app
+        .clone()
+        .oneshot(Request::head("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(head_miss.status(), StatusCode::OK);
+    assert_eq!(
+        head_miss
+            .headers()
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()),
+        Some(expected_len.as_str())
+    );
+    assert!(
+        head_miss
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // 2. GET populates the cache and returns the full body.
+    let get_resp = app
+        .clone()
+        .oneshot(Request::get("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(get_resp.status(), StatusCode::OK);
+    let body = get_resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], expected_body);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    // 3. HEAD hit must also preserve GET body Content-Length and return empty body.
+    let head_hit = app
+        .clone()
+        .oneshot(Request::head("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(head_hit.status(), StatusCode::OK);
+    assert_eq!(
+        head_hit
+            .headers()
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()),
+        Some(expected_len.as_str())
+    );
+    assert!(
+        head_hit
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    // 4. Subsequent GET still hits cache and receives the full body.
+    let get_hit = app
+        .oneshot(Request::get("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        &get_hit.into_body().collect().await.unwrap().to_bytes()[..],
+        expected_body
     );
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
@@ -1683,5 +1796,477 @@ async fn global_stats_key_hits_is_bounded() {
     assert!(
         tracked <= 1_000,
         "GlobalStats hot-key tracking must remain bounded (got {tracked})"
+    );
+}
+
+#[tokio::test]
+async fn cookie_policy_supports_bypass_require_public_and_ignore() {
+    use tower_http_cache::policy::CookiePolicy;
+
+    // 1. Bypass (default): Cookie bypasses even `Cache-Control: public`.
+    let bypass_calls = Arc::new(AtomicUsize::new(0));
+    let bypass_layer = CacheLayer::builder(InMemoryBackend::new(64))
+        .ttl(Duration::from_secs(60))
+        .cookie_policy(CookiePolicy::Bypass)
+        .build();
+    let mut bypass_svc = bypass_layer.layer(service_fn({
+        let calls = bypass_calls.clone();
+        move |_req: Request<()>| {
+            let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+            async move {
+                Ok::<_, Infallible>(
+                    http::Response::builder()
+                        .header(CACHE_CONTROL, "public, max-age=60")
+                        .body(Full::from(format!("bypass-{n}")))
+                        .unwrap(),
+                )
+            }
+        }
+    }));
+    for _ in 0..2 {
+        let _ = bypass_svc
+            .ready()
+            .await
+            .unwrap()
+            .call(
+                Request::get("/item")
+                    .header(http::header::COOKIE, "sid=1")
+                    .body(())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(bypass_calls.load(Ordering::SeqCst), 2);
+
+    // 2. RequirePublic: skips non-public responses, caches `public` and `s-maxage`.
+    let pub_calls = Arc::new(AtomicUsize::new(0));
+    let pub_layer = CacheLayer::builder(InMemoryBackend::new(64))
+        .ttl(Duration::from_secs(60))
+        .cookie_policy(CookiePolicy::RequirePublic)
+        .build();
+    let mut pub_svc = pub_layer.layer(service_fn({
+        let calls = pub_calls.clone();
+        move |req: Request<()>| {
+            let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let path = req.uri().path().to_owned();
+            async move {
+                let mut builder = http::Response::builder();
+                if path == "/public" {
+                    builder = builder.header(CACHE_CONTROL, "public, max-age=60");
+                } else if path == "/s-maxage" {
+                    builder = builder.header(CACHE_CONTROL, "s-maxage=60");
+                }
+                Ok::<_, Infallible>(builder.body(Full::from(format!("pub-{n}"))).unwrap())
+            }
+        }
+    }));
+
+    // Non-public endpoint with Cookie must not be stored or served.
+    for _ in 0..2 {
+        let _ = pub_svc
+            .ready()
+            .await
+            .unwrap()
+            .call(
+                Request::get("/plain")
+                    .header(http::header::COOKIE, "ga=1")
+                    .body(())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(pub_calls.load(Ordering::SeqCst), 2);
+
+    // `public` and `s-maxage` endpoints cache and hit despite Cookie.
+    for path in ["/public", "/s-maxage"] {
+        let first = pub_svc
+            .ready()
+            .await
+            .unwrap()
+            .call(
+                Request::get(path)
+                    .header(http::header::COOKIE, "ga=1")
+                    .body(())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let second = pub_svc
+            .ready()
+            .await
+            .unwrap()
+            .call(
+                Request::get(path)
+                    .header(http::header::COOKIE, "ga=2")
+                    .body(())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(first, second);
+    }
+    assert_eq!(pub_calls.load(Ordering::SeqCst), 4);
+
+    // 3. Ignore: caches & hits with Cookie even without `public`, still strips Set-Cookie.
+    let ign_calls = Arc::new(AtomicUsize::new(0));
+    let ign_layer = CacheLayer::builder(InMemoryBackend::new(64))
+        .ttl(Duration::from_secs(60))
+        .cookie_policy(CookiePolicy::Ignore)
+        .build();
+    let mut ign_svc = ign_layer.layer(service_fn({
+        let calls = ign_calls.clone();
+        move |_req: Request<()>| {
+            let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+            async move {
+                Ok::<_, Infallible>(
+                    http::Response::builder()
+                        .header(http::header::SET_COOKIE, "secret=1")
+                        .body(Full::from(format!("ign-{n}")))
+                        .unwrap(),
+                )
+            }
+        }
+    }));
+    let r1 = ign_svc
+        .ready()
+        .await
+        .unwrap()
+        .call(
+            Request::get("/ign")
+                .header(http::header::COOKIE, "a=1")
+                .body(())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    let r2 = ign_svc
+        .ready()
+        .await
+        .unwrap()
+        .call(
+            Request::get("/ign")
+                .header(http::header::COOKIE, "b=2")
+                .body(())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(r2.headers().get(http::header::SET_COOKIE).is_none());
+    let b2 = r2.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(r1, b2);
+    assert_eq!(ign_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn upstream_content_encoding_negotiated_on_full_and_chunk_hits() {
+    use tower_http_cache::streaming::StreamingPolicy;
+
+    // Part 1: Full cache hit negotiates upstream Content-Encoding against Accept-Encoding.
+    let full_calls = Arc::new(AtomicUsize::new(0));
+    let full_layer = CacheLayer::builder(InMemoryBackend::new(64))
+        .ttl(Duration::from_secs(60))
+        .header_allowlist(["content-type"])
+        .build();
+    let mut full_svc = full_layer.layer(service_fn({
+        let calls = full_calls.clone();
+        move |req: Request<()>| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let wants_gzip = req
+                .headers()
+                .get(http::header::ACCEPT_ENCODING)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.contains("gzip"));
+            async move {
+                let mut builder = http::Response::builder().header("content-type", "text/plain");
+                if wants_gzip {
+                    builder = builder
+                        .header(http::header::CONTENT_ENCODING, "gzip")
+                        .header(http::header::VARY, "Accept-Encoding");
+                    Ok::<_, Infallible>(
+                        builder
+                            .body(Full::from(Bytes::from_static(b"\x1f\x8b\x08\x00")))
+                            .unwrap(),
+                    )
+                } else {
+                    Ok::<_, Infallible>(
+                        builder
+                            .body(Full::from(Bytes::from_static(b"plain-text")))
+                            .unwrap(),
+                    )
+                }
+            }
+        }
+    }));
+
+    // Seed cache with gzip-encoded upstream response.
+    let gz_resp = full_svc
+        .ready()
+        .await
+        .unwrap()
+        .call(
+            Request::get("/enc")
+                .header(http::header::ACCEPT_ENCODING, "gzip")
+                .body(())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        gz_resp
+            .headers()
+            .get(http::header::CONTENT_ENCODING)
+            .unwrap(),
+        "gzip"
+    );
+
+    // Matching Accept-Encoding hits cache.
+    let gz_hit = full_svc
+        .ready()
+        .await
+        .unwrap()
+        .call(
+            Request::get("/enc")
+                .header(http::header::ACCEPT_ENCODING, "br, gzip")
+                .body(())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        gz_hit
+            .headers()
+            .get(http::header::CONTENT_ENCODING)
+            .unwrap(),
+        "gzip"
+    );
+    assert_eq!(full_calls.load(Ordering::SeqCst), 1);
+
+    // Client without Accept-Encoding must NOT receive upstream gzip bytes.
+    let plain_resp = full_svc
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::get("/enc").body(()).unwrap())
+        .await
+        .unwrap();
+    assert!(
+        plain_resp
+            .headers()
+            .get(http::header::CONTENT_ENCODING)
+            .is_none()
+    );
+    let plain_body = plain_resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&plain_body[..], b"plain-text");
+    assert_eq!(full_calls.load(Ordering::SeqCst), 2);
+
+    // Part 2: Chunk cache preserves Content-Encoding/Vary under allowlist and negotiates Accept-Encoding.
+    let chunk_calls = Arc::new(AtomicUsize::new(0));
+    let chunk_layer = CacheLayer::builder(InMemoryBackend::new(64))
+        .policy(
+            tower_http_cache::policy::CachePolicy::default()
+                .with_ttl(Duration::from_secs(60))
+                .with_header_allowlist(["content-type"])
+                .with_streaming_policy(StreamingPolicy {
+                    enable_chunk_cache: true,
+                    chunk_size: 8,
+                    min_chunk_file_size: 4,
+                    excluded_content_types: std::collections::HashSet::new(),
+                    ..Default::default()
+                }),
+        )
+        .build();
+    let mut chunk_svc = chunk_layer.layer(service_fn({
+        let calls = chunk_calls.clone();
+        move |req: Request<()>| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let wants_br = req
+                .headers()
+                .get(http::header::ACCEPT_ENCODING)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.contains("br"));
+            async move {
+                let mut builder =
+                    http::Response::builder().header("content-type", "application/octet-stream");
+                if wants_br {
+                    builder = builder
+                        .header(http::header::CONTENT_ENCODING, "br")
+                        .header(http::header::VARY, "Accept-Encoding");
+                    Ok::<_, Infallible>(
+                        builder
+                            .body(Full::from(Bytes::from_static(b"0123456789abcdef")))
+                            .unwrap(),
+                    )
+                } else {
+                    Ok::<_, Infallible>(
+                        builder
+                            .body(Full::from(Bytes::from_static(b"plain-chunk-body")))
+                            .unwrap(),
+                    )
+                }
+            }
+        }
+    }));
+
+    // Populate chunk cache with `br` upstream response.
+    let _ = chunk_svc
+        .ready()
+        .await
+        .unwrap()
+        .call(
+            Request::get("/blob")
+                .header(http::header::ACCEPT_ENCODING, "br")
+                .body(())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(chunk_calls.load(Ordering::SeqCst), 1);
+
+    // Range request with `Accept-Encoding: br` hits chunk cache and preserves Content-Encoding + Vary.
+    let chunk_hit = chunk_svc
+        .ready()
+        .await
+        .unwrap()
+        .call(
+            Request::get("/blob")
+                .header(http::header::RANGE, "bytes=0-3")
+                .header(http::header::ACCEPT_ENCODING, "br")
+                .body(())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(chunk_hit.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        chunk_hit
+            .headers()
+            .get(http::header::CONTENT_ENCODING)
+            .unwrap(),
+        "br"
+    );
+    assert_eq!(
+        chunk_hit.headers().get(http::header::VARY).unwrap(),
+        "Accept-Encoding"
+    );
+    assert_eq!(chunk_calls.load(Ordering::SeqCst), 1);
+
+    // Range request without `br` must NOT hit the `br`-encoded chunk entry.
+    let mismatch = chunk_svc
+        .ready()
+        .await
+        .unwrap()
+        .call(
+            Request::get("/blob")
+                .header(http::header::RANGE, "bytes=0-3")
+                .header(http::header::ACCEPT_ENCODING, "gzip")
+                .body(())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        mismatch
+            .headers()
+            .get(http::header::CONTENT_ENCODING)
+            .is_none()
+    );
+    let mismatch_body = mismatch.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&mismatch_body[..], b"plain-chunk-body");
+    assert_eq!(chunk_calls.load(Ordering::SeqCst), 2);
+}
+
+#[cfg(all(feature = "serde", feature = "tracing"))]
+#[tokio::test]
+async fn ml_logging_bypass_emits_single_bypass_event_and_hashes_uri() {
+    use std::io::Write;
+    use std::sync::Mutex;
+    use tower_http_cache::logging::MLLoggingConfig;
+    use tower_http_cache::policy::CachePolicy;
+
+    #[derive(Clone, Default)]
+    struct BufWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for BufWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufWriter {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    let logs = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(BufWriter(logs.clone()))
+        .with_ansi(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let policy = CachePolicy::default().with_ml_logging(
+        MLLoggingConfig::new()
+            .with_enabled(true)
+            .with_sample_rate(1.0)
+            .with_hash_keys(true),
+    );
+    let layer = CacheLayer::builder(InMemoryBackend::new(64))
+        .policy(policy)
+        .build();
+    let mut svc = layer.layer(service_fn(|_req: Request<()>| async {
+        Ok::<_, Infallible>(http::Response::new(Full::from("ok")))
+    }));
+
+    let _ = svc
+        .ready()
+        .await
+        .unwrap()
+        .call(
+            Request::post("/secret-bypass-path?token=xyz")
+                .body(())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let output = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    let bypass_count = output.matches("\"event\":\"bypass\"").count();
+    let miss_count = output.matches("\"event\":\"miss\"").count();
+    assert_eq!(bypass_count, 1, "expected exactly 1 bypass event: {output}");
+    assert_eq!(
+        miss_count, 0,
+        "bypassed request must not emit miss: {output}"
+    );
+    assert!(
+        !output.contains("secret-bypass-path") && !output.contains("token=xyz"),
+        "hash_keys=true must hash both key and uri: {output}"
     );
 }

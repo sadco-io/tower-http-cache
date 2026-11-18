@@ -29,7 +29,7 @@ use crate::chunks::{ChunkCache, ChunkMetadata, ChunkedEntry};
 use crate::logging::{CacheEvent, CacheEventType, MLLoggingConfig};
 #[cfg(feature = "compression")]
 use crate::policy::CompressionStrategy;
-use crate::policy::{CachePolicy, CompressionConfig};
+use crate::policy::{CachePolicy, CompressionConfig, CookiePolicy};
 use crate::range::{RangeHandling, is_partial_content, parse_range_header};
 use crate::refresh::{AutoRefreshConfig, RefreshCallback, RefreshManager, RefreshMetadata};
 #[cfg(feature = "serde")]
@@ -314,6 +314,12 @@ where
         self
     }
 
+    /// Configures how requests carrying a `Cookie` header interact with the cache.
+    pub fn cookie_policy(mut self, cookie_policy: CookiePolicy) -> Self {
+        self.policy = self.policy.with_cookie_policy(cookie_policy);
+        self
+    }
+
     pub fn key_extractor(mut self, extractor: KeyExtractor) -> Self {
         self.key_extractor = extractor;
         self
@@ -323,6 +329,11 @@ where
     ///
     /// When enabled, frequently accessed cache entries will be proactively
     /// refreshed before they expire, reducing cache misses and latency.
+    ///
+    /// Note that proactive refresh before expiry requires a non-zero
+    /// [`refresh_before`](Self::refresh_before) window on the policy (the
+    /// default is `Duration::ZERO`, which only qualifies already-expired
+    /// entries).
     pub fn auto_refresh(mut self, config: AutoRefreshConfig) -> Self {
         self.auto_refresh_config = Some(config);
         self
@@ -341,7 +352,15 @@ where
         let refresh_manager = self
             .auto_refresh_config
             .filter(|cfg| cfg.enabled)
-            .map(|cfg| Arc::new(RefreshManager::new(cfg).with_refresh_before(refresh_before)));
+            .map(|cfg| {
+                #[cfg(feature = "tracing")]
+                if refresh_before.is_zero() {
+                    tracing::warn!(
+                        "auto_refresh is enabled with refresh_before == Duration::ZERO; entries will only qualify for refresh after expiry"
+                    );
+                }
+                Arc::new(RefreshManager::new(cfg).with_refresh_before(refresh_before))
+            });
         let refresh_shutdown = refresh_manager
             .as_ref()
             .map(|manager| Arc::new(RefreshShutdownGuard::new(Arc::clone(manager))));
@@ -471,6 +490,12 @@ where
         self
     }
 
+    /// Configures how requests carrying a `Cookie` header interact with the cache.
+    pub fn with_cookie_policy(mut self, cookie_policy: CookiePolicy) -> Self {
+        self.policy = self.policy.clone().with_cookie_policy(cookie_policy);
+        self
+    }
+
     /// Returns the shared [`ChunkCache`] instance if chunk caching is enabled.
     pub fn chunk_cache(&self) -> Option<&Arc<ChunkCache>> {
         self.chunk_cache.as_ref()
@@ -546,12 +571,24 @@ where
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```no_run
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # use std::convert::Infallible;
+    /// # use std::time::Duration;
+    /// # use tower_http_cache::prelude::*;
+    /// # use tower_http_cache::refresh::AutoRefreshConfig;
+    /// # let backend = InMemoryBackend::new(100);
+    /// # let my_service = tower::service_fn(|_req: http::Request<()>| async {
+    /// #     Ok::<_, Infallible>(http::Response::new(http_body_util::Full::from("ok")))
+    /// # });
     /// let layer = CacheLayer::builder(backend)
-    ///     .auto_refresh(config)
+    ///     .refresh_before(Duration::from_secs(10))
+    ///     .auto_refresh(AutoRefreshConfig::enabled(5.0))
     ///     .build();
     ///
     /// layer.init_auto_refresh(my_service.clone()).await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn init_auto_refresh<S, ResBody>(&self, service: S) -> Result<(), String>
     where
@@ -674,10 +711,13 @@ where
                 .headers
                 .iter()
                 .any(|(name, _)| name.eq_ignore_ascii_case("cookie"));
+            let cookie_policy = policy.cookie_policy();
 
-            if is_head || has_cookie {
+            if is_head || (has_cookie && matches!(cookie_policy, CookiePolicy::Bypass)) {
                 return Ok(());
             }
+            let requires_shared =
+                requires_shared_public(has_authorization, has_cookie, cookie_policy);
 
             // Reconstruct the request
             let request = match metadata.try_into_request() {
@@ -742,7 +782,7 @@ where
                 &cache_bytes,
                 streaming,
                 is_head,
-                has_authorization,
+                requires_shared,
             ) {
                 return Ok(()); // Successfully refreshed but not stored
             }
@@ -821,7 +861,11 @@ where
             self.policy.respect_cache_control() && cache_control_disallows(req.headers());
         let has_cookie = req.headers().contains_key(http::header::COOKIE);
         let has_authorization = req.headers().contains_key(http::header::AUTHORIZATION);
-        let accept_gzip = client_accepts_gzip(req.headers());
+        let cookie_policy = self.policy.cookie_policy();
+        let cookie_bypass = has_cookie && matches!(cookie_policy, CookiePolicy::Bypass);
+        let requires_shared = requires_shared_public(has_authorization, has_cookie, cookie_policy);
+        let accept_encoding = AcceptEncoding::from_headers(req.headers());
+        let accept_gzip = accept_encoding.accepts("gzip");
         let has_range_header = req.headers().contains_key(http::header::RANGE);
         let req_if_range = req
             .headers()
@@ -829,7 +873,7 @@ where
             .and_then(|v| v.to_str().ok())
             .map(|s| s.trim().to_owned());
 
-        let key = if should_cache_method && !request_bypass && !has_cookie {
+        let key = if should_cache_method && !request_bypass && !cookie_bypass {
             self.key_extractor.extract(&method, &uri)
         } else {
             None
@@ -877,14 +921,16 @@ where
                 (range_request.as_ref(), &chunk_cache, &key)
             {
                 if let Some(entry) = chunk_cache.get(key_ref) {
-                    let auth_allowed = !has_authorization
+                    let auth_allowed = !requires_shared
                         || cached_entry_allows_shared_auth(&entry.metadata.headers);
+                    let encoding_allowed =
+                        upstream_encoding_accepted(&entry.metadata.headers, &accept_encoding);
                     let if_range_ok = if_range_matches(
                         req_if_range.as_deref(),
                         entry.metadata.etag.as_deref(),
                         entry.metadata.last_modified.as_deref(),
                     );
-                    if auth_allowed && if_range_ok {
+                    if auth_allowed && encoding_allowed && if_range_ok {
                         // Check if range is satisfiable and normalize it
                         if let Some(normalized) = range_req.normalize(entry.metadata.total_size) {
                             let end = normalized
@@ -940,7 +986,9 @@ where
             if let Some(ref key_ref) = key {
                 if let Ok(Some(hit)) = backend.get(key_ref).await {
                     match classify_hit(hit, stale_window, refresh_before) {
-                        HitState::Fresh(entry) if is_usable_hit(&entry, has_authorization) => {
+                        HitState::Fresh(entry)
+                            if is_usable_hit(&entry, requires_shared, &accept_encoding) =>
+                        {
                             #[cfg(feature = "metrics")]
                             counter!("tower_http_cache.hit").increment(1);
                             #[cfg(feature = "admin-api")]
@@ -964,7 +1012,9 @@ where
 
                             return Ok(entry.into_response_with_options(accept_gzip, is_head));
                         }
-                        HitState::Stale(entry) if is_usable_hit(&entry, has_authorization) => {
+                        HitState::Stale(entry)
+                            if is_usable_hit(&entry, requires_shared, &accept_encoding) =>
+                        {
                             #[cfg(feature = "metrics")]
                             counter!("tower_http_cache.stale_hit").increment(1);
 
@@ -1011,7 +1061,7 @@ where
                         if let Ok(Some(hit)) = backend.get(key_ref).await {
                             match classify_hit(hit, stale_window, refresh_before) {
                                 HitState::Fresh(entry)
-                                    if is_usable_hit(&entry, has_authorization) =>
+                                    if is_usable_hit(&entry, requires_shared, &accept_encoding) =>
                                 {
                                     #[cfg(feature = "metrics")]
                                     counter!("tower_http_cache.hit_after_wait").increment(1);
@@ -1032,7 +1082,7 @@ where
                                     );
                                 }
                                 HitState::Stale(entry)
-                                    if is_usable_hit(&entry, has_authorization) =>
+                                    if is_usable_hit(&entry, requires_shared, &accept_encoding) =>
                                 {
                                     #[cfg(feature = "metrics")]
                                     counter!("tower_http_cache.stale_served").increment(1);
@@ -1078,7 +1128,7 @@ where
                         if let HitState::Fresh(entry) =
                             classify_hit(hit, stale_window, refresh_before)
                         {
-                            if is_usable_hit(&entry, has_authorization) {
+                            if is_usable_hit(&entry, requires_shared, &accept_encoding) {
                                 #[cfg(feature = "metrics")]
                                 counter!("tower_http_cache.hit_after_lock").increment(1);
                                 #[cfg(feature = "admin-api")]
@@ -1213,7 +1263,7 @@ where
                     &cache_bytes,
                     streaming,
                     is_head,
-                    has_authorization,
+                    requires_shared,
                 );
 
             let version = parts.version;
@@ -1327,7 +1377,13 @@ where
 
             drop(primary_guard);
 
-            // Box the response body
+            // Box the response body; preserve GET body length on HEAD when upstream omitted it.
+            if is_head && !parts.headers.contains_key(http::header::CONTENT_LENGTH) {
+                if let Ok(len_val) = http::HeaderValue::from_str(&response_bytes.len().to_string())
+                {
+                    parts.headers.insert(http::header::CONTENT_LENGTH, len_val);
+                }
+            }
             let full_body = Full::from(if is_head {
                 Bytes::new()
             } else {
@@ -1544,6 +1600,9 @@ fn populate_chunk_cache(
         "populating_chunk_cache"
     );
 
+    let mut cached_headers = policy.headers_to_cache(&parts.headers);
+    preserve_upstream_encoding_headers(&mut cached_headers, &parts.headers);
+
     let metadata = ChunkMetadata {
         total_size: cache_bytes.len() as u64,
         content_type: parts
@@ -1564,7 +1623,7 @@ fn populate_chunk_cache(
             .map(|s| s.to_string()),
         status: parts.status,
         version: parts.version,
-        headers: policy.headers_to_cache(&parts.headers),
+        headers: cached_headers,
     };
 
     let chunk_size = streaming_policy.chunk_size.max(1);
@@ -1588,13 +1647,21 @@ fn populate_chunk_cache(
     let _ = chunk_count;
 }
 
+fn requires_shared_public(
+    has_authorization: bool,
+    has_cookie: bool,
+    cookie_policy: CookiePolicy,
+) -> bool {
+    has_authorization || (has_cookie && matches!(cookie_policy, CookiePolicy::RequirePublic))
+}
+
 fn should_store_response(
     headers: &HeaderMap,
     policy: &CachePolicy,
     cache_bytes: &[u8],
     streaming: bool,
     is_head: bool,
-    has_authorization: bool,
+    requires_shared_public: bool,
 ) -> bool {
     let cache_control_block = policy.respect_cache_control() && cache_control_disallows(headers);
     let body_too_large = policy
@@ -1603,7 +1670,7 @@ fn should_store_response(
     let body_too_small = policy
         .min_body_size()
         .is_some_and(|min| cache_bytes.len() < min);
-    let auth_allowed = !has_authorization || response_allows_shared_auth(headers);
+    let auth_allowed = !requires_shared_public || response_allows_shared_auth(headers);
 
     !is_head
         && !cache_control_block
@@ -1613,8 +1680,15 @@ fn should_store_response(
         && (policy.allow_streaming_bodies() || !streaming)
 }
 
-fn is_usable_hit(entry: &CacheEntry, has_authorization: bool) -> bool {
-    !has_authorization || cached_entry_allows_shared_auth(&entry.headers)
+fn is_usable_hit(
+    entry: &CacheEntry,
+    requires_shared_public: bool,
+    accept_encoding: &AcceptEncoding,
+) -> bool {
+    let auth_ok = !requires_shared_public || cached_entry_allows_shared_auth(&entry.headers);
+    let encoding_ok =
+        entry.compressed || upstream_encoding_accepted(&entry.headers, accept_encoding);
+    auth_ok && encoding_ok
 }
 
 fn cache_control_allows_shared_auth_str(value: &str) -> bool {
@@ -1640,44 +1714,82 @@ fn cached_entry_allows_shared_auth(headers: &[(String, Vec<u8>)]) -> bool {
         .any(cache_control_allows_shared_auth_str)
 }
 
-fn client_accepts_gzip(headers: &HeaderMap) -> bool {
-    let mut gzip_q: Option<f32> = None;
-    let mut star_q: Option<f32> = None;
+#[derive(Clone)]
+struct AcceptEncoding {
+    codings: Vec<(String, f32)>,
+}
 
-    for value in headers.get_all(http::header::ACCEPT_ENCODING) {
-        let Ok(raw) = value.to_str() else {
-            continue;
-        };
-        for item in raw.split(',') {
-            let mut parts = item.split(';');
-            let coding = parts.next().map(str::trim).unwrap_or("");
-            if coding.is_empty() {
+impl AcceptEncoding {
+    fn from_headers(headers: &HeaderMap) -> Self {
+        let mut codings = Vec::new();
+        for value in headers.get_all(http::header::ACCEPT_ENCODING) {
+            let Ok(raw) = value.to_str() else {
                 continue;
-            }
-            let mut q = 1.0_f32;
-            for param in parts {
-                let param = param.trim();
-                if let Some(q_str) = param
-                    .strip_prefix("q=")
-                    .or_else(|| param.strip_prefix("Q="))
-                {
-                    if let Ok(parsed) = q_str.trim().parse::<f32>() {
-                        q = parsed;
+            };
+            for item in raw.split(',') {
+                let mut parts = item.split(';');
+                let coding = parts.next().map(str::trim).unwrap_or("");
+                if coding.is_empty() {
+                    continue;
+                }
+                let mut q = 1.0_f32;
+                for param in parts {
+                    let param = param.trim();
+                    if let Some(q_str) = param
+                        .strip_prefix("q=")
+                        .or_else(|| param.strip_prefix("Q="))
+                    {
+                        if let Ok(parsed) = q_str.trim().parse::<f32>() {
+                            q = parsed;
+                        }
                     }
                 }
+                codings.push((coding.to_ascii_lowercase(), q));
             }
-            if coding.eq_ignore_ascii_case("gzip") {
-                gzip_q = Some(q);
+        }
+        Self { codings }
+    }
+
+    fn accepts(&self, target: &str) -> bool {
+        let mut target_q: Option<f32> = None;
+        let mut star_q: Option<f32> = None;
+
+        for (coding, q) in &self.codings {
+            if coding.eq_ignore_ascii_case(target) {
+                target_q = Some(*q);
             } else if coding == "*" {
-                star_q = Some(q);
+                star_q = Some(*q);
+            }
+        }
+
+        match target_q {
+            Some(q) => q > 0.0,
+            None => star_q.is_some_and(|q| q > 0.0),
+        }
+    }
+}
+
+fn upstream_encoding_accepted(
+    headers: &[(String, Vec<u8>)],
+    accept_encoding: &AcceptEncoding,
+) -> bool {
+    for (name, value) in headers {
+        if !name.eq_ignore_ascii_case("content-encoding") {
+            continue;
+        }
+        let Ok(raw) = std::str::from_utf8(value) else {
+            return false;
+        };
+        for coding in raw.split(',').map(str::trim).filter(|c| !c.is_empty()) {
+            if coding.eq_ignore_ascii_case("identity") {
+                continue;
+            }
+            if !accept_encoding.accepts(coding) {
+                return false;
             }
         }
     }
-
-    match gzip_q {
-        Some(q) => q > 0.0,
-        None => star_q.is_some_and(|q| q > 0.0),
-    }
+    true
 }
 
 fn if_range_matches(
@@ -1781,6 +1893,16 @@ fn tag_gzip_etag_header_map(headers: &mut HeaderMap) {
     }
 }
 
+fn preserve_upstream_encoding_headers(
+    cached_headers: &mut Vec<(String, Vec<u8>)>,
+    source: &HeaderMap,
+) {
+    if source.contains_key(http::header::CONTENT_ENCODING) {
+        preserve_header_if_missing(cached_headers, source, http::header::CONTENT_ENCODING);
+        preserve_header_if_missing(cached_headers, source, http::header::VARY);
+    }
+}
+
 fn prepare_cached_payload_and_headers(
     headers: &HeaderMap,
     policy: &CachePolicy,
@@ -1791,8 +1913,7 @@ fn prepare_cached_payload_and_headers(
     // Never double-compress upstream payloads that already carry Content-Encoding,
     // and preserve Content-Encoding / Vary even when header_allowlist omits them.
     if headers.contains_key(http::header::CONTENT_ENCODING) {
-        preserve_header_if_missing(&mut cached_headers, headers, http::header::CONTENT_ENCODING);
-        preserve_header_if_missing(&mut cached_headers, headers, http::header::VARY);
+        preserve_upstream_encoding_headers(&mut cached_headers, headers);
         return (raw_bytes, cached_headers, false);
     }
 

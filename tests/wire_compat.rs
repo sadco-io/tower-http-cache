@@ -58,7 +58,7 @@ fn envelope_header_layout_is_as_documented() {
     );
 
     assert_eq!(&bytes[0..3], b"THC");
-    assert_eq!(bytes[3], envelope::FORMAT_V1);
+    assert_eq!(bytes[3], envelope::FORMAT_V2);
     assert_eq!(bytes[4], envelope::CODEC_POSTCARD);
     assert_eq!(
         u64::from_le_bytes(bytes[5..13].try_into().unwrap()),
@@ -216,14 +216,81 @@ fn unknown_codec_id_is_a_miss() {
 fn unknown_format_version_is_a_miss() {
     let entry = sample(Bytes::from_static(b"payload"), None);
     let payload = PostcardCodec.encode(&entry).unwrap();
-    let mut bytes = envelope::wrap(PostcardCodec::CODEC_ID, 1, 2, &payload);
-    bytes[3] = 0x02;
+    for version in [0x00_u8, 0x03, 0x7f] {
+        let mut bytes = envelope::wrap(PostcardCodec::CODEC_ID, 1, 2, &payload);
+        bytes[3] = version;
 
-    assert!(
-        envelope::read_stored(&bytes, &PostcardCodec)
-            .unwrap()
-            .is_none()
+        assert!(
+            envelope::read_stored(&bytes, &PostcardCodec)
+                .unwrap()
+                .is_none(),
+            "format version {version:#04x} must read as a miss"
+        );
+    }
+}
+
+/// Golden 0.6.x (`FORMAT_V1`) payload: 5-field postcard `StoredEntry` without
+/// `compressed`, wrapped with `FORMAT_V1 = 0x01`. `0.7.0` must read it cleanly
+/// with `compressed = false`, and `0.6.x` nodes must reject `FORMAT_V2` as a miss.
+#[test]
+fn v1_06x_golden_payload_decodes_cleanly_and_v2_is_rejected_by_v1_readers() {
+    // Authentic 0.6.x postcard payload (5 fields: status=200, version=2 (HTTP/1.1),
+    // headers=[("content-type", b"text/plain")], body=b"hello-06", tags=Some(["tag:a"])).
+    #[derive(serde::Serialize)]
+    struct StoredEntryV06<'a> {
+        status: u16,
+        version: u8,
+        headers: Vec<(&'a str, &'a [u8])>,
+        body: &'a [u8],
+        tags: Option<Vec<&'a str>>,
+    }
+
+    let v06_payload = postcard::to_allocvec(&StoredEntryV06 {
+        status: 200,
+        version: 2,
+        headers: vec![("content-type", b"text/plain")],
+        body: b"hello-06",
+        tags: Some(vec!["tag:a"]),
+    })
+    .unwrap();
+
+    // Direct PostcardCodec::decode fallback on 0.6.x payload.
+    let direct = PostcardCodec.decode(&v06_payload).unwrap();
+    assert_eq!(direct.status, StatusCode::OK);
+    assert_eq!(direct.version, Version::HTTP_11);
+    assert_eq!(
+        direct.headers,
+        vec![("content-type".to_string(), b"text/plain".to_vec())]
     );
+    assert_eq!(direct.body, Bytes::from_static(b"hello-06"));
+    assert_eq!(direct.tags, Some(vec!["tag:a".to_string()]));
+    assert!(!direct.compressed);
+
+    // Full FORMAT_V1 envelope as written by 0.6.x RedisBackend::set.
+    let mut v1_envelope = Vec::with_capacity(envelope::ENVELOPE_HEADER_LEN + v06_payload.len());
+    v1_envelope.extend_from_slice(&envelope::MAGIC);
+    v1_envelope.push(envelope::FORMAT_V1);
+    v1_envelope.push(envelope::CODEC_POSTCARD);
+    v1_envelope.extend_from_slice(&1_777_000_000_000u64.to_le_bytes());
+    v1_envelope.extend_from_slice(&1_777_000_060_000u64.to_le_bytes());
+    v1_envelope.extend_from_slice(&v06_payload);
+
+    let read = envelope::read_stored(&v1_envelope, &PostcardCodec)
+        .unwrap()
+        .expect("0.6.x FORMAT_V1 entry must decode cleanly");
+    assert_eq!(read.entry.body, Bytes::from_static(b"hello-06"));
+    assert_eq!(read.entry.tags, Some(vec!["tag:a".to_string()]));
+    assert!(!read.entry.compressed);
+
+    // Reverse mixed-fleet check: 0.7.0 writes FORMAT_V2, which 0.6.x readers
+    // (checking bytes[3] == FORMAT_V1) cleanly reject as a miss instead of
+    // mis-decoding compressed bodies.
+    let mut compressed_entry = sample(Bytes::from_static(b"\x1f\x8b\x08\x00"), None);
+    compressed_entry.compressed = true;
+    let v2_payload = PostcardCodec.encode(&compressed_entry).unwrap();
+    let v2_envelope = envelope::wrap(PostcardCodec::CODEC_ID, 1, 2, &v2_payload);
+    assert_eq!(v2_envelope[3], envelope::FORMAT_V2);
+    assert_ne!(v2_envelope[3], envelope::FORMAT_V1);
 }
 
 // --------------------------------------------------------------------------

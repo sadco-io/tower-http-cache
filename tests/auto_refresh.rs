@@ -700,3 +700,84 @@ async fn dropping_layer_clone_keeps_auto_refresh_alive_while_service_lives() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(calls.load(Ordering::Relaxed), settled);
 }
+
+#[tokio::test]
+async fn auto_refresh_respects_cache_control_no_store() {
+    use http_body_util::BodyExt;
+    use tower_http_cache::backend::CacheBackend;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let origin = tower::service_fn({
+        let calls = calls.clone();
+        move |_req: Request<()>| {
+            let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+            async move {
+                let mut builder = Response::builder().status(StatusCode::OK);
+                if n > 1 {
+                    builder = builder.header(http::header::CACHE_CONTROL, "no-store");
+                }
+                Ok::<_, std::convert::Infallible>(
+                    builder
+                        .body(http_body_util::Full::from(bytes::Bytes::from(format!(
+                            "v{n}"
+                        ))))
+                        .unwrap(),
+                )
+            }
+        }
+    });
+
+    let backend = InMemoryBackend::new(100);
+    let layer = CacheLayer::builder(backend.clone())
+        .ttl(Duration::from_millis(500))
+        .stale_while_revalidate(Duration::from_secs(5))
+        .refresh_before(Duration::from_millis(450))
+        .auto_refresh(AutoRefreshConfig {
+            enabled: true,
+            min_hits_per_minute: 0.0,
+            check_interval: Duration::from_millis(50),
+            ..Default::default()
+        })
+        .build();
+    layer.init_auto_refresh(origin.clone()).await.unwrap();
+    let mut svc = layer.layer(origin);
+
+    // Populate initial cacheable entry ("v1").
+    let first = svc
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::get("/no-store-refresh").body(()).unwrap())
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(&first[..], b"v1");
+
+    // Record a hit so `AccessTracker` tracks the key for auto-refresh.
+    let _ = svc
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::get("/no-store-refresh").body(()).unwrap())
+        .await
+        .unwrap();
+
+    // Wait for background refresh to run; subsequent origin calls return `no-store`.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(
+        calls.load(Ordering::SeqCst) >= 2,
+        "background refresh should have queried the origin"
+    );
+
+    // The cached entry in the backend must still be "v1" (never overwritten by `no-store`).
+    let stored = backend
+        .get("/no-store-refresh")
+        .await
+        .unwrap()
+        .expect("initial entry must remain cached");
+    assert_eq!(&stored.entry.body[..], b"v1");
+}

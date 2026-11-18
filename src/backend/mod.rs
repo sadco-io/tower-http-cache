@@ -197,6 +197,16 @@ impl CacheEntry {
         }
 
         if strip_body {
+            if !self
+                .headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            {
+                self.headers.push((
+                    "content-length".to_string(),
+                    self.body.len().to_string().into_bytes(),
+                ));
+            }
             self.body = Bytes::new();
         }
 

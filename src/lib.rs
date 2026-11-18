@@ -63,6 +63,7 @@ pub use layer::{CacheLayer, CacheLayerBuilder, KeyExtractor};
 #[cfg(feature = "serde")]
 pub use logging::CacheEvent;
 pub use logging::{CacheEventType, MLLoggingConfig};
+pub use policy::CookiePolicy;
 pub use range::{RangeHandling, RangeRequest};
 pub use request_id::RequestId;
 pub use streaming::{StreamingDecision, StreamingPolicy};

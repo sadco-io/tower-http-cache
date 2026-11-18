@@ -25,7 +25,7 @@ pub struct MLLoggingConfig {
     /// Sample rate (1.0 = all requests, 0.1 = 10%)
     pub sample_rate: f64,
 
-    /// Hash cache keys for privacy (recommended for production)
+    /// Hash cache keys and logged request URIs for privacy (recommended for production)
     pub hash_keys: bool,
 
     /// Target for structured logs (defaults to "tower_http_cache::ml")
@@ -61,7 +61,7 @@ impl MLLoggingConfig {
         self
     }
 
-    /// Enables or disables key hashing.
+    /// Enables or disables SHA-256 hashing of cache keys and logged request URIs.
     pub fn with_hash_keys(mut self, hash: bool) -> Self {
         self.hash_keys = hash;
         self

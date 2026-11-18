@@ -210,9 +210,58 @@ async fn redis_ignores_unrecognised_bytes_and_writes_the_envelope()
         .query_async(&mut conn)
         .await?;
     assert_eq!(&raw[0..3], b"THC");
+    assert_eq!(raw[3], tower_http_cache::codec::envelope::FORMAT_V2);
 
     let read = backend.get("fresh").await?.expect("hit");
     assert_eq!(read.entry.body, bytes::Bytes::from_static(b"fresh"));
+
+    // Plant a 0.6.x FORMAT_V1 entry (5-field postcard layout without `compressed`)
+    // and verify 0.7.0 reads it seamlessly with `compressed == false`.
+    #[derive(serde::Serialize)]
+    struct StoredEntryV06<'a> {
+        status: u16,
+        version: u8,
+        headers: Vec<(&'a str, &'a [u8])>,
+        body: &'a [u8],
+        tags: Option<Vec<&'a str>>,
+    }
+    let v06_payload = postcard::to_allocvec(&StoredEntryV06 {
+        status: 200,
+        version: 2,
+        headers: vec![("content-type", b"text/plain")],
+        body: b"from-0.6.x",
+        tags: Some(vec!["legacy:tag"]),
+    })?;
+    let future_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis() as u64
+        + 60_000;
+    let mut v1_bytes = Vec::with_capacity(
+        tower_http_cache::codec::envelope::ENVELOPE_HEADER_LEN + v06_payload.len(),
+    );
+    v1_bytes.extend_from_slice(&tower_http_cache::codec::envelope::MAGIC);
+    v1_bytes.push(tower_http_cache::codec::envelope::FORMAT_V1);
+    v1_bytes.push(tower_http_cache::codec::envelope::CODEC_POSTCARD);
+    v1_bytes.extend_from_slice(&future_ms.to_le_bytes());
+    v1_bytes.extend_from_slice(&(future_ms + 60_000).to_le_bytes());
+    v1_bytes.extend_from_slice(&v06_payload);
+
+    redis::cmd("SET")
+        .arg(format!("{namespace}:v06-entry"))
+        .arg(v1_bytes.as_slice())
+        .query_async::<()>(&mut conn)
+        .await?;
+
+    let v06_read = backend
+        .get("v06-entry")
+        .await?
+        .expect("0.6.x FORMAT_V1 entry must read seamlessly from Redis");
+    assert_eq!(
+        v06_read.entry.body,
+        bytes::Bytes::from_static(b"from-0.6.x")
+    );
+    assert_eq!(v06_read.entry.tags, Some(vec!["legacy:tag".to_string()]));
+    assert!(!v06_read.entry.compressed);
 
     cleanup_namespace(&mut conn, &namespace).await?;
     Ok(())

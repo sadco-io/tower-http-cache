@@ -7,7 +7,8 @@
 //!  offset  size  field             encoding                      notes
 //!  ------  ----  ----------------  ----------------------------  --------------------------------
 //!       0     3  MAGIC             0x54 0x48 0x43  ("THC")       constant
-//!       3     1  FORMAT_VERSION    0x01                          bumped only on envelope changes
+//!       3     1  FORMAT_VERSION    0x02                          0x01 (0.6.x) accepted on read;
+//!                                                                0x02 written by 0.7.0+
 //!       4     1  CODEC_ID          0x01 = postcard               0x02..=0x7F reserved by this crate
 //!                                                                0x80..=0xFF free for user codecs
 //!       5     8  expires_at_ms     u64 little-endian             ms since UNIX_EPOCH
@@ -35,8 +36,11 @@ use crate::error::CacheError;
 /// Magic prefix identifying a 0.6.0 envelope: `b"THC"`.
 pub const MAGIC: [u8; 3] = *b"THC";
 
-/// Envelope format version written by this release.
+/// Envelope format version written by 0.6.x releases (still accepted on read).
 pub const FORMAT_V1: u8 = 0x01;
+
+/// Envelope format version written by this release (adds `compressed` to the payload).
+pub const FORMAT_V2: u8 = 0x02;
 
 /// Codec id of [`PostcardCodec`](super::PostcardCodec).
 pub const CODEC_POSTCARD: u8 = 0x01;
@@ -51,7 +55,7 @@ pub const ENVELOPE_HEADER_LEN: usize = 21;
 pub fn wrap(codec_id: u8, expires_at_ms: u64, stale_until_ms: u64, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(ENVELOPE_HEADER_LEN + payload.len());
     out.extend_from_slice(&MAGIC);
-    out.push(FORMAT_V1);
+    out.push(FORMAT_V2);
     out.push(codec_id);
     out.extend_from_slice(&expires_at_ms.to_le_bytes());
     out.extend_from_slice(&stale_until_ms.to_le_bytes());
@@ -61,10 +65,12 @@ pub fn wrap(codec_id: u8, expires_at_ms: u64, stale_until_ms: u64, payload: &[u8
 
 /// Reports whether `bytes` carries an envelope header this release understands.
 pub fn looks_like_v2(bytes: &[u8]) -> bool {
-    bytes.len() >= ENVELOPE_HEADER_LEN && bytes[0..3] == MAGIC && bytes[3] == FORMAT_V1
+    bytes.len() >= ENVELOPE_HEADER_LEN
+        && bytes[0..3] == MAGIC
+        && (bytes[3] == FORMAT_V1 || bytes[3] == FORMAT_V2)
 }
 
-/// Decodes an envelope written by this release.
+/// Decodes an envelope written by 0.6.x (`FORMAT_V1`) or 0.7.0+ (`FORMAT_V2`).
 ///
 /// Fails if the header is absent, if the format version is unknown, or if byte
 /// 4 does not name `C`'s [`CacheCodec::CODEC_ID`] — an unrecognised codec id is
@@ -79,7 +85,7 @@ pub fn decode_v2<C: CacheCodec>(bytes: &[u8], codec: &C) -> Result<CacheRead, Ca
     if bytes[0..3] != MAGIC {
         return Err(CacheError::Backend("missing envelope magic".to_string()));
     }
-    if bytes[3] != FORMAT_V1 {
+    if bytes[3] != FORMAT_V1 && bytes[3] != FORMAT_V2 {
         return Err(CacheError::Backend(format!(
             "unsupported envelope format version {:#04x}",
             bytes[3]

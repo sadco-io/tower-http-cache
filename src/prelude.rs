@@ -22,7 +22,7 @@ pub use crate::layer::{CacheLayer, CacheLayerBuilder, KeyExtractor};
 #[cfg(feature = "serde")]
 pub use crate::logging::CacheEvent;
 pub use crate::logging::{CacheEventType, MLLoggingConfig};
-pub use crate::policy::{CachePolicy, CompressionConfig, CompressionStrategy};
+pub use crate::policy::{CachePolicy, CompressionConfig, CompressionStrategy, CookiePolicy};
 pub use crate::range::{RangeHandling, RangeRequest};
 pub use crate::streaming::{StreamingDecision, StreamingPolicy};
 pub use crate::tags::{TagIndex, TagPolicy};
