@@ -42,6 +42,11 @@ pub struct CachePolicy {
 }
 
 /// Policy controlling how incoming `Cookie` headers interact with the cache.
+///
+/// Note: cache keys do not incorporate `Vary` headers beyond `Accept-Encoding`.
+/// When a response declares `Vary: Cookie` or `Vary: *` (and likewise
+/// `Vary: Authorization` or `Vary: *` for requests carrying `Authorization`),
+/// requests carrying those headers will not store or serve the entry.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CookiePolicy {

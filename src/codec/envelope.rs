@@ -33,7 +33,7 @@ use super::CacheCodec;
 use crate::backend::CacheRead;
 use crate::error::CacheError;
 
-/// Magic prefix identifying a 0.6.0 envelope: `b"THC"`.
+/// Magic prefix identifying a `tower-http-cache` envelope: `b"THC"`.
 pub const MAGIC: [u8; 3] = *b"THC";
 
 /// Envelope format version written by 0.6.x releases (still accepted on read).

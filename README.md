@@ -98,7 +98,7 @@ See [`examples/axum_redis.rs`](examples/axum_redis.rs) for a complete Redis + Ax
 
 ### Chunk Caching for Large Files
 
-Cache large responses once and serve `206 Partial Content` byte-range requests directly from in-memory slices. Note that `StreamingPolicy::default()` skips `video/*`, `audio/*`, `application/pdf`, and `application/zip` unless `excluded_content_types` is cleared (or overridden via `force_cache_content_types`):
+Cache large responses once and serve `206 Partial Content` byte-range requests directly from in-memory chunks. Note that `StreamingPolicy::default()` skips `video/*`, `audio/*`, `application/octet-stream`, `application/pdf`, `application/zip`, `application/gzip`, `application/x-rar`, `application/x-tar`, and `application/x-7z-compressed` unless `excluded_content_types` is cleared:
 
 ```rust
 use std::collections::HashSet;
@@ -117,10 +117,6 @@ let cache_layer = CacheLayer::builder(InMemoryBackend::new(500))
                 min_chunk_file_size: 5 * 1024 * 1024,      // Only chunk files >= 5MB
                 max_cacheable_size: Some(64 * 1024 * 1024), // Allow files up to 64MB
                 excluded_content_types: HashSet::new(),    // Allow video/audio/binary payloads
-                force_cache_content_types: HashSet::from([
-                    "video/*".to_string(),
-                    "audio/*".to_string(),
-                ]),
                 ..Default::default()
             }),
     )
@@ -128,7 +124,7 @@ let cache_layer = CacheLayer::builder(InMemoryBackend::new(500))
 ```
 
 **Benefits:**
-- Zero-copy `Bytes::slice` serving for HTTP `206 Partial Content` range requests
+- In-memory chunk serving for HTTP `206 Partial Content` range requests
 - Bounded chunk index (`128 MiB` / `1,024` entries by default) with LRU and TTL eviction
 - `If-Range` validation and seamless fallback to the backend entry when needed
 - Range requests served directly from memory without re-reading the backend
@@ -213,8 +209,9 @@ let cache_layer = CacheLayer::builder(backend)
 
 // Later: invalidate through the layer (also evicts ChunkCache when enabled;
 // calling `backend.invalidate*` directly bypasses ChunkCache).
-cache_layer.invalidate_by_tag("user:123").await?;
-backend.invalidate_by_tags(&["user:123", "posts"]).await?;
+for tag in ["user:123", "posts"] {
+    cache_layer.invalidate_by_tag(tag).await?;
+}
 ```
 
 Tag-based invalidation works on `InMemoryBackend`, and on `MultiTierBackend`
@@ -342,7 +339,7 @@ let cache_layer = CacheLayer::builder(backend)
 | `stale_while_revalidate` | serve stale data while a refresh is in progress |
 | `refresh_before` | proactively refresh the cache shortly before expiry |
 | `auto_refresh` | automatically refresh frequently-accessed entries (requires non-zero `refresh_before`) |
-| `cookie_policy` | configure how `Cookie` request headers interact with the cache (`Bypass`, `RequirePublic`, `Ignore`) |
+| `cookie_policy` | configure how `Cookie` request headers interact with the cache (`Bypass`, `RequirePublic`, `Ignore`); `Vary` headers beyond `Accept-Encoding` are not part of the cache key |
 | `tag_policy` | configure cache tags and invalidation groups |
 | `multi_tier` | enable multi-tier caching with L1/L2 backends |
 | `ml_logging` | enable ML-ready structured logging |
@@ -458,7 +455,7 @@ cargo run --example v0_3_features --features admin-api
 - `MultiTierBackend::stats(&self)` now returns a `TierStats` snapshot by value (with a new `writes` field) instead of `&TierStats`.
 - `RangeRequest::normalize` resolves RFC 9110 suffix ranges (`bytes=-N`) alongside start-end and open-ended ranges; construct values with `RangeRequest::new` or `RangeRequest::suffix`.
 - Enabled `compression` now writes `Content-Encoding: gzip` and updates `Content-Length` on compressed cached entries, while skipping responses that already carry `Content-Encoding` and validating client `Accept-Encoding` on hits.
-- Redis envelope bumped to `FORMAT_V2` (`0x02`) while still reading `0.6.x` `FORMAT_V1` entries transparently (`compressed = false`). Requests carrying `Cookie` bypass the cache by default via `CookiePolicy::Bypass` (`RequirePublic` and `Ignore` are opt-in).
+- Redis envelope bumped to `FORMAT_V2` (`0x02`) while still reading `0.6.x` `FORMAT_V1` entries transparently (`compressed = false`). Requests carrying `Cookie` bypass the cache by default via `CookiePolicy::Bypass` (`RequirePublic` and `Ignore` are opt-in). `Vary` headers beyond `Accept-Encoding` are not part of the cache key: responses declaring `Vary: Cookie`, `Vary: Authorization`, or `Vary: *` are neither stored nor served when the corresponding request header is present.
 
 See [CHANGELOG.md](CHANGELOG.md) for the full release history, including earlier `0.5.x` → `0.6.0` notes.
 

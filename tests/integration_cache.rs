@@ -2270,3 +2270,288 @@ async fn ml_logging_bypass_emits_single_bypass_event_and_hashes_uri() {
         "hash_keys=true must hash both key and uri: {output}"
     );
 }
+
+#[tokio::test]
+async fn vary_cookie_authorization_and_star_prevent_cross_user_sharing() {
+    use tower_http_cache::policy::{CachePolicy, CookiePolicy};
+    use tower_http_cache::streaming::StreamingPolicy;
+
+    for policy_kind in [CookiePolicy::RequirePublic, CookiePolicy::Ignore] {
+        for vary_value in ["Cookie", "*", "Accept-Encoding, cookie"] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let layer = CacheLayer::builder(InMemoryBackend::new(64))
+                .ttl(Duration::from_secs(60))
+                .cookie_policy(policy_kind)
+                .build();
+            let mut svc = layer.layer(service_fn({
+                let calls = calls.clone();
+                let vary_value = vary_value.to_string();
+                move |req: Request<()>| {
+                    let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    let cookie = req
+                        .headers()
+                        .get(http::header::COOKIE)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("none")
+                        .to_owned();
+                    let vary_header = vary_value.clone();
+                    async move {
+                        Ok::<_, Infallible>(
+                            http::Response::builder()
+                                .header(CACHE_CONTROL, "public, max-age=60")
+                                .header(http::header::VARY, vary_header)
+                                .body(Full::from(format!("hello {cookie} #{n}")))
+                                .unwrap(),
+                        )
+                    }
+                }
+            }));
+
+            let alice = svc
+                .ready()
+                .await
+                .unwrap()
+                .call(
+                    Request::get("/profile")
+                        .header(http::header::COOKIE, "sid=alice")
+                        .body(())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes();
+            let bob = svc
+                .ready()
+                .await
+                .unwrap()
+                .call(
+                    Request::get("/profile")
+                        .header(http::header::COOKIE, "sid=bob")
+                        .body(())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes();
+
+            assert_eq!(&alice[..], b"hello sid=alice #1");
+            assert_eq!(
+                &bob[..],
+                b"hello sid=bob #2",
+                "Vary: {vary_value} under {policy_kind:?} must not serve alice's entry to bob"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+        }
+
+        // Unrelated Vary (e.g. Vary: Origin) still caches under RequirePublic/Ignore.
+        let origin_calls = Arc::new(AtomicUsize::new(0));
+        let origin_layer = CacheLayer::builder(InMemoryBackend::new(64))
+            .ttl(Duration::from_secs(60))
+            .cookie_policy(policy_kind)
+            .build();
+        let mut origin_svc = origin_layer.layer(service_fn({
+            let calls = origin_calls.clone();
+            move |_req: Request<()>| {
+                let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                async move {
+                    Ok::<_, Infallible>(
+                        http::Response::builder()
+                            .header(CACHE_CONTROL, "public, max-age=60")
+                            .header(http::header::VARY, "Origin")
+                            .body(Full::from(format!("cors-{n}")))
+                            .unwrap(),
+                    )
+                }
+            }
+        }));
+        let r1 = origin_svc
+            .ready()
+            .await
+            .unwrap()
+            .call(
+                Request::get("/cors")
+                    .header(http::header::COOKIE, "sid=alice")
+                    .body(())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let r2 = origin_svc
+            .ready()
+            .await
+            .unwrap()
+            .call(
+                Request::get("/cors")
+                    .header(http::header::COOKIE, "sid=bob")
+                    .body(())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(r1, r2);
+        assert_eq!(origin_calls.load(Ordering::SeqCst), 1);
+    }
+
+    // Anonymous store with header_allowlist omitting `vary` must still block a Cookie hit
+    // when the stored entry declared `Vary: Cookie` (both full hit and chunk-cache hit).
+    let anon_calls = Arc::new(AtomicUsize::new(0));
+    let anon_layer = CacheLayer::builder(InMemoryBackend::new(64))
+        .policy(
+            CachePolicy::default()
+                .with_ttl(Duration::from_secs(60))
+                .with_cookie_policy(CookiePolicy::RequirePublic)
+                .with_header_allowlist(["content-type", "cache-control"])
+                .with_streaming_policy(StreamingPolicy {
+                    enable_chunk_cache: true,
+                    chunk_size: 4,
+                    min_chunk_file_size: 4,
+                    excluded_content_types: std::collections::HashSet::new(),
+                    ..Default::default()
+                }),
+        )
+        .build();
+    let mut anon_svc = anon_layer.layer(service_fn({
+        let calls = anon_calls.clone();
+        move |req: Request<()>| {
+            let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let has_cookie = req.headers().contains_key(http::header::COOKIE);
+            async move {
+                let body = if has_cookie {
+                    format!("user-{n}")
+                } else {
+                    "anon-01234567".to_string()
+                };
+                Ok::<_, Infallible>(
+                    http::Response::builder()
+                        .header("content-type", "text/plain")
+                        .header(CACHE_CONTROL, "public, max-age=60")
+                        .header(http::header::VARY, "Cookie")
+                        .body(Full::from(body))
+                        .unwrap(),
+                )
+            }
+        }
+    }));
+
+    // Anonymous request seeds both main cache and chunk cache.
+    let anon = anon_svc
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::get("/shared").body(()).unwrap())
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(&anon[..], b"anon-01234567");
+
+    // Cookie range request must NOT hit chunk cache or main cache.
+    let cookie_range = anon_svc
+        .ready()
+        .await
+        .unwrap()
+        .call(
+            Request::get("/shared")
+                .header(http::header::COOKIE, "sid=alice")
+                .header(http::header::RANGE, "bytes=0-3")
+                .body(())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(&cookie_range[..], b"user-2");
+
+    // Authorization + Vary: Authorization / Vary: * must not store or share.
+    for vary_value in ["Authorization", "*"] {
+        let auth_calls = Arc::new(AtomicUsize::new(0));
+        let auth_layer = CacheLayer::builder(InMemoryBackend::new(64))
+            .ttl(Duration::from_secs(60))
+            .build();
+        let mut auth_svc = auth_layer.layer(service_fn({
+            let calls = auth_calls.clone();
+            let vary_value = vary_value.to_string();
+            move |req: Request<()>| {
+                let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                let auth = req
+                    .headers()
+                    .get(http::header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("none")
+                    .to_owned();
+                let vary_header = vary_value.clone();
+                async move {
+                    Ok::<_, Infallible>(
+                        http::Response::builder()
+                            .header(CACHE_CONTROL, "public, max-age=60")
+                            .header(http::header::VARY, vary_header)
+                            .body(Full::from(format!("{auth} #{n}")))
+                            .unwrap(),
+                    )
+                }
+            }
+        }));
+        let u1 = auth_svc
+            .ready()
+            .await
+            .unwrap()
+            .call(
+                Request::get("/me")
+                    .header(http::header::AUTHORIZATION, "Bearer u1")
+                    .body(())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let u2 = auth_svc
+            .ready()
+            .await
+            .unwrap()
+            .call(
+                Request::get("/me")
+                    .header(http::header::AUTHORIZATION, "Bearer u2")
+                    .body(())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(&u1[..], b"Bearer u1 #1");
+        assert_eq!(&u2[..], b"Bearer u2 #2");
+        assert_eq!(auth_calls.load(Ordering::SeqCst), 2);
+    }
+}

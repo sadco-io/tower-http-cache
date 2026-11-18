@@ -716,8 +716,8 @@ where
             if is_head || (has_cookie && matches!(cookie_policy, CookiePolicy::Bypass)) {
                 return Ok(());
             }
-            let requires_shared =
-                requires_shared_public(has_authorization, has_cookie, cookie_policy);
+            let auth_check =
+                SharedAuthCheck::from_request(has_authorization, has_cookie, cookie_policy);
 
             // Reconstruct the request
             let request = match metadata.try_into_request() {
@@ -782,7 +782,7 @@ where
                 &cache_bytes,
                 streaming,
                 is_head,
-                requires_shared,
+                auth_check,
             ) {
                 return Ok(()); // Successfully refreshed but not stored
             }
@@ -863,7 +863,8 @@ where
         let has_authorization = req.headers().contains_key(http::header::AUTHORIZATION);
         let cookie_policy = self.policy.cookie_policy();
         let cookie_bypass = has_cookie && matches!(cookie_policy, CookiePolicy::Bypass);
-        let requires_shared = requires_shared_public(has_authorization, has_cookie, cookie_policy);
+        let auth_check =
+            SharedAuthCheck::from_request(has_authorization, has_cookie, cookie_policy);
         let accept_encoding = AcceptEncoding::from_headers(req.headers());
         let accept_gzip = accept_encoding.accepts("gzip");
         let has_range_header = req.headers().contains_key(http::header::RANGE);
@@ -921,8 +922,8 @@ where
                 (range_request.as_ref(), &chunk_cache, &key)
             {
                 if let Some(entry) = chunk_cache.get(key_ref) {
-                    let auth_allowed = !requires_shared
-                        || cached_entry_allows_shared_auth(&entry.metadata.headers);
+                    let auth_allowed =
+                        cached_entry_allows_auth_and_vary(&entry.metadata.headers, auth_check);
                     let encoding_allowed =
                         upstream_encoding_accepted(&entry.metadata.headers, &accept_encoding);
                     let if_range_ok = if_range_matches(
@@ -987,7 +988,7 @@ where
                 if let Ok(Some(hit)) = backend.get(key_ref).await {
                     match classify_hit(hit, stale_window, refresh_before) {
                         HitState::Fresh(entry)
-                            if is_usable_hit(&entry, requires_shared, &accept_encoding) =>
+                            if is_usable_hit(&entry, auth_check, &accept_encoding) =>
                         {
                             #[cfg(feature = "metrics")]
                             counter!("tower_http_cache.hit").increment(1);
@@ -1013,7 +1014,7 @@ where
                             return Ok(entry.into_response_with_options(accept_gzip, is_head));
                         }
                         HitState::Stale(entry)
-                            if is_usable_hit(&entry, requires_shared, &accept_encoding) =>
+                            if is_usable_hit(&entry, auth_check, &accept_encoding) =>
                         {
                             #[cfg(feature = "metrics")]
                             counter!("tower_http_cache.stale_hit").increment(1);
@@ -1061,7 +1062,7 @@ where
                         if let Ok(Some(hit)) = backend.get(key_ref).await {
                             match classify_hit(hit, stale_window, refresh_before) {
                                 HitState::Fresh(entry)
-                                    if is_usable_hit(&entry, requires_shared, &accept_encoding) =>
+                                    if is_usable_hit(&entry, auth_check, &accept_encoding) =>
                                 {
                                     #[cfg(feature = "metrics")]
                                     counter!("tower_http_cache.hit_after_wait").increment(1);
@@ -1082,7 +1083,7 @@ where
                                     );
                                 }
                                 HitState::Stale(entry)
-                                    if is_usable_hit(&entry, requires_shared, &accept_encoding) =>
+                                    if is_usable_hit(&entry, auth_check, &accept_encoding) =>
                                 {
                                     #[cfg(feature = "metrics")]
                                     counter!("tower_http_cache.stale_served").increment(1);
@@ -1128,7 +1129,7 @@ where
                         if let HitState::Fresh(entry) =
                             classify_hit(hit, stale_window, refresh_before)
                         {
-                            if is_usable_hit(&entry, requires_shared, &accept_encoding) {
+                            if is_usable_hit(&entry, auth_check, &accept_encoding) {
                                 #[cfg(feature = "metrics")]
                                 counter!("tower_http_cache.hit_after_lock").increment(1);
                                 #[cfg(feature = "admin-api")]
@@ -1263,7 +1264,7 @@ where
                     &cache_bytes,
                     streaming,
                     is_head,
-                    requires_shared,
+                    auth_check,
                 );
 
             let version = parts.version;
@@ -1602,6 +1603,7 @@ fn populate_chunk_cache(
 
     let mut cached_headers = policy.headers_to_cache(&parts.headers);
     preserve_upstream_encoding_headers(&mut cached_headers, &parts.headers);
+    preserve_auth_vary_header(&mut cached_headers, &parts.headers);
 
     let metadata = ChunkMetadata {
         total_size: cache_bytes.len() as u64,
@@ -1647,12 +1649,30 @@ fn populate_chunk_cache(
     let _ = chunk_count;
 }
 
-fn requires_shared_public(
+#[derive(Clone, Copy)]
+struct SharedAuthCheck {
+    requires_shared_public: bool,
+    has_non_bypass_cookie: bool,
     has_authorization: bool,
-    has_cookie: bool,
-    cookie_policy: CookiePolicy,
-) -> bool {
-    has_authorization || (has_cookie && matches!(cookie_policy, CookiePolicy::RequirePublic))
+}
+
+impl SharedAuthCheck {
+    fn from_request(
+        has_authorization: bool,
+        has_cookie: bool,
+        cookie_policy: CookiePolicy,
+    ) -> Self {
+        Self {
+            requires_shared_public: has_authorization
+                || (has_cookie && matches!(cookie_policy, CookiePolicy::RequirePublic)),
+            has_non_bypass_cookie: has_cookie && !matches!(cookie_policy, CookiePolicy::Bypass),
+            has_authorization,
+        }
+    }
+
+    fn checks_vary(self) -> bool {
+        self.has_non_bypass_cookie || self.has_authorization
+    }
 }
 
 fn should_store_response(
@@ -1661,7 +1681,7 @@ fn should_store_response(
     cache_bytes: &[u8],
     streaming: bool,
     is_head: bool,
-    requires_shared_public: bool,
+    auth_check: SharedAuthCheck,
 ) -> bool {
     let cache_control_block = policy.respect_cache_control() && cache_control_disallows(headers);
     let body_too_large = policy
@@ -1670,25 +1690,86 @@ fn should_store_response(
     let body_too_small = policy
         .min_body_size()
         .is_some_and(|min| cache_bytes.len() < min);
-    let auth_allowed = !requires_shared_public || response_allows_shared_auth(headers);
+    let auth_allowed = !auth_check.requires_shared_public || response_allows_shared_auth(headers);
+    let vary_allowed = response_vary_allows_request(headers, auth_check);
 
     !is_head
         && !cache_control_block
         && !body_too_large
         && !body_too_small
         && auth_allowed
+        && vary_allowed
         && (policy.allow_streaming_bodies() || !streaming)
 }
 
 fn is_usable_hit(
     entry: &CacheEntry,
-    requires_shared_public: bool,
+    auth_check: SharedAuthCheck,
     accept_encoding: &AcceptEncoding,
 ) -> bool {
-    let auth_ok = !requires_shared_public || cached_entry_allows_shared_auth(&entry.headers);
+    let auth_and_vary_ok = cached_entry_allows_auth_and_vary(&entry.headers, auth_check);
     let encoding_ok =
         entry.compressed || upstream_encoding_accepted(&entry.headers, accept_encoding);
-    auth_ok && encoding_ok
+    auth_and_vary_ok && encoding_ok
+}
+
+fn vary_str_blocks_request(value: &str, auth_check: SharedAuthCheck) -> bool {
+    value.split(',').map(str::trim).any(|tok| {
+        (tok == "*" && auth_check.checks_vary())
+            || (auth_check.has_non_bypass_cookie && tok.eq_ignore_ascii_case("cookie"))
+            || (auth_check.has_authorization && tok.eq_ignore_ascii_case("authorization"))
+    })
+}
+
+fn response_vary_allows_request(headers: &HeaderMap, auth_check: SharedAuthCheck) -> bool {
+    if !auth_check.checks_vary() {
+        return true;
+    }
+    !headers.get_all(http::header::VARY).iter().any(|v| {
+        v.to_str()
+            .map_or(true, |s| vary_str_blocks_request(s, auth_check))
+    })
+}
+
+fn cached_entry_vary_allows_request(
+    headers: &[(String, Vec<u8>)],
+    auth_check: SharedAuthCheck,
+) -> bool {
+    if !auth_check.checks_vary() {
+        return true;
+    }
+    !headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("vary"))
+        .any(|(_, value)| {
+            std::str::from_utf8(value).map_or(true, |s| vary_str_blocks_request(s, auth_check))
+        })
+}
+
+fn cached_entry_allows_auth_and_vary(
+    headers: &[(String, Vec<u8>)],
+    auth_check: SharedAuthCheck,
+) -> bool {
+    let auth_ok = !auth_check.requires_shared_public || cached_entry_allows_shared_auth(headers);
+    auth_ok && cached_entry_vary_allows_request(headers, auth_check)
+}
+
+fn vary_str_mentions_shared_auth(value: &str) -> bool {
+    value.split(',').map(str::trim).any(|tok| {
+        tok == "*"
+            || tok.eq_ignore_ascii_case("cookie")
+            || tok.eq_ignore_ascii_case("authorization")
+    })
+}
+
+fn preserve_auth_vary_header(cached_headers: &mut Vec<(String, Vec<u8>)>, source: &HeaderMap) {
+    let mentions_auth_vary = source
+        .get_all(http::header::VARY)
+        .iter()
+        .any(|v| v.to_str().map_or(true, vary_str_mentions_shared_auth));
+    if mentions_auth_vary {
+        preserve_header_if_missing(cached_headers, source, http::header::VARY);
+    }
 }
 
 fn cache_control_allows_shared_auth_str(value: &str) -> bool {
@@ -1909,6 +1990,7 @@ fn prepare_cached_payload_and_headers(
     raw_bytes: Bytes,
 ) -> (Bytes, Vec<(String, Vec<u8>)>, bool) {
     let mut cached_headers = policy.headers_to_cache(headers);
+    preserve_auth_vary_header(&mut cached_headers, headers);
 
     // Never double-compress upstream payloads that already carry Content-Encoding,
     // and preserve Content-Encoding / Vary even when header_allowlist omits them.
