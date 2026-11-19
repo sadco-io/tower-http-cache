@@ -1,6 +1,6 @@
 [package]
 name = "tower-http-cache"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 # 1.85 covers the default feature set and everything except `redis-backend`,
 # which requires 1.88 -- `redis` 1.8 declares `rust-version = "1.88"`. Both
@@ -98,11 +98,23 @@ name = "integration_cache"
 required-features = ["in-memory"]
 
 [[test]]
+name = "ml_logging_bypass"
+required-features = ["in-memory", "serde", "tracing"]
+
+[[test]]
 name = "streaming"
 required-features = ["in-memory"]
 
 [[test]]
+name = "shared_cache_rules"
+required-features = ["in-memory"]
+
+[[test]]
 name = "tags"
+required-features = ["in-memory"]
+
+[[test]]
+name = "vary_star_anonymous"
 required-features = ["in-memory"]
 
 [[test]]
@@ -114,6 +126,10 @@ required-features = ["redis-backend"]
 [[test]]
 name = "wire_compat"
 required-features = ["serde"]
+
+[[example]]
+name = "axum_admin"
+required-features = ["in-memory", "admin-api"]
 
 [[example]]
 name = "chunk_cache_demo"

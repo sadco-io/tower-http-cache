@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-19
+
+### Security
+
+- Admin API handlers for statistics, hot keys, tags, and invalidation now check `AdminConfig.enabled` on every call and require a valid Bearer token when `require_auth` is true. Previously these handlers did not check the configured token. See GHSA-4c8v-9w37-wmrm.
+- `CacheLayer` skips storage of new origin responses containing `Vary: *` and refuses to serve stored entries whose headers contain `Vary: *`. See GHSA-9g55-85q9-7vr2.
+
+### Breaking
+
+- **`admin::routes` handler signatures now require the request's `Authorization` header and return `Result<_, AdminError>`.**
+  - `handle_stats(state, auth_header) -> Result<StatsResponse, AdminError>`
+  - `handle_hot_keys(state, auth_header, limit) -> Result<HotKeysResponse, AdminError>`
+  - `handle_list_tags(state, auth_header) -> Result<TagsResponse, AdminError>`
+  - `handle_invalidate(state, auth_header, request) -> Result<InvalidationResponse, AdminError>`
+  - `handle_health()` is unchanged and stays open for health probes when the admin routes are mounted. Do not mount any admin routes (including `handle_health`) when `AdminConfig::enabled` is `false`.
+  - Each authenticated handler calls `AdminState::authorize(auth_header)` first, returning `AdminError::Disabled` (404, displaying as `"not found"`) when `AdminConfig::enabled` is `false`, `AdminError::Unauthorized` (401) when authentication fails, `AdminError::BadRequest(String)` (400) for missing or invalid input, `AdminError::Unsupported(String)` (501) when the backend does not support the operation, or `AdminError::Backend(String)` (500) on backend errors.
+
+  Migration example:
+
+  ```diff
+  +let auth_header = headers
+  +    .get(http::header::AUTHORIZATION)
+  +    .and_then(|v| v.to_str().ok());
+  -let stats = handle_stats(&state);
+  +let stats = handle_stats(&state, auth_header).map_err(|err| match err {
+  +    AdminError::Disabled => (err.status(), None),
+  +    other => (other.status(), Some(ErrorResponse::from(other))),
+  +})?;
+  ```
+
+- **`AdminConfig` defaults now take effect:** `AdminConfig::default()` sets `enabled = false`, `require_auth = true`, and `auth_token = None`. Enable the admin API (`.with_enabled(true)`) and configure a non-empty token (`.with_auth_token(...)`), or deliberately set `.with_require_auth(false)` behind an authenticating proxy, otherwise each of the four state-accessing handlers returns `AdminError::Disabled` or `AdminError::Unauthorized`.
+
+### Added
+
+- **`#[non_exhaustive]` `AdminError` (`Disabled`, `Unauthorized`, `BadRequest(String)`, `Unsupported(String)`, `Backend(String)`)** with `AdminError::status()` (`404`/`401`/`400`/`501`/`500`), `Display` (`Disabled` displays as `"not found"`), `std::error::Error`, `From<AdminError>` and `From<&AdminError>` for `routes::ErrorResponse`, and crate-root re-export under `admin-api`.
+- **`AdminState::authorize(auth_header: Option<&str>) -> Result<(), AdminError>`** enforcing `AdminConfig::enabled` and constant-time Bearer token verification via `AdminConfig::validate_token`.
+- **`examples/axum_admin.rs`** demonstrating complete authenticated Axum admin routing on a dedicated internal listener (`ADMIN_TOKEN=<token> cargo run --example axum_admin --features admin-api`), requiring a non-blank `ADMIN_TOKEN`, returning a bare `404` for `AdminError::Disabled`, and sending `WWW-Authenticate: Bearer` on `401` responses.
+- **Regression tests** covering `Vary: *` on anonymous requests (incoming, multiple/split/mixed-case headers, pre-stored entries, chunk cache, and multi-tier backends), authenticated admin handler authorization/disabled/missing-token/`require_auth(false)`/backend-error states, RFC 9111 §3.5 `Authorization` shared-cache rules, and `Set-Cookie` / hop-by-hop header stripping on both store and cache-hit reads.
+
+### Changed
+
+- **`Vary: *` handling in `CacheLayer`:** `CacheLayer` skips storage of new origin responses containing `Vary: *` and refuses to serve stored entries whose headers contain `Vary: *`. The layer rejects incoming `Vary` values that `HeaderValue::to_str()` cannot read. Documented behavior for other named `Vary` headers is unchanged.
+- **Read-side header filtering on cache hits:** building a response from a cached entry (`CacheEntry::into_response` and chunk cache range hits) now strips `Set-Cookie`, RFC 9110 hop-by-hop headers, and `Connection`-nominated headers in addition to store-time filtering. If the namespace may contain entries written before 0.7.0, evict them after retiring old writers or switch to a fresh namespace.
+- **Documentation:** updated `README.md`, `SECURITY.md`, `CookiePolicy`, and `admin` rustdoc with complete authenticated wiring examples, `# Security` guidance for `require_auth = false`, bare-404 / unmounted disabled-route guidance, and internal-only listener recommendations.
+
 ## [0.7.0] - 2026-11-17
 
 ### Added
@@ -907,7 +952,9 @@ All v0.3.0 features are opt-in and backward compatible:
 - Benchmark suite with Criterion
 - Examples for Axum and Redis integration
 
-[Unreleased]: https://github.com/sadco-io/tower-http-cache/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/sadco-io/tower-http-cache/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/sadco-io/tower-http-cache/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/sadco-io/tower-http-cache/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/sadco-io/tower-http-cache/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/sadco-io/tower-http-cache/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/sadco-io/tower-http-cache/compare/v0.5.1...v0.5.2

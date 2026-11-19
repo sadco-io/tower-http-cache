@@ -44,9 +44,10 @@ pub struct CachePolicy {
 /// Policy controlling how incoming `Cookie` headers interact with the cache.
 ///
 /// Note: cache keys do not incorporate `Vary` headers beyond `Accept-Encoding`.
-/// When a response declares `Vary: Cookie` or `Vary: *` (and likewise
-/// `Vary: Authorization` or `Vary: *` for requests carrying `Authorization`),
-/// requests carrying those headers will not store or serve the entry.
+/// Responses declaring `Vary: *` (or a `Vary` list containing `*`) are never
+/// stored or served, whatever headers the request carries. When a response
+/// declares `Vary: Cookie` (or `Vary: Authorization`), requests carrying that
+/// header will not store or serve the entry.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CookiePolicy {
@@ -59,7 +60,7 @@ pub enum CookiePolicy {
     /// public`, `must-revalidate`, or `s-maxage=...`).
     RequirePublic,
     /// Ignore `Cookie` headers on requests when deciding cacheability
-    /// (`Set-Cookie` response headers are still stripped on store).
+    /// (`Set-Cookie` response headers are still stripped on store and on cache hits).
     Ignore,
 }
 
@@ -380,7 +381,23 @@ impl Default for CachePolicy {
     }
 }
 
-fn is_non_cacheable_header(lower_name: &str, connection_tokens: &HashSet<String>) -> bool {
+pub(crate) fn collect_connection_tokens_from_pairs(
+    headers: &[(String, Vec<u8>)],
+) -> HashSet<String> {
+    headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("connection"))
+        .filter_map(|(_, value)| std::str::from_utf8(value).ok())
+        .flat_map(|v| v.split(','))
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+pub(crate) fn is_non_cacheable_header(
+    lower_name: &str,
+    connection_tokens: &HashSet<String>,
+) -> bool {
     matches!(
         lower_name,
         "set-cookie"

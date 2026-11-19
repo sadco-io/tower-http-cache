@@ -30,13 +30,13 @@ Tower middleware for HTTP response caching with pluggable storage backends (in-m
 
 ```toml
 [dependencies]
-tower-http-cache = "0.7"
+tower-http-cache = "0.8"
 
 # Enable Redis support if required
-tower-http-cache = { version = "0.7", features = ["redis-backend"] }
+tower-http-cache = { version = "0.8", features = ["redis-backend"] }
 
 # With framework-agnostic admin API support
-tower-http-cache = { version = "0.7", features = ["admin-api"] }
+tower-http-cache = { version = "0.8", features = ["admin-api"] }
 ```
 
 ---
@@ -275,27 +275,122 @@ let cache_layer = CacheLayer::builder(backend)
 
 ### Admin API
 
-Enable framework-agnostic cache introspection and management handlers (no Axum dependency required):
+Enable framework-agnostic cache introspection and management handlers (no Axum dependency required). Every state-reading and state-changing handler (`handle_stats`, `handle_hot_keys`, `handle_list_tags`, `handle_invalidate`) takes the request's raw `Authorization` header value and calls `AdminState::authorize` first, returning `Err(AdminError::Disabled)` (404) when `enabled` is `false` or `Err(AdminError::Unauthorized)` (401) when authentication fails, `Err(AdminError::BadRequest(_))` (400) for invalid input, `Err(AdminError::Unsupported(_))` (501) when the backend does not support the operation, or `Err(AdminError::Backend(_))` (500) on backend failures.
 
-```rust
-use tower_http_cache::admin::{AdminConfig, AdminState};
+When `AdminConfig::enabled` is `false`, **do not mount the admin routes (including `handle_health`) at all**, and map `AdminError::Disabled` to a bare `404` response so disabled endpoints are not advertised. Include a `WWW-Authenticate: Bearer` header on `401` responses (RFC 9110).
+
+The Axum wiring snippet below requires these dependencies alongside `tower-http-cache = { version = "0.8", features = ["admin-api"] }`:
+
+```toml
+[dependencies]
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+```
+
+```rust,no_run
+use axum::{
+    Json, Router,
+    extract::{Query, State},
+    http::{
+        HeaderMap, StatusCode,
+        header::{AUTHORIZATION, WWW_AUTHENTICATE},
+    },
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
+use serde::Deserialize;
+use std::time::Duration;
+use tower_http_cache::admin::routes::{
+    ErrorResponse, InvalidationRequest, handle_health, handle_hot_keys, handle_invalidate,
+    handle_list_tags, handle_stats,
+};
+use tower_http_cache::admin::{AdminConfig, AdminError, AdminState};
+use tower_http_cache::prelude::*;
+
+#[derive(Deserialize)]
+struct HotKeysQuery {
+    limit: Option<usize>,
+}
+
+fn auth_header(headers: &HeaderMap) -> Option<&str> {
+    headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok())
+}
+
+fn admin_error_response(err: AdminError) -> Response {
+    match err {
+        AdminError::Disabled => StatusCode::NOT_FOUND.into_response(),
+        AdminError::Unauthorized => (
+            StatusCode::UNAUTHORIZED,
+            [(WWW_AUTHENTICATE, "Bearer")],
+            Json(ErrorResponse::from(err)),
+        )
+            .into_response(),
+        other => {
+            let status =
+                StatusCode::from_u16(other.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            (status, Json(ErrorResponse::from(other))).into_response()
+        }
+    }
+}
+
+let token = std::env::var("ADMIN_TOKEN").expect("ADMIN_TOKEN must be set");
+assert!(!token.trim().is_empty(), "ADMIN_TOKEN must not be blank");
+
+let cache_layer = CacheLayer::builder(InMemoryBackend::new(10_000))
+    .ttl(Duration::from_secs(60))
+    .build();
 
 let admin_config = AdminConfig::new()
+    .with_enabled(true)
     .with_require_auth(true)
-    .with_auth_token("your-secret-token")
-    .with_enabled(true);
+    .with_auth_token(token);
 
 // Wire AdminState to the CacheLayer's backend, live GlobalStats, and ChunkCache:
-// (Note: calling `backend.invalidate()` directly bypasses ChunkCache eviction.)
+// (Note: calling `backend.invalidate()` directly skips ChunkCache eviction.)
 let admin_state = AdminState::from_layer(&cache_layer, admin_config);
 
-// Available handler functions (wire into any HTTP framework):
-// tower_http_cache::admin::routes::handle_health
-// tower_http_cache::admin::routes::handle_stats
-// tower_http_cache::admin::routes::handle_hot_keys
-// tower_http_cache::admin::routes::handle_list_tags
-// tower_http_cache::admin::routes::handle_invalidate
+let admin_router: Router = Router::new()
+    .route("/admin/cache/health", get(|| async { Json(handle_health()) }))
+    .route(
+        "/admin/cache/stats",
+        get(|State(state): State<AdminState<InMemoryBackend>>, headers: HeaderMap| async move {
+            match handle_stats(&state, auth_header(&headers)) {
+                Ok(resp) => Json(resp).into_response(),
+                Err(err) => admin_error_response(err),
+            }
+        }),
+    )
+    .route(
+        "/admin/cache/hot-keys",
+        get(|State(state): State<AdminState<InMemoryBackend>>, headers: HeaderMap, Query(q): Query<HotKeysQuery>| async move {
+            match handle_hot_keys(&state, auth_header(&headers), q.limit) {
+                Ok(resp) => Json(resp).into_response(),
+                Err(err) => admin_error_response(err),
+            }
+        }),
+    )
+    .route(
+        "/admin/cache/tags",
+        get(|State(state): State<AdminState<InMemoryBackend>>, headers: HeaderMap| async move {
+            match handle_list_tags(&state, auth_header(&headers)).await {
+                Ok(resp) => Json(resp).into_response(),
+                Err(err) => admin_error_response(err),
+            }
+        }),
+    )
+    .route(
+        "/admin/cache/invalidate",
+        post(|State(state): State<AdminState<InMemoryBackend>>, headers: HeaderMap, Json(body): Json<InvalidationRequest>| async move {
+            match handle_invalidate(&state, auth_header(&headers), body).await {
+                Ok(resp) => Json(resp).into_response(),
+                Err(err) => admin_error_response(err),
+            }
+        }),
+    )
+    .with_state(admin_state);
 ```
+
+Mount the admin routes on an internal-only listener (such as loopback or a private management interface) rather than exposing them on a public application router, and omit them entirely when `AdminConfig::enabled` is `false`. See [`examples/axum_admin.rs`](examples/axum_admin.rs) for a complete runnable example (`ADMIN_TOKEN=replace-with-strong-token cargo run --example axum_admin --features admin-api`).
 
 ### ML-Ready Structured Logging
 
@@ -339,7 +434,7 @@ let cache_layer = CacheLayer::builder(backend)
 | `stale_while_revalidate` | serve stale data while a refresh is in progress |
 | `refresh_before` | proactively refresh the cache shortly before expiry |
 | `auto_refresh` | automatically refresh frequently-accessed entries (requires non-zero `refresh_before`) |
-| `cookie_policy` | configure how `Cookie` request headers interact with the cache (`Bypass`, `RequirePublic`, `Ignore`); `Vary` headers beyond `Accept-Encoding` are not part of the cache key |
+| `cookie_policy` | configure how `Cookie` request headers interact with the cache (`Bypass`, `RequirePublic`, `Ignore`); `Vary` headers beyond `Accept-Encoding` are not part of the cache key, and `Vary: *` responses are never stored or served |
 | `tag_policy` | configure cache tags and invalidation groups |
 | `multi_tier` | enable multi-tier caching with L1/L2 backends |
 | `ml_logging` | enable ML-ready structured logging |
@@ -414,6 +509,7 @@ python3 scripts/redis_smoke.py
 docker compose -f docker-compose.redis.yml down
 
 # Examples
+ADMIN_TOKEN=replace-with-strong-token cargo run --example axum_admin --features admin-api
 cargo run --example axum_redis --features redis-backend
 cargo run --example chunk_cache_demo
 cargo run --example redis_smoke --features redis-backend
@@ -433,6 +529,15 @@ cargo run --example v0_3_features --features admin-api
 | `compression` | Adds optional gzip compression for cached payloads | ✗ |
 | `metrics` | Emits `metrics` counters (hit/miss/store/etc.) | ✗ |
 | `tracing` | Adds tracing spans around cache operations | ✗ |
+
+---
+
+## Upgrading from 0.7.0 to 0.8.0
+
+- **Authenticated `admin::routes` handlers:** `handle_stats`, `handle_hot_keys`, `handle_list_tags`, and `handle_invalidate` now accept `auth_header: Option<&str>` (the request's raw `Authorization` header) and return `Result<_, AdminError>`. Each handler calls `AdminState::authorize` before reading or mutating cache state and maps failures to `#[non_exhaustive]` `AdminError` variants: `Disabled` (`404`, displays as `"not found"`), `Unauthorized` (`401`), `BadRequest(String)` (`400`), `Unsupported(String)` (`501`), or `Backend(String)` (`500`) via `AdminError::status()`. Return a bare `404` for `AdminError::Disabled`, include `WWW-Authenticate: Bearer` on `401` responses, and do not mount admin routes (including `handle_health`) when `AdminConfig::enabled` is `false`.
+- **`AdminConfig` defaults now take effect:** `AdminConfig::default()` sets `enabled = false`, `require_auth = true`, and `auth_token = None`. Explicitly enable the admin API (`.with_enabled(true)`) and configure a non-empty token (`.with_auth_token(...)`), or deliberately set `.with_require_auth(false)` behind an authenticating proxy, otherwise every handler returns `AdminError::Disabled` or `AdminError::Unauthorized`.
+- **Unconditional `Vary: *` handling:** responses with `Vary: *` (or a `Vary` list containing `*`) are never stored or served, regardless of whether the request carries `Authorization` or `Cookie` headers. `Vary` values that are not visible ASCII are also treated as uncacheable.
+- **Upgrading from versions before 0.7.0:** cached hit responses now strip `Set-Cookie` and RFC 9110 hop-by-hop headers on read as well as on store, but users upgrading from versions before `0.7.0` should flush or rotate their Redis or other persistent cache namespace so entries written by earlier versions are cleared.
 
 ---
 

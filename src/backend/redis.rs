@@ -145,8 +145,7 @@ where
     /// the tags the entry was stored with — but there is no reverse index, so
     /// tag -> keys cannot be answered. Reporting it is deliberate: inheriting
     /// the trait default would answer `Ok(vec![])`, and the caller could not
-    /// tell that from "nothing carried that tag". A Redis-native index is
-    /// planned for 0.7.0.
+    /// tell that from "nothing carried that tag".
     async fn get_keys_by_tag(&self, _tag: &str) -> Result<Vec<String>, CacheError> {
         Err(unsupported_tags())
     }
@@ -157,8 +156,7 @@ where
     /// the tags the entry was stored with — but there is no reverse index, so
     /// tag -> keys cannot be answered. Reporting it is deliberate: inheriting
     /// the trait default would answer `Ok(vec![])`, and the caller could not
-    /// tell that from "nothing carried that tag". A Redis-native index is
-    /// planned for 0.7.0.
+    /// tell that from "nothing carried that tag".
     async fn list_tags(&self) -> Result<Vec<String>, CacheError> {
         Err(unsupported_tags())
     }
@@ -166,8 +164,7 @@ where
 
 fn unsupported_tags() -> CacheError {
     CacheError::Unsupported(
-        "RedisBackend keeps no tag index; tag lookup and tag invalidation are \
-         not available on it. Planned for 0.7.0 as an opt-in Redis-native index."
+        "RedisBackend keeps no tag index; tag operations are not supported by the Redis backend."
             .to_string(),
     )
 }

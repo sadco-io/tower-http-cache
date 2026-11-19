@@ -1,8 +1,55 @@
 //! Admin API for cache introspection and management.
 //!
-//! This module provides HTTP endpoints for monitoring and managing the cache
-//! at runtime. Features include statistics, key inspection, hot key tracking,
-//! and tag-based invalidation.
+//! This module provides framework-agnostic handlers for monitoring and managing
+//! the cache at runtime, including statistics, hot-key inspection, tag listing,
+//! and cache invalidation.
+//!
+//! # Authentication and Deployment
+//!
+//! Every state-reading and state-changing handler in [`routes`] takes the
+//! incoming request's raw `Authorization` header value and calls
+//! [`AdminState::authorize`] before reading or modifying state:
+//!
+//! - When [`AdminConfig::enabled`] is `false`, handlers return
+//!   `Err(AdminError::Disabled)` (HTTP `404`). Return a bare `404` response
+//!   so disabled endpoints are not advertised, and do not mount any admin
+//!   routes (including [`routes::handle_health`]) when `enabled` is `false`.
+//! - When [`AdminConfig::require_auth`] is `true` (the default), handlers
+//!   require an `Authorization: Bearer <token>` header matching
+//!   [`AdminConfig::auth_token`] using constant-time comparison, returning
+//!   `Err(AdminError::Unauthorized)` (HTTP `401`) otherwise. Include a
+//!   `WWW-Authenticate: Bearer` header on `401` responses (RFC 9110).
+//! - [`routes::handle_health`] remains unauthenticated for liveness probes
+//!   when the admin router is mounted.
+//!
+//! Serve admin routes only on an internal-only listener (such as loopback or a
+//! private management interface) rather than exposing them on a public router.
+//!
+//! # Wiring Example
+//!
+//! ```no_run
+//! use tower_http_cache::admin::{AdminConfig, AdminError, AdminState, routes};
+//! use tower_http_cache::backend::CacheBackend;
+//!
+//! fn handle_stats_request<B: CacheBackend>(
+//!     state: &AdminState<B>,
+//!     auth_header: Option<&str>,
+//! ) -> Result<routes::StatsResponse, (u16, Option<routes::ErrorResponse>)> {
+//!     routes::handle_stats(state, auth_header).map_err(|err| match err {
+//!         AdminError::Disabled => (err.status(), None),
+//!         other => (other.status(), Some(routes::ErrorResponse::from(other))),
+//!     })
+//! }
+//!
+//! # fn configure<B: CacheBackend>(backend: B) -> AdminState<B> {
+//! let token = std::env::var("ADMIN_TOKEN").expect("ADMIN_TOKEN must be set");
+//! let config = AdminConfig::new()
+//!     .with_enabled(true)
+//!     .with_require_auth(true)
+//!     .with_auth_token(token);
+//! AdminState::new(backend, config)
+//! # }
+//! ```
 
 pub mod routes;
 pub mod stats;
@@ -17,13 +64,22 @@ use std::sync::Arc;
 /// Configuration for the admin API.
 #[derive(Clone)]
 pub struct AdminConfig {
-    /// Whether admin API is enabled
+    /// Whether the admin API is enabled (defaults to `false`).
+    ///
+    /// When `false`, integrators should not mount the admin routes (including
+    /// [`routes::handle_health`]) on their router.
     pub enabled: bool,
 
     /// Optional authentication token (Bearer token)
     pub auth_token: Option<String>,
 
-    /// Whether authentication is required
+    /// Whether authentication is required (defaults to `true`).
+    ///
+    /// # Security
+    ///
+    /// Setting this to `false` disables authentication for every admin
+    /// handler, including cache invalidation, and ignores [`Self::auth_token`].
+    /// Use `false` only behind an authenticating proxy.
     pub require_auth: bool,
 
     /// Mount path for admin endpoints (e.g., "/admin/cache")
@@ -71,7 +127,10 @@ impl AdminConfig {
         Self::default()
     }
 
-    /// Enables the admin API.
+    /// Enables or disables the admin API.
+    ///
+    /// When `enabled` is `false`, integrators should avoid mounting admin
+    /// routes (including [`routes::handle_health`]).
     pub fn with_enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
         self
@@ -84,6 +143,12 @@ impl AdminConfig {
     }
 
     /// Sets whether authentication is required.
+    ///
+    /// # Security
+    ///
+    /// Setting `require` to `false` disables authentication for every admin
+    /// handler, including cache invalidation, and ignores [`Self::auth_token`].
+    /// Use `false` only behind an authenticating proxy.
     pub fn with_require_auth(mut self, require: bool) -> Self {
         self.require_auth = require;
         self
@@ -125,6 +190,54 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     std::hint::black_box(diff == 0)
 }
 
+/// Reason an admin API request was refused or could not be completed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AdminError {
+    /// [`AdminConfig::enabled`] is `false`. Map to a bare HTTP `404` so
+    /// disabled admin endpoints are not advertised.
+    Disabled,
+    /// Authentication is required and the `Authorization: Bearer` token is
+    /// missing, malformed, or does not match [`AdminConfig::auth_token`].
+    Unauthorized,
+    /// The caller was authorized, but the request input was missing or
+    /// invalid (HTTP `400`).
+    BadRequest(String),
+    /// The caller was authorized, but the cache backend does not support the
+    /// requested operation (HTTP `501`).
+    Unsupported(String),
+    /// The caller was authorized, but the cache backend returned an error
+    /// (HTTP `500`).
+    Backend(String),
+}
+
+impl AdminError {
+    /// Suggested HTTP status code for this error (`404`, `401`, `400`, `501`, or `500`).
+    pub fn status(&self) -> u16 {
+        match self {
+            AdminError::Disabled => 404,
+            AdminError::Unauthorized => 401,
+            AdminError::BadRequest(_) => 400,
+            AdminError::Unsupported(_) => 501,
+            AdminError::Backend(_) => 500,
+        }
+    }
+}
+
+impl fmt::Display for AdminError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AdminError::Disabled => f.write_str("not found"),
+            AdminError::Unauthorized => f.write_str("unauthorized"),
+            AdminError::BadRequest(msg)
+            | AdminError::Unsupported(msg)
+            | AdminError::Backend(msg) => f.write_str(msg),
+        }
+    }
+}
+
+impl std::error::Error for AdminError {}
+
 /// Shared state for admin API handlers.
 #[derive(Clone)]
 pub struct AdminState<B: CacheBackend> {
@@ -149,6 +262,21 @@ impl<B: CacheBackend> AdminState<B> {
             stats,
             chunk_cache: None,
         }
+    }
+
+    /// Enforces [`AdminConfig::enabled`] and [`AdminConfig::require_auth`] for a single request.
+    ///
+    /// `auth_header` is the raw `Authorization` request header value, if present.
+    /// Token verification uses constant-time comparison via [`AdminConfig::validate_token`].
+    /// Every state-reading and state-changing handler in [`routes`] calls this method first.
+    pub fn authorize(&self, auth_header: Option<&str>) -> Result<(), AdminError> {
+        if !self.config.enabled {
+            return Err(AdminError::Disabled);
+        }
+        if !routes::validate_auth(&self.config, auth_header) {
+            return Err(AdminError::Unauthorized);
+        }
+        Ok(())
     }
 
     /// Attaches a chunk cache so admin invalidations also evict cached chunks.
@@ -261,5 +389,26 @@ mod tests {
             .with_require_auth(true);
         assert!(!whitespace.validate_token(Some("   ")));
         assert!(!whitespace.validate_token(Some("")));
+    }
+
+    #[test]
+    fn admin_error_status_and_display() {
+        assert_eq!(AdminError::Disabled.status(), 404);
+        assert_eq!(AdminError::Disabled.to_string(), "not found");
+
+        assert_eq!(AdminError::Unauthorized.status(), 401);
+        assert_eq!(AdminError::Unauthorized.to_string(), "unauthorized");
+
+        let bad_req = AdminError::BadRequest("Must provide key, tag, or tags".to_string());
+        assert_eq!(bad_req.status(), 400);
+        assert_eq!(bad_req.to_string(), "Must provide key, tag, or tags");
+
+        let unsupported = AdminError::Unsupported("Failed to list tags: unsupported".to_string());
+        assert_eq!(unsupported.status(), 501);
+        assert_eq!(unsupported.to_string(), "Failed to list tags: unsupported");
+
+        let backend = AdminError::Backend("Failed to invalidate key: unavailable".to_string());
+        assert_eq!(backend.status(), 500);
+        assert_eq!(backend.to_string(), "Failed to invalidate key: unavailable");
     }
 }

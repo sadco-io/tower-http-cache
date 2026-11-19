@@ -226,9 +226,15 @@ impl CacheEntry {
         *response.status_mut() = self.status;
         *response.version_mut() = self.version;
 
+        let connection_tokens = crate::policy::collect_connection_tokens_from_pairs(&self.headers);
+
         let headers = response.headers_mut();
         headers.clear();
         for (name, value) in self.headers {
+            let lower = name.to_ascii_lowercase();
+            if crate::policy::is_non_cacheable_header(&lower, &connection_tokens) {
+                continue;
+            }
             if let (Ok(name), Ok(value)) = (
                 HeaderName::from_bytes(name.as_bytes()),
                 HeaderValue::from_bytes(&value),

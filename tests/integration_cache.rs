@@ -1047,7 +1047,12 @@ async fn admin_state_receives_live_layer_statistics_and_invalidations() {
     let layer = CacheLayer::builder(backend.clone())
         .ttl(Duration::from_secs(60))
         .build();
-    let admin_state = AdminState::with_stats(backend, AdminConfig::new(), layer.stats());
+    let admin_state = AdminState::with_stats(
+        backend,
+        AdminConfig::new().with_enabled(true).with_auth_token("t"),
+        layer.stats(),
+    );
+    let auth = Some("Bearer t");
 
     let mut service = layer.layer(service_fn(|_req: Request<()>| async move {
         Ok::<_, Infallible>(http::Response::new(Full::from("admin-observed")))
@@ -1083,25 +1088,26 @@ async fn admin_state_receives_live_layer_statistics_and_invalidations() {
             .unwrap();
     }
 
-    let stats_resp = handle_stats(&admin_state);
+    let stats_resp = handle_stats(&admin_state, auth).unwrap();
     assert_eq!(stats_resp.cache.misses, 1);
     assert_eq!(stats_resp.cache.stores, 1);
     assert_eq!(stats_resp.cache.hits, 2);
     assert_eq!(stats_resp.cache.total_requests, 3);
 
-    let hot = handle_hot_keys(&admin_state, Some(5));
+    let hot = handle_hot_keys(&admin_state, auth, Some(5)).unwrap();
     assert_eq!(hot.hot_keys.len(), 1);
     assert_eq!(hot.hot_keys[0].key, "/items/1");
     assert_eq!(hot.hot_keys[0].hits, 2);
 
     // Layer invalidation increments GlobalStats
     layer.invalidate("/items/1").await.unwrap();
-    let after_layer_inv = handle_stats(&admin_state);
+    let after_layer_inv = handle_stats(&admin_state, auth).unwrap();
     assert_eq!(after_layer_inv.cache.invalidations, 1);
 
     // Admin handler invalidation also increments shared GlobalStats
     let inv_resp = handle_invalidate(
         &admin_state,
+        auth,
         InvalidationRequest {
             key: Some("/items/other".to_string()),
             tag: None,
@@ -1111,7 +1117,13 @@ async fn admin_state_receives_live_layer_statistics_and_invalidations() {
     .await
     .unwrap();
     assert!(inv_resp.success);
-    assert_eq!(handle_stats(&admin_state).cache.invalidations, 2);
+    assert_eq!(
+        handle_stats(&admin_state, auth)
+            .unwrap()
+            .cache
+            .invalidations,
+        2
+    );
 }
 
 #[cfg(feature = "serde")]
@@ -2194,81 +2206,6 @@ async fn upstream_content_encoding_negotiated_on_full_and_chunk_hits() {
     let mismatch_body = mismatch.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(&mismatch_body[..], b"plain-chunk-body");
     assert_eq!(chunk_calls.load(Ordering::SeqCst), 2);
-}
-
-#[cfg(all(feature = "serde", feature = "tracing"))]
-#[tokio::test]
-async fn ml_logging_bypass_emits_single_bypass_event_and_hashes_uri() {
-    use std::io::Write;
-    use std::sync::Mutex;
-    use tower_http_cache::logging::MLLoggingConfig;
-    use tower_http_cache::policy::CachePolicy;
-
-    #[derive(Clone, Default)]
-    struct BufWriter(Arc<Mutex<Vec<u8>>>);
-
-    impl Write for BufWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufWriter {
-        type Writer = Self;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    let logs = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(BufWriter(logs.clone()))
-        .with_ansi(false)
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
-
-    let policy = CachePolicy::default().with_ml_logging(
-        MLLoggingConfig::new()
-            .with_enabled(true)
-            .with_sample_rate(1.0)
-            .with_hash_keys(true),
-    );
-    let layer = CacheLayer::builder(InMemoryBackend::new(64))
-        .policy(policy)
-        .build();
-    let mut svc = layer.layer(service_fn(|_req: Request<()>| async {
-        Ok::<_, Infallible>(http::Response::new(Full::from("ok")))
-    }));
-
-    let _ = svc
-        .ready()
-        .await
-        .unwrap()
-        .call(
-            Request::post("/secret-bypass-path?token=xyz")
-                .body(())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    let output = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
-    let bypass_count = output.matches("\"event\":\"bypass\"").count();
-    let miss_count = output.matches("\"event\":\"miss\"").count();
-    assert_eq!(bypass_count, 1, "expected exactly 1 bypass event: {output}");
-    assert_eq!(
-        miss_count, 0,
-        "bypassed request must not emit miss: {output}"
-    );
-    assert!(
-        !output.contains("secret-bypass-path") && !output.contains("token=xyz"),
-        "hash_keys=true must hash both key and uri: {output}"
-    );
 }
 
 #[tokio::test]
