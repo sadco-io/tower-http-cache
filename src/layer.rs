@@ -1551,7 +1551,14 @@ fn build_chunk_hit_response(
     *response.status_mut() = http::StatusCode::PARTIAL_CONTENT;
     *response.version_mut() = entry.metadata.version;
 
+    let connection_tokens =
+        crate::policy::collect_connection_tokens_from_pairs(&entry.metadata.headers);
+
     for (name, value) in &entry.metadata.headers {
+        let lower = name.to_ascii_lowercase();
+        if crate::policy::is_non_cacheable_header(&lower, &connection_tokens) {
+            continue;
+        }
         if let (Ok(header_name), Ok(header_value)) = (
             http::header::HeaderName::from_bytes(name.as_bytes()),
             http::header::HeaderValue::from_bytes(value),
@@ -1669,10 +1676,6 @@ impl SharedAuthCheck {
             has_authorization,
         }
     }
-
-    fn checks_vary(self) -> bool {
-        self.has_non_bypass_cookie || self.has_authorization
-    }
 }
 
 fn should_store_response(
@@ -1715,16 +1718,15 @@ fn is_usable_hit(
 
 fn vary_str_blocks_request(value: &str, auth_check: SharedAuthCheck) -> bool {
     value.split(',').map(str::trim).any(|tok| {
-        (tok == "*" && auth_check.checks_vary())
+        // RFC 9111 §4.1: a stored response whose Vary contains "*" always fails to match,
+        // whatever headers the request carries.
+        tok == "*"
             || (auth_check.has_non_bypass_cookie && tok.eq_ignore_ascii_case("cookie"))
             || (auth_check.has_authorization && tok.eq_ignore_ascii_case("authorization"))
     })
 }
 
 fn response_vary_allows_request(headers: &HeaderMap, auth_check: SharedAuthCheck) -> bool {
-    if !auth_check.checks_vary() {
-        return true;
-    }
     !headers.get_all(http::header::VARY).iter().any(|v| {
         v.to_str()
             .map_or(true, |s| vary_str_blocks_request(s, auth_check))
@@ -1735,9 +1737,6 @@ fn cached_entry_vary_allows_request(
     headers: &[(String, Vec<u8>)],
     auth_check: SharedAuthCheck,
 ) -> bool {
-    if !auth_check.checks_vary() {
-        return true;
-    }
     !headers
         .iter()
         .filter(|(name, _)| name.eq_ignore_ascii_case("vary"))

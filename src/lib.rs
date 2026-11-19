@@ -70,4 +70,4 @@ pub use streaming::{StreamingDecision, StreamingPolicy};
 pub use tags::{TagIndex, TagPolicy};
 
 #[cfg(feature = "admin-api")]
-pub use admin::{AdminConfig, AdminState};
+pub use admin::{AdminConfig, AdminError, AdminState};

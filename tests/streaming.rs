@@ -1018,7 +1018,12 @@ async fn admin_invalidate_evicts_chunk_cache() {
                 .with_ttl(Duration::from_secs(60)),
         )
         .build();
-    let admin = AdminState::from_layer(&layer, AdminConfig::default());
+    let admin = AdminState::from_layer(
+        &layer,
+        AdminConfig::default()
+            .with_enabled(true)
+            .with_auth_token("t"),
+    );
 
     let mut svc = layer.layer(tower::service_fn({
         let calls = calls.clone();
@@ -1050,6 +1055,7 @@ async fn admin_invalidate_evicts_chunk_cache() {
 
     let resp = handle_invalidate(
         &admin,
+        Some("Bearer t"),
         InvalidationRequest {
             key: Some("/a".into()),
             tag: None,
