@@ -31,7 +31,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
   deny:
-    name: cargo-deny
+    name: cargo-deny (scheduled)
     runs-on: ubuntu-latest
     timeout-minutes: 25
     permissions:
@@ -43,7 +43,7 @@ jobs:
           command: check
 
   machete:
-    name: unused dependencies
+    name: unused dependencies (scheduled)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
